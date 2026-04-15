@@ -18,10 +18,6 @@ Thumbs.db
 # committed alongside the repo. Everything under `index/` is derivable and
 # should never be tracked.
 .thoth*/
-!.thoth/
-!.thoth/MEMORY.md
-!.thoth/LESSONS.md
-!.thoth/skills/
 
 # Stray local databases from prototype runs
 /identifier.sqlite
