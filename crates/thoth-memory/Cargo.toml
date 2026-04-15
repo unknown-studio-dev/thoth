@@ -12,9 +12,6 @@ description = "Memory lifecycle: markdown curator, skills manager, nudge loop, T
 thoth-core   = { workspace = true }
 thoth-store  = { workspace = true }
 tokio        = { workspace = true }
-async-trait  = { workspace = true }
-thiserror    = { workspace = true }
-anyhow       = { workspace = true }
 serde        = { workspace = true }
 toml         = { workspace = true }
 tracing      = { workspace = true }

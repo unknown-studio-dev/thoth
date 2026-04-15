@@ -63,7 +63,8 @@ impl DaemonClient {
     /// Tool-level errors surface as `Ok(value)` with `isError: true`.
     /// Transport / protocol errors are returned as `Err`.
     pub async fn call(&mut self, tool: &str, arguments: Value) -> anyhow::Result<Value> {
-        self.call_with_timeout(tool, arguments, DEFAULT_TIMEOUT).await
+        self.call_with_timeout(tool, arguments, DEFAULT_TIMEOUT)
+            .await
     }
 
     /// Like [`Self::call`] but with a caller-specified timeout.
@@ -87,10 +88,7 @@ impl DaemonClient {
         let fut = self.roundtrip(&request);
         let resp: Value = match tokio::time::timeout(timeout, fut).await {
             Ok(inner) => inner?,
-            Err(_) => anyhow::bail!(
-                "thoth-mcp daemon did not respond within {:?}",
-                timeout
-            ),
+            Err(_) => anyhow::bail!("thoth-mcp daemon did not respond within {:?}", timeout),
         };
 
         // Check for JSON-RPC level error.
@@ -141,10 +139,7 @@ pub fn tool_text(result: &Value) -> &str {
 /// Extract the `data` field from a `ToolOutput` JSON value. Returns
 /// `Value::Null` if absent.
 pub fn tool_data(result: &Value) -> Value {
-    result
-        .get("data")
-        .cloned()
-        .unwrap_or(Value::Null)
+    result.get("data").cloned().unwrap_or(Value::Null)
 }
 
 /// Is the tool-level `isError` flag set?

@@ -1,0 +1,100 @@
+name: 🧠 Memory drift
+description: The agent hallucinated or ignored a lesson that should have caught it.
+labels: ["memory-drift", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This template is specifically for failures of the discipline loop
+        — the agent said or did something `LESSONS.md` / `MEMORY.md`
+        should have prevented, or the gate failed to block.
+
+        If it's a plain bug, use the Bug report template instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: Thoth version
+      placeholder: thoth 0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Discipline mode in effect
+      options:
+        - soft
+        - strict (gate_require_nudge = false)
+        - strict (gate_require_nudge = true)
+        - not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: memory_mode
+    attributes:
+      label: Memory mode
+      options:
+        - auto
+        - review
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What the agent did wrong
+      description: |
+        Quote the offending agent turn. Include the tool call it made
+        (recall / remember / edit) if relevant.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_should_have_happened
+    attributes:
+      label: What should have happened
+      description: |
+        Which lesson / fact should have caught this? Paste the relevant
+        `LESSONS.md` or `MEMORY.md` entry if one exists.
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: history
+    attributes:
+      label: Relevant memory-history.jsonl
+      description: |
+        `thoth memory log --limit 30` around the time it went wrong.
+        Great for triaging auto-quarantine / promote/reject sequences.
+      render: json
+
+  - type: textarea
+    id: episodes
+    attributes:
+      label: Gate / episode evidence (optional)
+      description: |
+        Output of `sqlite3 .thoth/episodes.db 'select * from events order
+        by rowid desc limit 20'`. Particularly useful for strict-mode
+        failures — we want to see whether `query_issued` /
+        `nudge_invoked` events were actually logged.
+      render: text
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Best guess at the category
+      options:
+        - Agent bypassed recall (soft mode)
+        - Gate approved despite missing event
+        - Nudge expanded but agent didn't honour the lesson
+        - Lesson trigger didn't match (but should have)
+        - Lesson got auto-quarantined incorrectly
+        - Memory staged when it shouldn't have
+        - Other
+    validations:
+      required: true

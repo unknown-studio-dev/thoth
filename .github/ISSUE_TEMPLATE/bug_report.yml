@@ -1,0 +1,91 @@
+name: 🐛 Bug report
+description: Something is broken — a command crashes, a hook misfires, output is wrong.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. A small reproducer
+        beats a long description — please include one if you can.
+
+  - type: input
+    id: version
+    attributes:
+      label: Thoth version
+      description: Output of `thoth --version`.
+      placeholder: thoth 0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component is affected?
+      multiple: true
+      options:
+        - thoth CLI
+        - thoth-mcp (MCP server)
+        - thoth-gate (strict-mode hook)
+        - thoth-discipline plugin
+        - Homebrew / npm packaging
+        - Docs / README
+        - I'm not sure
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS + architecture
+      placeholder: macOS 14.5 / aarch64, Ubuntu 22.04 / x86_64
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: |
+        Exact commands, in order. Include the state of `.thoth/` if it's
+        relevant (fresh `init`, existing index, etc.). Redact API keys.
+      render: bash
+      placeholder: |
+        thoth init
+        thoth index .
+        thoth query "the thing that breaks"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: One or two sentences.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: Full output if you have it. `RUST_LOG=debug` is welcome.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: .thoth/config.toml (if any)
+      description: Copy-paste the relevant sections — redact anything secret.
+      render: toml
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched open and closed issues for this bug.
+          required: true
+        - label: I'm on the latest published version (or built from `main`).
+          required: false

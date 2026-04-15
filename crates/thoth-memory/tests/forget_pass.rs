@@ -89,8 +89,8 @@ async fn forget_pass_evicts_decayed_episodes() {
     let db_path = dir.path().join("episodes.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     // Age the "stale" row by 10 years and zero its salience floor.
-    let long_ago = (OffsetDateTime::now_utc() - Duration::days(3_650))
-        .unix_timestamp_nanos() as i64;
+    let long_ago =
+        (OffsetDateTime::now_utc() - Duration::days(3_650)).unix_timestamp_nanos() as i64;
     conn.execute(
         "UPDATE episodes SET salience = 0.01, last_accessed_ns = ?1 \
          WHERE payload LIKE '%stale retrieval%'",
@@ -103,7 +103,10 @@ async fn forget_pass_evicts_decayed_episodes() {
 
     // Confirm both rows exist before the pass.
     let before = mgr.episodes.count().await.unwrap();
-    assert_eq!(before, 2, "both events should be present before forget_pass");
+    assert_eq!(
+        before, 2,
+        "both events should be present before forget_pass"
+    );
 
     let report = mgr.forget_pass().await.unwrap();
 

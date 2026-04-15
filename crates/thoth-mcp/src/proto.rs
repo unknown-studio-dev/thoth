@@ -143,6 +143,9 @@ pub struct Capabilities {
     /// Resources capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<Value>,
+    /// Prompts capability — enables `prompts/list` + `prompts/get`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Value>,
 }
 
 /// Server identity block.
@@ -280,4 +283,56 @@ impl ToolOutput {
             is_error: true,
         }
     }
+}
+
+// ---- MCP prompts ----------------------------------------------------------
+
+/// A single prompt descriptor advertised in `prompts/list`.
+///
+/// Prompts are templates (optionally parameterised) that MCP clients can
+/// expand into their own context window. They're the canonical vehicle for
+/// "ask Claude to self-reflect using this preset" — Thoth just assembles
+/// the text, Claude (on the client side) runs it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Prompt {
+    /// Prompt id — unique within the server.
+    pub name: String,
+    /// One-line human description.
+    pub description: String,
+    /// Optional argument schema. Empty = no arguments.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<PromptArgument>,
+}
+
+/// Single named argument in a prompt template.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptArgument {
+    /// Argument id.
+    pub name: String,
+    /// Description shown to the model picking values.
+    pub description: String,
+    /// Whether the argument must be supplied.
+    pub required: bool,
+}
+
+/// Response payload for `prompts/get`.
+///
+/// Follows the MCP spec: a short description plus one-or-more
+/// `PromptMessage` blocks that the client concatenates into its context.
+#[derive(Debug, Clone, Serialize)]
+pub struct GetPromptResult {
+    /// Echo of the prompt description (lets clients cache metadata).
+    pub description: String,
+    /// Rendered conversation — typically a single `user` message carrying
+    /// the fully substituted template.
+    pub messages: Vec<PromptMessage>,
+}
+
+/// One message inside a rendered prompt.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptMessage {
+    /// `"user"`, `"assistant"`, or `"system"`.
+    pub role: String,
+    /// Content block — we only ever emit text here.
+    pub content: ContentBlock,
 }

@@ -20,7 +20,6 @@ lang-go       = ["dep:tree-sitter-go"]
 [dependencies]
 thoth-core   = { workspace = true }
 tokio        = { workspace = true }
-thiserror    = { workspace = true }
 anyhow       = { workspace = true }
 serde        = { workspace = true }
 tracing      = { workspace = true }

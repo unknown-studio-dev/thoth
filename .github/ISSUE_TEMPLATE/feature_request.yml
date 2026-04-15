@@ -1,0 +1,70 @@
+name: ✨ Feature request
+description: Suggest a new capability, config knob, or provider adapter.
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: anything touching `DESIGN.md` or `.thoth/` on-disk
+        layout needs a short design-note PR, not just an issue. For smaller
+        things, go ahead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: |
+        Describe the rough edge in your actual workflow. "What isn't
+        working" beats "what I want you to add" — it lets us consider
+        alternatives.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        The change you have in mind. Config knobs, new subcommands, new
+        MCP tools, plugin hooks. Rough is fine.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Solutions you rejected and why.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which area?
+      multiple: true
+      options:
+        - Retrieval / indexing (`thoth-retrieve`, `thoth-parse`)
+        - Memory lifecycle (`thoth-memory`)
+        - MCP server (`thoth-mcp`)
+        - Plugin / hooks / discipline
+        - CLI UX
+        - Packaging (brew / npm / Docker)
+        - Docs
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Are you willing to help?
+      options:
+        - label: I can send a PR for this.
+        - label: I can help test a prototype.
+        - label: I'm just filing it — hoping someone else picks it up.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched open and closed issues for this idea.
+          required: true

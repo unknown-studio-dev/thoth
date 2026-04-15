@@ -52,11 +52,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::{
-    Connection,
-    connect,
+    Connection, DistanceType, connect,
     query::{ExecutableQuery, QueryBase},
     table::Table,
-    DistanceType,
 };
 use tokio::sync::Mutex;
 
@@ -105,7 +103,8 @@ impl LanceVectorStore {
 
     /// Upsert a single `(id, vector)` pair under `model`.
     pub async fn upsert(&self, id: &str, model: &str, vector: &[f32]) -> Result<()> {
-        self.upsert_batch(&[(id.to_string(), vector.to_vec())], model).await
+        self.upsert_batch(&[(id.to_string(), vector.to_vec())], model)
+            .await
     }
 
     /// Upsert a batch under a single `model`. All vectors in `items` must
@@ -144,10 +143,7 @@ impl LanceVectorStore {
         let mut builder = table.merge_insert(&["id"]);
         builder.when_matched_update_all(None);
         builder.when_not_matched_insert_all();
-        builder
-            .execute(Box::new(reader))
-            .await
-            .map_err(store)?;
+        builder.execute(Box::new(reader)).await.map_err(store)?;
         Ok(())
     }
 
@@ -209,10 +205,7 @@ impl LanceVectorStore {
                 }
                 let id = ids.value(i).to_string();
                 let d = dists.value(i);
-                out.push(VectorHit {
-                    id,
-                    score: 1.0 - d,
-                });
+                out.push(VectorHit { id, score: 1.0 - d });
             }
         }
         out.truncate(k);
@@ -389,11 +382,7 @@ fn vector_schema(dim: usize) -> Arc<Schema> {
     let item = Arc::new(Field::new("item", DataType::Float32, true));
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
-        Field::new(
-            "vec",
-            DataType::FixedSizeList(item, dim as i32),
-            false,
-        ),
+        Field::new("vec", DataType::FixedSizeList(item, dim as i32), false),
     ]))
 }
 
@@ -472,7 +461,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_search_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let vs = LanceVectorStore::open(dir.path().join("lance")).await.unwrap();
+        let vs = LanceVectorStore::open(dir.path().join("lance"))
+            .await
+            .unwrap();
 
         vs.upsert("a", "m", &[1.0, 0.0, 0.0]).await.unwrap();
         vs.upsert("b", "m", &[0.0, 1.0, 0.0]).await.unwrap();
@@ -487,7 +478,9 @@ mod tests {
     #[tokio::test]
     async fn different_model_isolated() {
         let dir = tempfile::tempdir().unwrap();
-        let vs = LanceVectorStore::open(dir.path().join("lance")).await.unwrap();
+        let vs = LanceVectorStore::open(dir.path().join("lance"))
+            .await
+            .unwrap();
         vs.upsert("a", "m1", &[1.0, 0.0]).await.unwrap();
         vs.upsert("b", "m2", &[1.0, 0.0]).await.unwrap();
 
@@ -499,7 +492,9 @@ mod tests {
     #[tokio::test]
     async fn dim_mismatch_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let vs = LanceVectorStore::open(dir.path().join("lance")).await.unwrap();
+        let vs = LanceVectorStore::open(dir.path().join("lance"))
+            .await
+            .unwrap();
         vs.upsert("a", "m", &[1.0, 0.0, 0.0]).await.unwrap();
 
         let hits = vs.search("m", &[1.0, 0.0], 1).await.unwrap();
@@ -509,7 +504,9 @@ mod tests {
     #[tokio::test]
     async fn delete_by_path_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        let vs = LanceVectorStore::open(dir.path().join("lance")).await.unwrap();
+        let vs = LanceVectorStore::open(dir.path().join("lance"))
+            .await
+            .unwrap();
         vs.upsert("src/a.rs:0-10", "m", &[1.0, 0.0]).await.unwrap();
         vs.upsert("src/a.rs:10-20", "m", &[0.0, 1.0]).await.unwrap();
         vs.upsert("src/b.rs:0-10", "m", &[1.0, 0.0]).await.unwrap();
@@ -522,7 +519,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_model_search_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let vs = LanceVectorStore::open(dir.path().join("lance")).await.unwrap();
+        let vs = LanceVectorStore::open(dir.path().join("lance"))
+            .await
+            .unwrap();
         let hits = vs.search("never-seen", &[1.0, 0.0], 5).await.unwrap();
         assert!(hits.is_empty());
     }

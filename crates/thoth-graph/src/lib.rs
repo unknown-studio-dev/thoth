@@ -184,10 +184,7 @@ impl Graph {
     /// "module" node (file stem) which the indexer uses as the source of
     /// file-level `use`/`import` statements. Destinations are deduped;
     /// order is stable (insertion order of first occurrence).
-    pub async fn imports_of_file(
-        &self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Vec<String>> {
+    pub async fn imports_of_file(&self, path: impl AsRef<std::path::Path>) -> Result<Vec<String>> {
         let path = path.as_ref();
         let nodes = self.symbols_in_file(path).await?;
         let mut seen: HashSet<String> = HashSet::new();

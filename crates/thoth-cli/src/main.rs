@@ -2,6 +2,8 @@
 //!
 //! ```text
 //! thoth init                        # create .thoth/ in the current directory
+//! thoth setup                       # interactive config wizard (config.toml)
+//! thoth setup --show                # print current config, no writes
 //! thoth index [PATH]                # walk + parse + index (optionally embed)
 //! thoth query <TEXT>                # hybrid recall (Mode::Zero by default)
 //! thoth watch [PATH]                # stay resident, reindex on change
@@ -39,11 +41,13 @@ use thoth_core::{Embedder, Fact, Lesson, MemoryKind, MemoryMeta, Query, Synthesi
 use thoth_memory::MemoryManager;
 use thoth_parse::{LanguageRegistry, watch::Watcher};
 use thoth_retrieve::{IndexProgress, Indexer, Retriever};
+use thoth_store::markdown::MarkdownStore;
 use thoth_store::{StoreRoot, VectorStore};
 use tracing::warn;
 
 mod daemon;
 mod hooks;
+mod setup;
 
 // ------------------------------------------------------------------ CLI spec
 
@@ -95,6 +99,19 @@ enum SynthKind {
 enum Cmd {
     /// Initialize a new `.thoth/` directory.
     Init,
+
+    /// Interactive setup wizard — writes `<root>/config.toml`.
+    ///
+    /// In CI or other non-TTY contexts it falls back to defaults without
+    /// prompting. Use `--show` to print the current config without writing.
+    Setup {
+        /// Print current config and exit. Does not modify anything.
+        #[arg(long)]
+        show: bool,
+        /// Skip prompts and write defaults (useful for CI / bootstrap).
+        #[arg(long)]
+        accept_defaults: bool,
+    },
 
     /// Parse + index a source tree. With `--embedder` set, also writes
     /// semantic vectors into `<root>/vectors.db`.
@@ -211,6 +228,33 @@ enum MemoryCmd {
         #[arg(long, default_value_t = 0)]
         window: usize,
     },
+    /// List entries staged in `MEMORY.pending.md` / `LESSONS.pending.md`.
+    Pending,
+    /// Promote a staged fact or lesson into the canonical markdown file.
+    Promote {
+        /// `fact` or `lesson`.
+        #[arg(value_parser = ["fact", "lesson"])]
+        kind: String,
+        /// 0-based index shown by `thoth memory pending`.
+        index: usize,
+    },
+    /// Drop a staged fact or lesson without promoting it.
+    Reject {
+        /// `fact` or `lesson`.
+        #[arg(value_parser = ["fact", "lesson"])]
+        kind: String,
+        /// 0-based index shown by `thoth memory pending`.
+        index: usize,
+        /// Optional reason — recorded in memory-history.jsonl.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Tail the memory-history.jsonl audit log.
+    Log {
+        /// Return only the latest N entries.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -297,6 +341,10 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Init => cmd_init(&cli.root).await?,
+        Cmd::Setup {
+            show,
+            accept_defaults,
+        } => setup::run(&cli.root, show, accept_defaults).await?,
         Cmd::Index { path } => cmd_index(&cli.root, &path, cli.embedder).await?,
         Cmd::Query { text, top_k } => {
             cmd_query(
@@ -331,6 +379,16 @@ async fn main() -> anyhow::Result<()> {
             MemoryCmd::Nudge { window } => {
                 cmd_memory_nudge(&cli.root, window, cli.json, cli.synth).await?
             }
+            MemoryCmd::Pending => cmd_memory_pending(&cli.root, cli.json).await?,
+            MemoryCmd::Promote { kind, index } => {
+                cmd_memory_promote(&cli.root, &kind, index, cli.json).await?
+            }
+            MemoryCmd::Reject {
+                kind,
+                index,
+                reason,
+            } => cmd_memory_reject(&cli.root, &kind, index, reason.as_deref(), cli.json).await?,
+            MemoryCmd::Log { limit } => cmd_memory_log(&cli.root, limit, cli.json).await?,
         },
         Cmd::Skills { cmd } => match cmd {
             SkillsCmd::List => cmd_skills_list(&cli.root, cli.json).await?,
@@ -613,9 +671,7 @@ async fn cmd_query(
     // The daemon always runs in Mode::Zero (no embedder/synth), so
     // `--embedder` / `--synth` force a direct-store fallback below.
     let wants_full = embedder_kind.is_some() || synth_kind.is_some();
-    if !wants_full
-        && let Some(mut d) = daemon::DaemonClient::try_connect(root).await
-    {
+    if !wants_full && let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
         let result = d
             .call(
                 "thoth_recall",
@@ -797,9 +853,7 @@ async fn cmd_memory_show(root: &std::path::Path) -> anyhow::Result<()> {
     // when available because the MCP server is the single writer — reading
     // through it guarantees we see the same view Claude Code sees.
     if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
-        let result = d
-            .call("thoth_memory_show", serde_json::json!({}))
-            .await?;
+        let result = d.call("thoth_memory_show", serde_json::json!({})).await?;
         if daemon::tool_is_error(&result) {
             anyhow::bail!("{}", daemon::tool_text(&result));
         }
@@ -832,10 +886,7 @@ async fn cmd_memory_edit(root: &std::path::Path) -> anyhow::Result<()> {
     // Ensure the root exists; otherwise the editor would create the file
     // in a non-existent parent and fail confusingly.
     if !root.exists() {
-        anyhow::bail!(
-            "{} not found — run `thoth init` first",
-            root.display()
-        );
+        anyhow::bail!("{} not found — run `thoth init` first", root.display());
     }
     let path = root.join("MEMORY.md");
     if !path.exists() {
@@ -891,7 +942,10 @@ async fn cmd_memory_fact(
         tags,
     };
     store.markdown.append_fact(&fact).await?;
-    println!("fact appended to {}", store.path.join("MEMORY.md").display());
+    println!(
+        "fact appended to {}",
+        store.path.join("MEMORY.md").display()
+    );
     Ok(())
 }
 
@@ -938,9 +992,7 @@ async fn cmd_memory_lesson(
 
 async fn cmd_memory_forget(root: &std::path::Path, json: bool) -> anyhow::Result<()> {
     if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
-        let result = d
-            .call("thoth_memory_forget", serde_json::json!({}))
-            .await?;
+        let result = d.call("thoth_memory_forget", serde_json::json!({})).await?;
         if daemon::tool_is_error(&result) {
             anyhow::bail!("{}", daemon::tool_text(&result));
         }
@@ -962,13 +1014,148 @@ async fn cmd_memory_forget(root: &std::path::Path, json: bool) -> anyhow::Result
             "episodes_ttl": report.episodes_ttl,
             "episodes_cap": report.episodes_cap,
             "lessons_dropped": report.lessons_dropped,
+            "lessons_quarantined": report.lessons_quarantined,
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         println!(
-            "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={}",
-            report.episodes_ttl, report.episodes_cap, report.lessons_dropped
+            "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={} lessons_quarantined={}",
+            report.episodes_ttl,
+            report.episodes_cap,
+            report.lessons_dropped,
+            report.lessons_quarantined
         );
+    }
+    Ok(())
+}
+
+async fn cmd_memory_pending(root: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    let md = MarkdownStore::open(root).await?;
+    let facts = md.read_pending_facts().await?;
+    let lessons = md.read_pending_lessons().await?;
+    if json {
+        let v = serde_json::json!({
+            "facts": facts.iter().enumerate().map(|(i, f)| {
+                serde_json::json!({ "index": i, "text": f.text, "tags": f.tags })
+            }).collect::<Vec<_>>(),
+            "lessons": lessons.iter().enumerate().map(|(i, l)| {
+                serde_json::json!({ "index": i, "trigger": l.trigger, "advice": l.advice })
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("── pending facts ({}) ──", facts.len());
+        for (i, f) in facts.iter().enumerate() {
+            let first = f.text.lines().next().unwrap_or("").trim();
+            println!("[{i}] {first}");
+        }
+        println!("\n── pending lessons ({}) ──", lessons.len());
+        for (i, l) in lessons.iter().enumerate() {
+            println!("[{i}] {}", l.trigger);
+        }
+        if facts.is_empty() && lessons.is_empty() {
+            println!("(no pending entries)");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_memory_promote(
+    root: &std::path::Path,
+    kind: &str,
+    index: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let md = MarkdownStore::open(root).await?;
+    let (title, ok) = match kind {
+        "fact" => match md.promote_pending_fact(index).await? {
+            Some(f) => (f.text.lines().next().unwrap_or("").trim().to_string(), true),
+            None => (String::new(), false),
+        },
+        "lesson" => match md.promote_pending_lesson(index).await? {
+            Some(l) => (l.trigger, true),
+            None => (String::new(), false),
+        },
+        other => anyhow::bail!("unknown kind: {other} (expected `fact` or `lesson`)"),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "kind": kind,
+                "index": index,
+                "promoted": ok,
+                "title": title,
+            }))?
+        );
+    } else if ok {
+        println!("promoted {kind} [{index}]: {title}");
+    } else {
+        println!("no pending {kind} at index {index}");
+    }
+    Ok(())
+}
+
+async fn cmd_memory_reject(
+    root: &std::path::Path,
+    kind: &str,
+    index: usize,
+    reason: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let md = MarkdownStore::open(root).await?;
+    let (title, ok) = match kind {
+        "fact" => match md.reject_pending_fact(index, reason).await? {
+            Some(f) => (f.text.lines().next().unwrap_or("").trim().to_string(), true),
+            None => (String::new(), false),
+        },
+        "lesson" => match md.reject_pending_lesson(index, reason).await? {
+            Some(l) => (l.trigger, true),
+            None => (String::new(), false),
+        },
+        other => anyhow::bail!("unknown kind: {other} (expected `fact` or `lesson`)"),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "kind": kind,
+                "index": index,
+                "rejected": ok,
+                "title": title,
+                "reason": reason,
+            }))?
+        );
+    } else if ok {
+        println!("rejected {kind} [{index}]: {title}");
+    } else {
+        println!("no pending {kind} at index {index}");
+    }
+    Ok(())
+}
+
+async fn cmd_memory_log(
+    root: &std::path::Path,
+    limit: Option<usize>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let md = MarkdownStore::open(root).await?;
+    let mut entries = md.read_history().await?;
+    if let Some(n) = limit
+        && entries.len() > n
+    {
+        let skip = entries.len() - n;
+        entries.drain(..skip);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        for e in &entries {
+            println!("{}  {:<14} {:<7} {}", e.at_rfc3339, e.op, e.kind, e.title);
+        }
+        if entries.is_empty() {
+            println!("(no history yet)");
+        }
     }
     Ok(())
 }
@@ -1090,11 +1277,13 @@ async fn cmd_eval(
             let path_ok = gq.expect_path.is_empty()
                 || gq.expect_path.iter().any(|s| p.contains(&s.to_lowercase()));
             let text_ok = gq.expect_text.is_empty()
-                || gq.expect_text.iter().any(|s| body.contains(&s.to_lowercase()));
+                || gq
+                    .expect_text
+                    .iter()
+                    .any(|s| body.contains(&s.to_lowercase()));
             // Any-of semantics across the two expect_* buckets — if *either*
             // bucket matches we count the query as answered.
-            (!gq.expect_path.is_empty() && path_ok)
-                || (!gq.expect_text.is_empty() && text_ok)
+            (!gq.expect_path.is_empty() && path_ok) || (!gq.expect_text.is_empty() && text_ok)
         });
 
         if got {
@@ -1134,9 +1323,7 @@ async fn cmd_eval(
 
 async fn cmd_skills_list(root: &std::path::Path, json: bool) -> anyhow::Result<()> {
     if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
-        let result = d
-            .call("thoth_skills_list", serde_json::json!({}))
-            .await?;
+        let result = d.call("thoth_skills_list", serde_json::json!({})).await?;
         if daemon::tool_is_error(&result) {
             anyhow::bail!("{}", daemon::tool_text(&result));
         }

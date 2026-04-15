@@ -1,0 +1,15 @@
+{
+  "name": "thoth-discipline",
+  "version": "0.2.0",
+  "description": "Memory-disciplined coding agent loop: two-event strict gate, staged review workflow, auto-quarantine, versioned history, and skill self-proposal against a local Thoth MCP server.",
+  "author": {
+    "name": "Thoth contributors"
+  },
+  "keywords": [
+    "memory",
+    "reflection",
+    "rag",
+    "code-search",
+    "discipline"
+  ]
+}

@@ -103,11 +103,7 @@ enum Direction {
     Callees,
 }
 
-async fn collect_neighbors(
-    graph: &Graph,
-    fqn: &str,
-    dir: Direction,
-) -> Result<Vec<SymbolRef>> {
+async fn collect_neighbors(graph: &Graph, fqn: &str, dir: Direction) -> Result<Vec<SymbolRef>> {
     let nodes = match dir {
         Direction::Callers => graph.callers(fqn, FANOUT_DEPTH).await?,
         Direction::Callees => graph.callees(fqn, FANOUT_DEPTH).await?,
@@ -119,11 +115,7 @@ async fn collect_neighbors(
         .collect())
 }
 
-async fn siblings(
-    graph: &Graph,
-    path: &Path,
-    own_fqn: Option<&str>,
-) -> Result<Vec<SymbolRef>> {
+async fn siblings(graph: &Graph, path: &Path, own_fqn: Option<&str>) -> Result<Vec<SymbolRef>> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for n in graph.symbols_in_file(path).await? {
@@ -235,7 +227,10 @@ fn is_doc_ish(line: &str) -> bool {
 /// blank lines are dropped. If no recognisable comment block is at the
 /// top of the body we return `None` rather than guessing.
 pub fn extract_docstring(path: &Path, body: &str) -> Option<String> {
-    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
     let lines: Vec<&str> = body.lines().collect();
     if lines.is_empty() {
         return None;
@@ -391,7 +386,11 @@ fn c_style_doc(lines: &[&str]) -> Option<String> {
             break;
         }
     }
-    if saw { Some(out.trim_end().to_string()) } else { None }
+    if saw {
+        Some(out.trim_end().to_string())
+    } else {
+        None
+    }
 }
 
 /// Strip leading `*` and at most one space, preserving further indent.
@@ -423,7 +422,11 @@ fn go_doc(lines: &[&str]) -> Option<String> {
             break;
         }
     }
-    if saw { Some(out.trim_end().to_string()) } else { None }
+    if saw {
+        Some(out.trim_end().to_string())
+    } else {
+        None
+    }
 }
 
 fn strip_prefix_once<'a>(s: &'a str, p: &str) -> &'a str {

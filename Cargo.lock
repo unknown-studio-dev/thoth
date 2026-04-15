@@ -1716,6 +1716,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dialoguer"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "658bce805d770f407bc62102fca7c2c64ceef2fbcb2b8bd19d2765ce093980de"
+dependencies = [
+ "console",
+ "fuzzy-matcher",
+ "shell-words",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2107,6 +2119,15 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "fuzzy-matcher"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54614a3312934d066701a80f20f15fa3b56d67ac7722b39eea5b4c9dd1d66c94"
+dependencies = [
+ "thread_local",
 ]
 
 [[package]]
@@ -4106,7 +4127,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.12.1",
  "log",
  "multimap",
@@ -4935,6 +4956,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
+
+[[package]]
 name = "shellexpand"
 version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5566,6 +5593,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "dialoguer",
  "indicatif",
  "serde",
  "serde_json",
@@ -5588,13 +5616,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "blake3",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "time",
- "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -5602,31 +5627,22 @@ dependencies = [
 name = "thoth-embed"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "reqwest",
  "serde",
- "serde_json",
- "thiserror 2.0.18",
  "thoth-core",
- "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "thoth-graph"
 version = "0.0.1"
 dependencies = [
- "anyhow",
- "async-trait",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "thoth-core",
  "thoth-store",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -5634,6 +5650,7 @@ name = "thoth-mcp"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -5642,21 +5659,21 @@ dependencies = [
  "thoth-parse",
  "thoth-retrieve",
  "thoth-store",
+ "time",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "thoth-memory"
 version = "0.0.1"
 dependencies = [
- "anyhow",
- "async-trait",
  "rusqlite",
  "serde",
  "tempfile",
- "thiserror 2.0.18",
  "thoth-core",
  "thoth-store",
  "time",
@@ -5676,7 +5693,6 @@ dependencies = [
  "notify",
  "serde",
  "tempfile",
- "thiserror 2.0.18",
  "thoth-core",
  "time",
  "tokio",
@@ -5693,15 +5709,12 @@ dependencies = [
 name = "thoth-retrieve"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "blake3",
  "futures",
  "parking_lot",
  "serde",
- "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "thoth-core",
  "thoth-graph",
  "thoth-parse",
@@ -5716,11 +5729,8 @@ dependencies = [
 name = "thoth-store"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "arrow-array",
  "arrow-schema",
- "async-trait",
- "blake3",
  "futures",
  "lancedb",
  "parking_lot",
@@ -5730,7 +5740,6 @@ dependencies = [
  "serde_json",
  "tantivy 0.26.0",
  "tempfile",
- "thiserror 2.0.18",
  "thoth-core",
  "time",
  "tokio",
@@ -5742,17 +5751,11 @@ dependencies = [
 name = "thoth-synth"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "async-trait",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "thoth-core",
- "time",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]

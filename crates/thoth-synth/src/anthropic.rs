@@ -131,7 +131,11 @@ impl Synthesizer for AnthropicSynthesizer {
         if !prompt.lessons.is_empty() {
             user.push_str("### Lessons to keep in mind\n");
             for l in &prompt.lessons {
-                user.push_str(&format!("- when {}: {}\n", l.trigger.trim(), l.advice.trim()));
+                user.push_str(&format!(
+                    "- when {}: {}\n",
+                    l.trigger.trim(),
+                    l.advice.trim()
+                ));
             }
             user.push('\n');
         }
@@ -181,7 +185,9 @@ impl Synthesizer for AnthropicSynthesizer {
 
         let raw = self.messages(system, &user, 512).await?;
         let parsed: CritiqueResult = match extract_json(&raw) {
-            Some(json) => serde_json::from_str(&json).map_err(|e| Error::Provider(e.to_string()))?,
+            Some(json) => {
+                serde_json::from_str(&json).map_err(|e| Error::Provider(e.to_string()))?
+            }
             None => {
                 // Model replied in prose; treat as "no lesson".
                 return Ok(None);

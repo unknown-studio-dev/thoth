@@ -106,9 +106,7 @@ impl Retriever {
         // 0. (Mode::Full) optional query rewrite via the Synthesizer. We fall
         //    back to the original on `Ok(None)` or any error — retrieval
         //    should never harden-fail because a rewrite failed.
-        let search_text: String = if with_synth
-            && let Some(s) = self.synthesizer.as_ref()
-        {
+        let search_text: String = if with_synth && let Some(s) = self.synthesizer.as_ref() {
             match s.rewrite_query(&q.text).await {
                 Ok(Some(rewritten)) if !rewritten.trim().is_empty() => rewritten,
                 _ => q.text.clone(),
@@ -159,9 +157,7 @@ impl Retriever {
         // 6. (Mode::Full) vector similarity — only if both an embedder and a
         //    vector store are configured. Silent no-op otherwise so that
         //    Mode::Full without a key still degrades to Mode::Zero recall.
-        if with_vector
-            && let Some(hits) = self.vector_stage(&search_text, k * 3).await?
-        {
+        if with_vector && let Some(hits) = self.vector_stage(&search_text, k * 3).await? {
             let scoped = filter_scope(hits, scope);
             for (rank, cand) in scoped.iter().enumerate() {
                 fuse(&mut fused, cand, rank);
@@ -565,8 +561,7 @@ fn filter_scope(cands: Vec<Candidate>, scope: &QueryScope) -> Vec<Candidate> {
     cands
         .into_iter()
         .filter(|c| {
-            if !scope.paths.is_empty() && !scope.paths.iter().any(|p| path_has_prefix(&c.path, p))
-            {
+            if !scope.paths.is_empty() && !scope.paths.iter().any(|p| path_has_prefix(&c.path, p)) {
                 return false;
             }
             if !scope.languages.is_empty()
@@ -645,7 +640,9 @@ fn episode_preview(ev: &Event) -> Option<String> {
             Outcome::Commit { sha, .. } => format!("past outcome — commit {sha}"),
             Outcome::Revert { sha, reason } => {
                 let why = reason.as_deref().unwrap_or("");
-                format!("past outcome — revert {sha}: {why}").trim().to_string()
+                format!("past outcome — revert {sha}: {why}")
+                    .trim()
+                    .to_string()
             }
             Outcome::UserFeedback { signal, note } => {
                 let tail = note.as_deref().unwrap_or("");
@@ -656,7 +653,12 @@ fn episode_preview(ev: &Event) -> Option<String> {
             Outcome::Error { summary, .. } => format!("past outcome — error: {summary}"),
         }),
         Event::FileChanged { path, .. } => Some(format!("file changed: {}", path.display())),
-        Event::FileDeleted { .. } | Event::AnswerReturned { .. } => None,
+        Event::NudgeInvoked { intent, .. } if !intent.is_empty() => {
+            Some(format!("past nudge: {intent}"))
+        }
+        Event::FileDeleted { .. } | Event::AnswerReturned { .. } | Event::NudgeInvoked { .. } => {
+            None
+        }
     }
 }
 

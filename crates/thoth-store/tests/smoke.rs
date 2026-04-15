@@ -56,7 +56,11 @@ async fn store_root_migrates_legacy_index_layout() {
     assert!(root.path.join("episodes.db").exists());
     // … and carry the legacy data (the kv marker survives the rename).
     assert_eq!(
-        root.kv.get_meta("migration-marker").await.unwrap().as_deref(),
+        root.kv
+            .get_meta("migration-marker")
+            .await
+            .unwrap()
+            .as_deref(),
         Some(&b"present"[..])
     );
     // Legacy dir is pruned after a successful migration.

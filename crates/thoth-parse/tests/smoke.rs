@@ -158,12 +158,9 @@ async fn walk_respects_thothignore() {
     tokio::fs::write(dir.path().join("generated").join("out.rs"), "fn g() {}")
         .await
         .unwrap();
-    tokio::fs::write(
-        dir.path().join(".thothignore"),
-        "skip.rs\ngenerated/\n",
-    )
-    .await
-    .unwrap();
+    tokio::fs::write(dir.path().join(".thothignore"), "skip.rs\ngenerated/\n")
+        .await
+        .unwrap();
 
     let reg = LanguageRegistry::new();
     let files = walk_sources(dir.path(), &reg, &WalkOptions::default());
@@ -171,7 +168,10 @@ async fn walk_respects_thothignore() {
         .iter()
         .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
         .collect();
-    assert!(names.contains(&"keep.rs".to_string()), "keep.rs missing: {names:?}");
+    assert!(
+        names.contains(&"keep.rs".to_string()),
+        "keep.rs missing: {names:?}"
+    );
     assert!(
         !names.contains(&"skip.rs".to_string()),
         ".thothignore file rule not honoured: {names:?}",
@@ -210,7 +210,10 @@ async fn walk_respects_extra_ignore_patterns() {
         .iter()
         .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
         .collect();
-    assert!(names.contains(&"a.rs".to_string()), "a.rs missing: {names:?}");
+    assert!(
+        names.contains(&"a.rs".to_string()),
+        "a.rs missing: {names:?}"
+    );
     assert!(
         !names.contains(&"a.generated.rs".to_string()),
         "glob pattern not honoured: {names:?}",
@@ -240,7 +243,10 @@ async fn walk_survives_bad_extra_pattern() {
         .iter()
         .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
         .collect();
-    assert!(names.contains(&"a.rs".to_string()), "good files dropped: {names:?}");
+    assert!(
+        names.contains(&"a.rs".to_string()),
+        "good files dropped: {names:?}"
+    );
 }
 
 #[tokio::test]

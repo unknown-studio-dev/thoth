@@ -17,12 +17,7 @@ cohere  = ["dep:reqwest"]
 
 [dependencies]
 thoth-core   = { workspace = true }
-tokio        = { workspace = true }
 async-trait  = { workspace = true }
-thiserror    = { workspace = true }
-anyhow       = { workspace = true }
 serde        = { workspace = true }
-serde_json   = { workspace = true }
-tracing      = { workspace = true }
 
 reqwest      = { workspace = true, optional = true }

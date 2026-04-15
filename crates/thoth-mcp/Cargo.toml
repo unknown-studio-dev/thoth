@@ -12,6 +12,10 @@ description = "MCP (Model Context Protocol) stdio server for Thoth — plug-and-
 name = "thoth-mcp"
 path = "src/main.rs"
 
+[[bin]]
+name = "thoth-gate"
+path = "src/bin/gate.rs"
+
 [lib]
 name = "thoth_mcp"
 path = "src/lib.rs"
@@ -29,6 +33,14 @@ tracing              = { workspace = true }
 tracing-subscriber   = { workspace = true }
 serde                = { workspace = true }
 serde_json           = { workspace = true }
+time                 = { workspace = true }
+uuid                 = { workspace = true }
+
+# Used only by the `thoth-gate` binary — direct SQLite query against
+# episodes.db without going through the MCP server. Keeping it here
+# (rather than a new crate) avoids another link step.
+rusqlite             = { workspace = true }
+toml                 = { workspace = true }
 
 [dev-dependencies]
 tempfile             = { workspace = true }

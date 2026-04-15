@@ -239,7 +239,9 @@ pub async fn install(scope: Scope) -> anyhow::Result<()> {
     write_settings(&path, &settings).await?;
 
     println!("✓ hooks installed into {}", path.display());
-    println!("  events: SessionStart · UserPromptSubmit · PostToolUse(Edit|Write|MultiEdit) · Stop");
+    println!(
+        "  events: SessionStart · UserPromptSubmit · PostToolUse(Edit|Write|MultiEdit) · Stop"
+    );
     println!("  uninstall: thoth hooks uninstall");
     Ok(())
 }

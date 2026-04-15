@@ -176,9 +176,7 @@ impl Language {
             #[cfg(feature = "lang-python")]
             LanguageKind::Python => node_kind == "call",
             #[cfg(any(feature = "lang-javascript", feature = "lang-typescript"))]
-            LanguageKind::JavaScript | LanguageKind::TypeScript => {
-                node_kind == "call_expression"
-            }
+            LanguageKind::JavaScript | LanguageKind::TypeScript => node_kind == "call_expression",
             #[cfg(feature = "lang-go")]
             LanguageKind::Go => node_kind == "call_expression",
             _ => false,
@@ -199,9 +197,10 @@ impl Language {
     ) -> Option<String> {
         let raw = match (self.inner, node.kind()) {
             #[cfg(feature = "lang-rust")]
-            (LanguageKind::Rust, "call_expression") => {
-                node.child_by_field_name("function")?.utf8_text(source).ok()?
-            }
+            (LanguageKind::Rust, "call_expression") => node
+                .child_by_field_name("function")?
+                .utf8_text(source)
+                .ok()?,
             #[cfg(feature = "lang-rust")]
             (LanguageKind::Rust, "method_call_expression") => {
                 node.child_by_field_name("method")?.utf8_text(source).ok()?
@@ -211,17 +210,20 @@ impl Language {
                 node.child_by_field_name("macro")?.utf8_text(source).ok()?
             }
             #[cfg(feature = "lang-python")]
-            (LanguageKind::Python, "call") => {
-                node.child_by_field_name("function")?.utf8_text(source).ok()?
-            }
+            (LanguageKind::Python, "call") => node
+                .child_by_field_name("function")?
+                .utf8_text(source)
+                .ok()?,
             #[cfg(any(feature = "lang-javascript", feature = "lang-typescript"))]
-            (LanguageKind::JavaScript | LanguageKind::TypeScript, "call_expression") => {
-                node.child_by_field_name("function")?.utf8_text(source).ok()?
-            }
+            (LanguageKind::JavaScript | LanguageKind::TypeScript, "call_expression") => node
+                .child_by_field_name("function")?
+                .utf8_text(source)
+                .ok()?,
             #[cfg(feature = "lang-go")]
-            (LanguageKind::Go, "call_expression") => {
-                node.child_by_field_name("function")?.utf8_text(source).ok()?
-            }
+            (LanguageKind::Go, "call_expression") => node
+                .child_by_field_name("function")?
+                .utf8_text(source)
+                .ok()?,
             _ => return None,
         };
         Some(last_name_segment(raw))

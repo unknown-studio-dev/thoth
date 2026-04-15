@@ -8,18 +8,20 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use thoth_core::{Fact, Lesson, MemoryKind, MemoryMeta, Query};
-use thoth_memory::MemoryManager;
+use thoth_core::{Event, Fact, Lesson, MemoryKind, MemoryMeta, Outcome, Query, UserSignal};
+use thoth_memory::{DisciplineConfig, MemoryManager};
 use thoth_parse::LanguageRegistry;
 use thoth_retrieve::{Indexer, Retriever};
 use thoth_store::StoreRoot;
+use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::proto::{
-    CallToolResult, Capabilities, ContentBlock, InitializeResult, MCP_PROTOCOL_VERSION, Resource,
-    ResourceContents, RpcError, RpcIncoming, RpcResponse, ServerInfo, Tool, ToolOutput,
-    error_codes,
+    CallToolResult, Capabilities, ContentBlock, GetPromptResult, InitializeResult,
+    MCP_PROTOCOL_VERSION, Prompt, PromptArgument, PromptMessage, Resource, ResourceContents,
+    RpcError, RpcIncoming, RpcResponse, ServerInfo, Tool, ToolOutput, error_codes,
 };
 
 /// URI of the `MEMORY.md` resource.
@@ -82,6 +84,8 @@ impl Server {
             "thoth.call" => self.thoth_call(msg.params).await,
             "resources/list" => Ok(self.resources_list()),
             "resources/read" => self.resources_read(msg.params).await,
+            "prompts/list" => Ok(self.prompts_list()),
+            "prompts/get" => self.prompts_get(msg.params).await,
             other => Err(RpcError::new(
                 error_codes::METHOD_NOT_FOUND,
                 format!("method not found: {other}"),
@@ -109,6 +113,7 @@ impl Server {
             capabilities: Capabilities {
                 tools: Some(json!({})),
                 resources: Some(json!({})),
+                prompts: Some(json!({})),
             },
             server_info: ServerInfo {
                 name: "thoth-mcp".to_string(),
@@ -167,6 +172,14 @@ impl Server {
             "thoth_skills_list" => self.tool_skills_list().await,
             "thoth_memory_show" => self.tool_memory_show().await,
             "thoth_memory_forget" => self.tool_memory_forget().await,
+            "thoth_episode_append" => self.tool_episode_append(arguments).await,
+            "thoth_lesson_outcome" => self.tool_lesson_outcome(arguments).await,
+            "thoth_memory_pending" => self.tool_memory_pending().await,
+            "thoth_memory_promote" => self.tool_memory_promote(arguments).await,
+            "thoth_memory_reject" => self.tool_memory_reject(arguments).await,
+            "thoth_memory_history" => self.tool_memory_history(arguments).await,
+            "thoth_request_review" => self.tool_request_review(arguments).await,
+            "thoth_skill_propose" => self.tool_skill_propose(arguments).await,
             other => {
                 return Err(RpcError::new(
                     error_codes::METHOD_NOT_FOUND,
@@ -244,11 +257,25 @@ impl Server {
         }
         let Args { query, top_k } = serde_json::from_value(args)?;
         let q = Query {
-            text: query,
+            text: query.clone(),
             top_k: top_k.unwrap_or(8).max(1),
             ..Query::text("")
         };
         let out = self.inner.retriever.recall(&q).await?;
+
+        // Log a `QueryIssued` event so the strict-mode gate can prove the
+        // agent actually consulted memory before mutating files. Failure
+        // here is non-fatal — recall still returns the chunks — but we warn
+        // because a missing log entry will defeat the gate.
+        let ev = Event::QueryIssued {
+            id: Uuid::new_v4(),
+            text: query,
+            at: OffsetDateTime::now_utc(),
+        };
+        if let Err(e) = self.inner.store.episodes.append(&ev).await {
+            warn!(error = %e, "failed to log QueryIssued event");
+        }
+
         let text = render_retrieval(&out);
         // Serialize the full `Retrieval` so CLI `--json` sees the same
         // shape as the direct-store path. Fall back to an empty object on
@@ -293,19 +320,36 @@ impl Server {
             text: String,
             #[serde(default)]
             tags: Vec<String>,
+            /// If set, force staging even when the discipline config says
+            /// `memory_mode = "auto"`. The agent should set this whenever
+            /// it's uncertain — matches the `thoth_request_review` intent.
+            #[serde(default)]
+            stage: bool,
         }
-        let Args { text, tags } = serde_json::from_value(args)?;
+        let Args { text, tags, stage } = serde_json::from_value(args)?;
         let fact = Fact {
             meta: MemoryMeta::new(MemoryKind::Semantic),
             text: text.trim().to_string(),
             tags,
         };
-        self.inner.store.markdown.append_fact(&fact).await?;
-        let text = format!("remembered fact: {}", first_line(&fact.text));
+        let cfg = DisciplineConfig::load_or_default(&self.inner.root).await;
+        let staged = stage || cfg.requires_review();
+        let (path, status) = if staged {
+            self.inner.store.markdown.append_pending_fact(&fact).await?;
+            (
+                self.inner.root.join("MEMORY.pending.md"),
+                "staged (review mode) — run `thoth_memory_promote` to accept",
+            )
+        } else {
+            self.inner.store.markdown.append_fact(&fact).await?;
+            (self.inner.root.join("MEMORY.md"), "committed to MEMORY.md")
+        };
+        let text = format!("{status}: {}", first_line(&fact.text));
         let data = json!({
             "text": fact.text,
             "tags": fact.tags,
-            "path": self.inner.root.join("MEMORY.md").display().to_string(),
+            "path": path.display().to_string(),
+            "staged": staged,
         });
         Ok(ToolOutput::new(data, text))
     }
@@ -315,8 +359,14 @@ impl Server {
         struct Args {
             trigger: String,
             advice: String,
+            #[serde(default)]
+            stage: bool,
         }
-        let Args { trigger, advice } = serde_json::from_value(args)?;
+        let Args {
+            trigger,
+            advice,
+            stage,
+        } = serde_json::from_value(args)?;
         let lesson = Lesson {
             meta: MemoryMeta::new(MemoryKind::Reflective),
             trigger: trigger.trim().to_string(),
@@ -324,12 +374,303 @@ impl Server {
             success_count: 0,
             failure_count: 0,
         };
-        self.inner.store.markdown.append_lesson(&lesson).await?;
-        let text = format!("recorded lesson for trigger: {}", lesson.trigger);
+        let cfg = DisciplineConfig::load_or_default(&self.inner.root).await;
+        let staged = stage || cfg.requires_review();
+
+        // Conflict check: a lesson with the same trigger already exists.
+        // In review mode we always stage; in auto mode we still refuse to
+        // silently overwrite — force the agent to stage + escalate.
+        let conflict = self
+            .inner
+            .store
+            .markdown
+            .read_lessons()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|l| l.trigger.trim().eq_ignore_ascii_case(lesson.trigger.trim()));
+
+        let (path, status, staged) = if staged || conflict.is_some() {
+            self.inner
+                .store
+                .markdown
+                .append_pending_lesson(&lesson)
+                .await?;
+            let note = if conflict.is_some() {
+                "staged (conflict with existing lesson — user must review)"
+            } else {
+                "staged (review mode) — run `thoth_memory_promote` to accept"
+            };
+            (self.inner.root.join("LESSONS.pending.md"), note, true)
+        } else {
+            self.inner.store.markdown.append_lesson(&lesson).await?;
+            (
+                self.inner.root.join("LESSONS.md"),
+                "committed to LESSONS.md",
+                false,
+            )
+        };
+        let text = format!("{status}: {}", lesson.trigger);
         let data = json!({
             "trigger": lesson.trigger,
             "advice": lesson.advice,
-            "path": self.inner.root.join("LESSONS.md").display().to_string(),
+            "path": path.display().to_string(),
+            "staged": staged,
+            "conflict": conflict.map(|l| json!({
+                "trigger": l.trigger,
+                "existing_advice": l.advice,
+            })),
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    // -- review-mode plumbing ----------------------------------------------
+
+    async fn tool_memory_pending(&self) -> anyhow::Result<ToolOutput> {
+        let facts = self.inner.store.markdown.read_pending_facts().await?;
+        let lessons = self.inner.store.markdown.read_pending_lessons().await?;
+        let mut text = String::new();
+        text.push_str(&format!("── pending facts ({}) ──\n", facts.len()));
+        for (i, f) in facts.iter().enumerate() {
+            text.push_str(&format!("[{i}] {}\n", first_line(&f.text)));
+        }
+        text.push_str(&format!("\n── pending lessons ({}) ──\n", lessons.len()));
+        for (i, l) in lessons.iter().enumerate() {
+            text.push_str(&format!("[{i}] {}\n", l.trigger));
+        }
+        if facts.is_empty() && lessons.is_empty() {
+            text.push_str("(no pending entries)\n");
+        }
+        let data = json!({
+            "facts": facts
+                .iter()
+                .map(|f| json!({ "text": f.text, "tags": f.tags }))
+                .collect::<Vec<_>>(),
+            "lessons": lessons
+                .iter()
+                .map(|l| json!({
+                    "trigger": l.trigger,
+                    "advice": l.advice,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    async fn tool_memory_promote(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            kind: String,
+            index: usize,
+        }
+        let Args { kind, index } = serde_json::from_value(args)?;
+        let (title, ok) = match kind.as_str() {
+            "fact" => match self
+                .inner
+                .store
+                .markdown
+                .promote_pending_fact(index)
+                .await?
+            {
+                Some(f) => (first_line(&f.text), true),
+                None => (String::new(), false),
+            },
+            "lesson" => match self
+                .inner
+                .store
+                .markdown
+                .promote_pending_lesson(index)
+                .await?
+            {
+                Some(l) => (l.trigger, true),
+                None => (String::new(), false),
+            },
+            other => anyhow::bail!("unknown kind: {other} (expected `fact` or `lesson`)"),
+        };
+        let text = if ok {
+            format!("promoted {kind} [{index}]: {title}")
+        } else {
+            format!("no pending {kind} at index {index}")
+        };
+        let data = json!({ "kind": kind, "index": index, "promoted": ok, "title": title });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    async fn tool_memory_reject(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            kind: String,
+            index: usize,
+            #[serde(default)]
+            reason: Option<String>,
+        }
+        let Args {
+            kind,
+            index,
+            reason,
+        } = serde_json::from_value(args)?;
+        let (title, ok) = match kind.as_str() {
+            "fact" => {
+                match self
+                    .inner
+                    .store
+                    .markdown
+                    .reject_pending_fact(index, reason.as_deref())
+                    .await?
+                {
+                    Some(f) => (first_line(&f.text), true),
+                    None => (String::new(), false),
+                }
+            }
+            "lesson" => {
+                match self
+                    .inner
+                    .store
+                    .markdown
+                    .reject_pending_lesson(index, reason.as_deref())
+                    .await?
+                {
+                    Some(l) => (l.trigger, true),
+                    None => (String::new(), false),
+                }
+            }
+            other => anyhow::bail!("unknown kind: {other} (expected `fact` or `lesson`)"),
+        };
+        let text = if ok {
+            format!("rejected {kind} [{index}]: {title}")
+        } else {
+            format!("no pending {kind} at index {index}")
+        };
+        let data = json!({
+            "kind": kind,
+            "index": index,
+            "rejected": ok,
+            "title": title,
+            "reason": reason,
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    async fn tool_memory_history(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize, Default)]
+        struct Args {
+            #[serde(default)]
+            limit: Option<usize>,
+        }
+        let Args { limit } = serde_json::from_value(args).unwrap_or_default();
+        let mut entries = self.inner.store.markdown.read_history().await?;
+        if let Some(n) = limit
+            && entries.len() > n
+        {
+            let skip = entries.len() - n;
+            entries.drain(..skip);
+        }
+        let mut text = String::new();
+        for e in &entries {
+            text.push_str(&format!(
+                "{}  {:<10} {:<7} {}\n",
+                e.at_rfc3339, e.op, e.kind, e.title
+            ));
+        }
+        if entries.is_empty() {
+            text.push_str("(no history yet)\n");
+        }
+        let data = serde_json::to_value(&entries).unwrap_or_else(|_| json!([]));
+        Ok(ToolOutput::new(data, text))
+    }
+
+    async fn tool_request_review(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            kind: String,
+            title: String,
+            #[serde(default)]
+            reason: Option<String>,
+        }
+        let Args {
+            kind,
+            title,
+            reason,
+        } = serde_json::from_value(args)?;
+        self.inner
+            .store
+            .markdown
+            .append_history(&thoth_store::markdown::HistoryEntry {
+                op: "request_review",
+                kind: match kind.as_str() {
+                    "fact" => "fact",
+                    "lesson" => "lesson",
+                    "skill" => "skill",
+                    _ => "other",
+                },
+                title: title.clone(),
+                actor: Some("agent".to_string()),
+                reason: reason.clone(),
+            })
+            .await?;
+        let text = format!("review requested for {kind}: {title}");
+        let data = json!({ "kind": kind, "title": title, "reason": reason });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    async fn tool_skill_propose(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            /// Slug for the proposed skill directory under
+            /// `.thoth/skills/<slug>.draft/`.
+            slug: String,
+            /// The SKILL.md body the agent drafted. Must start with the
+            /// `---\nname: ...` frontmatter.
+            body: String,
+            /// Triggers of the lessons that motivated this proposal — used
+            /// only for the history log.
+            #[serde(default)]
+            source_triggers: Vec<String>,
+        }
+        let Args {
+            slug,
+            body,
+            source_triggers,
+        } = serde_json::from_value(args)?;
+        let clean_slug = slug
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>();
+        if clean_slug.is_empty() {
+            anyhow::bail!("skill slug must contain alphanumeric characters");
+        }
+        let draft_dir = self
+            .inner
+            .root
+            .join("skills")
+            .join(format!("{clean_slug}.draft"));
+        tokio::fs::create_dir_all(&draft_dir).await?;
+        tokio::fs::write(draft_dir.join("SKILL.md"), body.as_bytes()).await?;
+        self.inner
+            .store
+            .markdown
+            .append_history(&thoth_store::markdown::HistoryEntry {
+                op: "propose",
+                kind: "skill",
+                title: clean_slug.clone(),
+                actor: Some("agent".to_string()),
+                reason: if source_triggers.is_empty() {
+                    None
+                } else {
+                    Some(format!("from lessons: {}", source_triggers.join(", ")))
+                },
+            })
+            .await?;
+        let text = format!(
+            "skill proposal drafted at {} — review and run `thoth skills install` to accept",
+            draft_dir.display()
+        );
+        let data = json!({
+            "slug": clean_slug,
+            "path": draft_dir.display().to_string(),
+            "source_triggers": source_triggers,
         });
         Ok(ToolOutput::new(data, text))
     }
@@ -356,13 +697,17 @@ impl Server {
         let mm = MemoryManager::open(&self.inner.root).await?;
         let report = mm.forget_pass().await?;
         let text = format!(
-            "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={}",
-            report.episodes_ttl, report.episodes_cap, report.lessons_dropped
+            "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={} lessons_quarantined={}",
+            report.episodes_ttl,
+            report.episodes_cap,
+            report.lessons_dropped,
+            report.lessons_quarantined
         );
         let data = json!({
             "episodes_ttl": report.episodes_ttl,
             "episodes_cap": report.episodes_cap,
             "lessons_dropped": report.lessons_dropped,
+            "lessons_quarantined": report.lessons_quarantined,
         });
         Ok(ToolOutput::new(data, text))
     }
@@ -396,6 +741,217 @@ impl Server {
             "lessons_md": lessons_md,
         });
         Ok(ToolOutput::new(data, text))
+    }
+
+    /// Append a raw episodic event. Used by Claude Code hooks to record
+    /// what it observed during a session (file edits, tool outcomes, etc.)
+    /// so future reflective passes have ground-truth timeline data.
+    async fn tool_episode_append(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            /// One of: `file_changed`, `file_deleted`, `query_issued`,
+            /// `answer_returned`, `outcome_observed`.
+            kind: String,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            commit: Option<String>,
+            #[serde(default)]
+            text: Option<String>,
+            #[serde(default)]
+            outcome: Option<Value>,
+            #[serde(default)]
+            related_to: Option<String>,
+        }
+        let Args {
+            kind,
+            path,
+            commit,
+            text,
+            outcome,
+            related_to,
+        } = serde_json::from_value(args)?;
+
+        let at = OffsetDateTime::now_utc();
+        let ev = match kind.as_str() {
+            "file_changed" => Event::FileChanged {
+                path: PathBuf::from(
+                    path.ok_or_else(|| anyhow::anyhow!("file_changed requires `path`"))?,
+                ),
+                commit,
+                at,
+            },
+            "file_deleted" => Event::FileDeleted {
+                path: PathBuf::from(
+                    path.ok_or_else(|| anyhow::anyhow!("file_deleted requires `path`"))?,
+                ),
+                at,
+            },
+            "query_issued" => Event::QueryIssued {
+                id: Uuid::new_v4(),
+                text: text.ok_or_else(|| anyhow::anyhow!("query_issued requires `text`"))?,
+                at,
+            },
+            "answer_returned" => Event::AnswerReturned {
+                id: related_to
+                    .as_deref()
+                    .map(Uuid::parse_str)
+                    .transpose()?
+                    .unwrap_or_else(Uuid::new_v4),
+                chunk_ids: vec![],
+                synthesized: false,
+                at,
+            },
+            "outcome_observed" => {
+                let parsed: Outcome = serde_json::from_value(
+                    outcome
+                        .ok_or_else(|| anyhow::anyhow!("outcome_observed requires `outcome`"))?,
+                )?;
+                Event::OutcomeObserved {
+                    related_to: related_to
+                        .as_deref()
+                        .map(Uuid::parse_str)
+                        .transpose()?
+                        .unwrap_or_else(Uuid::new_v4),
+                    outcome: parsed,
+                    at,
+                }
+            }
+            "nudge_invoked" => Event::NudgeInvoked {
+                id: related_to
+                    .as_deref()
+                    .map(Uuid::parse_str)
+                    .transpose()?
+                    .unwrap_or_else(Uuid::new_v4),
+                intent: text.unwrap_or_default(),
+                at,
+            },
+            other => anyhow::bail!("unknown event kind: {other}"),
+        };
+
+        let id = self.inner.store.episodes.append(&ev).await?;
+        let text = format!("appended episode #{id} ({kind})");
+        let data = json!({ "id": id, "kind": kind });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// Bump lesson confidence counters based on an observed outcome.
+    ///
+    /// `signal` is one of `success` or `failure`. `triggers` is the list of
+    /// lesson triggers that were active when the outcome happened — typically
+    /// fed in by a hook from the tool call's prior `thoth_recall` response.
+    async fn tool_lesson_outcome(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            signal: String,
+            triggers: Vec<String>,
+            #[serde(default)]
+            note: Option<String>,
+        }
+        let Args {
+            signal,
+            triggers,
+            note,
+        } = serde_json::from_value(args)?;
+
+        let bumped = match signal.as_str() {
+            "success" => {
+                self.inner
+                    .store
+                    .markdown
+                    .bump_lesson_success(&triggers)
+                    .await?
+            }
+            "failure" => {
+                self.inner
+                    .store
+                    .markdown
+                    .bump_lesson_failure(&triggers)
+                    .await?
+            }
+            other => anyhow::bail!("unknown signal: {other} (expected `success` or `failure`)"),
+        };
+
+        // Also append an OutcomeObserved episode so the session log shows
+        // the lesson being exercised.
+        let ev = Event::OutcomeObserved {
+            related_to: Uuid::new_v4(),
+            outcome: Outcome::UserFeedback {
+                signal: match signal.as_str() {
+                    "success" => UserSignal::Accept,
+                    _ => UserSignal::Reject,
+                },
+                note,
+            },
+            at: OffsetDateTime::now_utc(),
+        };
+        let _ = self.inner.store.episodes.append(&ev).await?;
+
+        let text = format!("{signal}: bumped {bumped} lesson(s)");
+        let data = json!({ "signal": signal, "bumped": bumped, "triggers": triggers });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    // ---- prompts ----------------------------------------------------------
+
+    fn prompts_list(&self) -> Value {
+        json!({ "prompts": prompts_catalog() })
+    }
+
+    async fn prompts_get(&self, params: Value) -> Result<Value, RpcError> {
+        #[derive(Deserialize)]
+        struct GetParams {
+            name: String,
+            #[serde(default)]
+            arguments: serde_json::Map<String, Value>,
+        }
+        let GetParams { name, arguments } = serde_json::from_value(params)
+            .map_err(|e| RpcError::new(error_codes::INVALID_PARAMS, e.to_string()))?;
+
+        let (description, body) = match name.as_str() {
+            "thoth.reflect" => (
+                "Reflect on the session so far and decide what to remember.",
+                render_reflect_prompt(&arguments),
+            ),
+            "thoth.nudge" => {
+                // Record that the agent actually expanded the nudge prompt —
+                // strict-mode gates use this to distinguish "ran a recall"
+                // from "actually reflected on lessons".
+                let intent = arg_str(&arguments, "intent").to_string();
+                let ev = Event::NudgeInvoked {
+                    id: Uuid::new_v4(),
+                    intent: intent.clone(),
+                    at: OffsetDateTime::now_utc(),
+                };
+                if let Err(e) = self.inner.store.episodes.append(&ev).await {
+                    warn!(error = %e, "failed to log NudgeInvoked event");
+                }
+                (
+                    "Nudge before a risky step: recall relevant lessons and plan.",
+                    render_nudge_prompt(&arguments),
+                )
+            }
+            "thoth.grounding_check" => (
+                "Verify a claim against the indexed codebase before asserting it.",
+                render_grounding_prompt(&arguments),
+            ),
+            other => {
+                return Err(RpcError::new(
+                    error_codes::INVALID_PARAMS,
+                    format!("unknown prompt: {other}"),
+                ));
+            }
+        };
+
+        let result = GetPromptResult {
+            description: description.to_string(),
+            messages: vec![PromptMessage {
+                role: "user".to_string(),
+                content: ContentBlock::text(body),
+            }],
+        };
+        serde_json::to_value(result)
+            .map_err(|e| RpcError::new(error_codes::INTERNAL_ERROR, e.to_string()))
     }
 }
 
@@ -480,7 +1036,270 @@ fn tools_catalog() -> Vec<Tool> {
                 .to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
         },
+        Tool {
+            name: "thoth_episode_append".to_string(),
+            description: "Append one observed event (file edit, query, outcome, ...) to the \
+                          episodic log. Call this from hooks so future reflect passes have \
+                          accurate timeline data."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["file_changed", "file_deleted", "query_issued",
+                                 "answer_returned", "outcome_observed", "nudge_invoked"]
+                    },
+                    "path": { "type": "string" },
+                    "commit": { "type": "string" },
+                    "text": { "type": "string" },
+                    "outcome": { "type": "object" },
+                    "related_to": { "type": "string", "description": "UUID of a prior event." }
+                },
+                "required": ["kind"]
+            }),
+        },
+        Tool {
+            name: "thoth_lesson_outcome".to_string(),
+            description: "Record that a set of active lessons was followed successfully or \
+                          violated. Bumps their confidence counters and writes an outcome \
+                          event to the episodic log."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "signal":   { "type": "string", "enum": ["success", "failure"] },
+                    "triggers": { "type": "array", "items": { "type": "string" } },
+                    "note":     { "type": "string" }
+                },
+                "required": ["signal", "triggers"]
+            }),
+        },
+        Tool {
+            name: "thoth_memory_pending".to_string(),
+            description: "List every fact and lesson staged but not yet promoted. \
+                          Pending entries live in MEMORY.pending.md / LESSONS.pending.md \
+                          and are created automatically when `memory_mode = \"review\"`."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        Tool {
+            name: "thoth_memory_promote".to_string(),
+            description: "Promote a staged fact or lesson into the canonical MEMORY.md / \
+                          LESSONS.md. Use `thoth_memory_pending` first to see indices."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind":  { "type": "string", "enum": ["fact", "lesson"] },
+                    "index": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["kind", "index"]
+            }),
+        },
+        Tool {
+            name: "thoth_memory_reject".to_string(),
+            description: "Drop a staged fact or lesson without promoting it. Optional \
+                          `reason` is recorded in memory-history.jsonl."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind":   { "type": "string", "enum": ["fact", "lesson"] },
+                    "index":  { "type": "integer", "minimum": 0 },
+                    "reason": { "type": "string" }
+                },
+                "required": ["kind", "index"]
+            }),
+        },
+        Tool {
+            name: "thoth_memory_history".to_string(),
+            description: "Return the memory-history.jsonl log — every stage / promote / \
+                          reject / quarantine / propose operation with timestamps."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "description": "Return the latest N entries only." }
+                }
+            }),
+        },
+        Tool {
+            name: "thoth_request_review".to_string(),
+            description: "Flag an uncertain fact, lesson, or skill for the human to review. \
+                          Use when you're about to remember something but aren't sure — this \
+                          writes a `request_review` entry to memory-history.jsonl so the user \
+                          can act on it."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind":   { "type": "string", "enum": ["fact", "lesson", "skill"] },
+                    "title":  { "type": "string" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["kind", "title"]
+            }),
+        },
+        Tool {
+            name: "thoth_skill_propose".to_string(),
+            description: "Draft a new SKILL.md under .thoth/skills/<slug>.draft/ — used when \
+                          you've noticed ≥5 related lessons and want to consolidate them into \
+                          a reusable skill. The user promotes via `thoth skills install`."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "slug":            { "type": "string", "description": "kebab-case slug for the draft directory." },
+                    "body":            { "type": "string", "description": "Full SKILL.md body starting with `---` frontmatter." },
+                    "source_triggers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Triggers of the lessons this skill consolidates."
+                    }
+                },
+                "required": ["slug", "body"]
+            }),
+        },
     ]
+}
+
+// ===========================================================================
+// Prompts catalog
+// ===========================================================================
+
+/// Descriptors advertised by `prompts/list`. Each maps to a renderer in
+/// [`Server::prompts_get`]; rendering is pure string substitution so the
+/// server stays deterministic and dependency-free.
+fn prompts_catalog() -> Vec<Prompt> {
+    vec![
+        Prompt {
+            name: "thoth.reflect".to_string(),
+            description:
+                "End-of-step self-reflection: decide whether to save a lesson or fact based \
+                 on what just happened."
+                    .to_string(),
+            arguments: vec![
+                PromptArgument {
+                    name: "summary".to_string(),
+                    description: "One-paragraph summary of what the agent just did.".to_string(),
+                    required: true,
+                },
+                PromptArgument {
+                    name: "outcome".to_string(),
+                    description: "What went right or wrong (tests, user feedback, etc.)."
+                        .to_string(),
+                    required: false,
+                },
+            ],
+        },
+        Prompt {
+            name: "thoth.nudge".to_string(),
+            description:
+                "Pre-action nudge: surface the most relevant lessons and force the agent to \
+                 acknowledge them before proceeding."
+                    .to_string(),
+            arguments: vec![PromptArgument {
+                name: "intent".to_string(),
+                description: "What the agent is about to do.".to_string(),
+                required: true,
+            }],
+        },
+        Prompt {
+            name: "thoth.grounding_check".to_string(),
+            description: "Ask the agent to verify a factual claim against the indexed code before \
+                 asserting it to the user."
+                .to_string(),
+            arguments: vec![PromptArgument {
+                name: "claim".to_string(),
+                description: "The claim to verify.".to_string(),
+                required: true,
+            }],
+        },
+    ]
+}
+
+fn arg_str<'a>(args: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {
+    args.get(key).and_then(Value::as_str).unwrap_or("").trim()
+}
+
+fn render_reflect_prompt(args: &serde_json::Map<String, Value>) -> String {
+    let summary = arg_str(args, "summary");
+    let outcome = arg_str(args, "outcome");
+    format!(
+        "You just finished a step. Reflect on it before moving on.\n\
+         \n\
+         ## What you did\n\
+         {summary}\n\
+         \n\
+         ## Outcome observed\n\
+         {outcome}\n\
+         \n\
+         ## Decide\n\
+         1. Is there a durable FACT worth saving about this codebase?\n\
+            If yes, call `thoth_remember_fact` with a one-line summary.\n\
+         2. Is there a LESSON — a non-obvious pattern a future session would miss?\n\
+            If yes, call `thoth_remember_lesson` with a crisp `trigger` and `advice`.\n\
+         3. If neither, reply `no memory needed` and continue.\n\
+         \n\
+         Be conservative: only save memory that is useful, specific, and not \
+         already obvious from the code itself.",
+        summary = if summary.is_empty() {
+            "(not provided)"
+        } else {
+            summary
+        },
+        outcome = if outcome.is_empty() {
+            "(not provided)"
+        } else {
+            outcome
+        },
+    )
+}
+
+fn render_nudge_prompt(args: &serde_json::Map<String, Value>) -> String {
+    let intent = arg_str(args, "intent");
+    format!(
+        "Before you act, recall what past sessions learned.\n\
+         \n\
+         ## Intended action\n\
+         {intent}\n\
+         \n\
+         ## Required checks\n\
+         1. Call `thoth_recall` with a short query derived from the intent above.\n\
+         2. Read LESSONS.md via `resources/read thoth://memory/LESSONS.md` and pick \
+            every lesson whose `trigger` plausibly applies.\n\
+         3. Restate the plan in one paragraph, naming each lesson you're honouring.\n\
+         4. Only then execute. If a lesson advises against the plan, STOP and ask \
+            the user before proceeding.",
+        intent = if intent.is_empty() {
+            "(not provided)"
+        } else {
+            intent
+        },
+    )
+}
+
+fn render_grounding_prompt(args: &serde_json::Map<String, Value>) -> String {
+    let claim = arg_str(args, "claim");
+    format!(
+        "Verify the following claim against the indexed codebase BEFORE asserting it.\n\
+         \n\
+         ## Claim\n\
+         {claim}\n\
+         \n\
+         ## Procedure\n\
+         1. Call `thoth_recall` with the most load-bearing nouns from the claim.\n\
+         2. Read the returned chunks and decide: supported, contradicted, or \
+            insufficient evidence.\n\
+         3. If supported, cite at least one chunk id when you answer the user.\n\
+         4. If contradicted or insufficient, say so honestly — do not hedge.",
+        claim = if claim.is_empty() {
+            "(not provided)"
+        } else {
+            claim
+        },
+    )
 }
 
 // ===========================================================================
@@ -600,10 +1419,7 @@ pub async fn run_socket(server: Server) -> anyhow::Result<()> {
 }
 
 /// Handle one Unix-socket connection: read lines, dispatch, respond.
-async fn handle_socket_conn(
-    server: Server,
-    stream: tokio::net::UnixStream,
-) -> anyhow::Result<()> {
+async fn handle_socket_conn(server: Server, stream: tokio::net::UnixStream) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();

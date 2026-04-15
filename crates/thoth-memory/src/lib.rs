@@ -25,9 +25,9 @@ pub use working::{WorkingMemory, WorkingNote};
 
 use std::path::Path;
 use thoth_core::{Event, Result, Synthesizer};
+use thoth_store::StoreRoot;
 use thoth_store::episodes::EpisodeLog;
 use thoth_store::markdown::MarkdownStore;
-use thoth_store::StoreRoot;
 use time::{Duration, OffsetDateTime};
 
 /// Config controlling the memory lifecycle.
@@ -77,11 +77,135 @@ impl Default for MemoryConfig {
     }
 }
 
-/// TOML file schema — mirrors the `[memory]` table in `<root>/config.toml`.
+/// TOML file schema — mirrors the `[memory]` and `[discipline]` tables in
+/// `<root>/config.toml`.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigFile {
     memory: MemoryConfig,
+    #[serde(default)]
+    discipline: DisciplineConfig,
+}
+
+/// Enforcement policy for the memory-discipline loop.
+///
+/// Read by hook runners and by the plugin skills; the MCP server itself
+/// doesn't enforce anything — it just exposes memory tools. What the
+/// `discipline` block controls is **how loud** the plugin skills get when
+/// they detect that a lesson was violated or a reflect-step was skipped.
+///
+/// Two modes:
+///
+/// - `soft` (default): the skill reminds the agent but never blocks.
+/// - `strict`: the skill returns a hard `deny` to Claude Code hooks, which
+///   aborts the tool call until the agent re-plans with lessons in hand.
+///
+/// `global_fallback = true` (default) lets the plugin fall back to the
+/// user-level `~/.thoth/` memory when no project-local `.thoth/` exists,
+/// so lessons travel across checkouts of scratch repos.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DisciplineConfig {
+    /// `"soft"` (warn only) or `"strict"` (deny on violation). Default
+    /// `"soft"` — match the principle of "nudge, don't yoke".
+    pub mode: String,
+    /// Fall back to `~/.thoth/` memory when the current project has no
+    /// `.thoth/` directory. Default `true`.
+    pub global_fallback: bool,
+    /// Ask for a `thoth.reflect` pass after every tool call (`"every"`) or
+    /// only at session end (`"end"`). Default `"end"` — avoid thrash on
+    /// trivial edits.
+    pub reflect_cadence: String,
+    /// Ask for a `thoth.nudge` pass before destructive actions. Default
+    /// `true`.
+    pub nudge_before_write: bool,
+    /// Ask for a `thoth.grounding_check` on any load-bearing factual claim
+    /// in the assistant's response. Default `false` (opt-in — it's the
+    /// slowest of the three).
+    pub grounding_check: bool,
+    /// How new facts and lessons land in memory:
+    ///
+    /// - `"auto"` (default) — `thoth_remember_fact` and
+    ///   `thoth_remember_lesson` write straight to `MEMORY.md` / `LESSONS.md`.
+    /// - `"review"` — writes land in `MEMORY.pending.md` / `LESSONS.pending.md`
+    ///   and a human must run `thoth_memory_promote` (or the CLI equivalent)
+    ///   to accept them. Rejected entries are archived with a reason.
+    ///
+    /// Teams that want hard curation should switch to `"review"`; teams that
+    /// trust the agent can stay on `"auto"` and rely on the forget pass +
+    /// confidence counters to prune bad memory later.
+    pub memory_mode: String,
+    /// In `strict` mode, the gate also requires a `nudge_invoked` event
+    /// within [`Self::gate_window_secs`] before a `Write`/`Edit`/`Bash`
+    /// tool call. This forces the agent to actually expand `thoth.nudge`
+    /// (not just run a no-op `thoth_recall`). Default `false`.
+    pub gate_require_nudge: bool,
+    /// Lessons whose `failure_count / (success_count + failure_count)`
+    /// exceeds this ratio (once they have at least
+    /// [`Self::quarantine_min_attempts`] attempts) are moved from
+    /// `LESSONS.md` to `LESSONS.quarantined.md` during the forget pass.
+    /// Default `0.66` — i.e. twice as many failures as successes.
+    pub quarantine_failure_ratio: f32,
+    /// Minimum `success_count + failure_count` before a lesson is eligible
+    /// for quarantine. Default `5` — a freshly minted lesson with one
+    /// failure shouldn't get yanked.
+    pub quarantine_min_attempts: u32,
+}
+
+impl Default for DisciplineConfig {
+    fn default() -> Self {
+        Self {
+            mode: "soft".to_string(),
+            global_fallback: true,
+            reflect_cadence: "end".to_string(),
+            nudge_before_write: true,
+            grounding_check: false,
+            memory_mode: "auto".to_string(),
+            gate_require_nudge: false,
+            quarantine_failure_ratio: 0.66,
+            quarantine_min_attempts: 5,
+        }
+    }
+}
+
+impl DisciplineConfig {
+    /// `true` if new memory should be staged (pending) instead of
+    /// auto-committed.
+    pub fn requires_review(&self) -> bool {
+        self.memory_mode.eq_ignore_ascii_case("review")
+    }
+}
+
+impl DisciplineConfig {
+    /// Load `<root>/config.toml` if it exists, else return defaults.
+    ///
+    /// Same tolerant behaviour as [`MemoryConfig::load_or_default`]: missing
+    /// file → defaults, malformed file → warn + defaults.
+    pub async fn load_or_default(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "discipline: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        match toml::from_str::<ConfigFile>(&text) {
+            Ok(cf) => cf.discipline,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "discipline: config.toml parse error, using defaults");
+                Self::default()
+            }
+        }
+    }
+
+    /// `true` if mode is `"strict"`.
+    pub fn is_strict(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("strict")
+    }
 }
 
 impl MemoryConfig {
@@ -198,8 +322,7 @@ impl MemoryManager {
         let cutoff = now - Duration::days(ttl_days);
         let cutoff_ns_i128 = cutoff.unix_timestamp_nanos();
         // Clamp to i64 since that's what the store uses.
-        let cutoff_ns = cutoff_ns_i128
-            .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let cutoff_ns = cutoff_ns_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
         let episodes_ttl = self.episodes.delete_older_than(cutoff_ns).await?;
         let episodes_cap = self
@@ -211,12 +334,20 @@ impl MemoryManager {
 
         let lessons_dropped = self.drop_low_confidence_lessons().await?;
 
+        // Auto-quarantine: lessons whose failure ratio blew past the
+        // discipline threshold. Different from `drop_low_confidence_lessons`
+        // in two ways: it's opt-in via `DisciplineConfig`, and it preserves
+        // the offending lesson in `LESSONS.quarantined.md` so a human can
+        // review and restore it later.
+        let lessons_quarantined = self.auto_quarantine_lessons().await?;
+
         tracing::info!(
             ttl_days,
             episodes_ttl,
             episodes_cap,
             episodes_decayed,
             lessons_dropped,
+            lessons_quarantined,
             "memory: forget pass complete"
         );
 
@@ -225,7 +356,39 @@ impl MemoryManager {
             episodes_cap,
             episodes_decayed,
             lessons_dropped,
+            lessons_quarantined,
         })
+    }
+
+    /// Move every lesson whose failure ratio has tripped the configured
+    /// threshold into `LESSONS.quarantined.md`. Threshold knobs live in
+    /// [`DisciplineConfig::quarantine_failure_ratio`] and
+    /// [`DisciplineConfig::quarantine_min_attempts`].
+    async fn auto_quarantine_lessons(&self) -> Result<u64> {
+        let root = self.md.root.clone();
+        let dcfg = DisciplineConfig::load_or_default(&root).await;
+        if dcfg.quarantine_failure_ratio <= 0.0 || dcfg.quarantine_min_attempts == 0 {
+            return Ok(0);
+        }
+        let min_attempts = dcfg.quarantine_min_attempts as u64;
+        let ratio_threshold = dcfg.quarantine_failure_ratio;
+
+        let lessons = self.md.read_lessons().await?;
+        let mut to_quarantine: Vec<String> = Vec::new();
+        for l in &lessons {
+            let attempts = l.success_count + l.failure_count;
+            if attempts < min_attempts {
+                continue;
+            }
+            let ratio = l.failure_count as f32 / attempts as f32;
+            if ratio >= ratio_threshold {
+                to_quarantine.push(l.trigger.trim().to_string());
+            }
+        }
+        if to_quarantine.is_empty() {
+            return Ok(0);
+        }
+        self.md.quarantine_lessons(&to_quarantine).await
     }
 
     /// Compute [`effective_retention_score`] for every surviving episode
@@ -301,11 +464,7 @@ impl MemoryManager {
     ///
     /// `window` bounds how many recent episodes are scanned. `0` means
     /// "use the default of 64".
-    pub async fn nudge(
-        &self,
-        synth: &dyn Synthesizer,
-        window: usize,
-    ) -> Result<NudgeReport> {
+    pub async fn nudge(&self, synth: &dyn Synthesizer, window: usize) -> Result<NudgeReport> {
         if !self.config.enable_nudge {
             return Ok(NudgeReport::default());
         }
@@ -489,8 +648,6 @@ mod decay_tests {
     }
 }
 
-
-
 /// Stats produced by a forgetting pass.
 #[derive(Debug, Clone, Default)]
 pub struct ForgetReport {
@@ -503,6 +660,9 @@ pub struct ForgetReport {
     pub episodes_decayed: u64,
     /// How many lessons were dropped for low confidence.
     pub lessons_dropped: u64,
+    /// How many lessons were moved to `LESSONS.quarantined.md` because
+    /// their failure ratio exceeded the configured threshold.
+    pub lessons_quarantined: u64,
 }
 
 /// Stats produced by a nudge pass.

@@ -69,9 +69,9 @@ pub use vector::VectorStore;
 #[cfg(feature = "lance")]
 pub use vector_lance::LanceVectorStore as VectorStore;
 // Keep the concrete names around too, for callers that need to be explicit.
+pub use vector::VectorStore as SqliteVectorStore;
 #[cfg(feature = "lance")]
 pub use vector_lance::LanceVectorStore;
-pub use vector::VectorStore as SqliteVectorStore;
 
 /// Root handle bundling every backend living under a `.thoth/` dir.
 ///

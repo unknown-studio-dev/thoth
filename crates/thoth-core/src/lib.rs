@@ -23,7 +23,7 @@ pub mod provider;
 pub mod query;
 
 pub use error::{Error, Result};
-pub use event::{Event, EventId, Outcome};
+pub use event::{Event, EventId, Outcome, UserSignal};
 pub use memory::{Fact, Lesson, MemoryKind, MemoryMeta, Skill};
 pub use mode::Mode;
 pub use provider::{Embedder, NudgeProposal, Prompt, Synthesis, Synthesizer};

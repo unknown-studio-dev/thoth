@@ -87,19 +87,20 @@ async fn thoth_call_returns_structured_tool_output() {
     // The result IS the ToolOutput — no `content` wrapper.
     let result = &resp["result"];
     assert_eq!(result["isError"], false);
+    // In the default (auto) discipline config the fact commits straight to
+    // MEMORY.md; in review mode it would say "staged (review mode)". Both
+    // carry the fact text.
     assert!(
         result["text"]
             .as_str()
             .unwrap()
-            .contains("remembered fact:"),
+            .contains("committed to MEMORY.md"),
         "got text: {}",
         result["text"]
     );
-    assert_eq!(
-        result["data"]["text"],
-        "sockets close after one response"
-    );
+    assert_eq!(result["data"]["text"], "sockets close after one response");
     assert_eq!(result["data"]["tags"], json!(["mcp", "transport"]));
+    assert_eq!(result["data"]["staged"], false);
     assert!(
         result["data"]["path"]
             .as_str()
@@ -241,8 +242,5 @@ async fn second_daemon_refuses_to_steal_the_socket() {
     let res = run_socket(server.clone()).await;
     assert!(res.is_err(), "second daemon should not have bound");
     let msg = format!("{}", res.unwrap_err());
-    assert!(
-        msg.contains("already listening"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("already listening"), "unexpected error: {msg}");
 }

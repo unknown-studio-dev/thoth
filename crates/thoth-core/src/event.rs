@@ -57,6 +57,18 @@ pub enum Event {
         /// Timestamp.
         at: OffsetDateTime,
     },
+    /// The agent expanded the `thoth.nudge` prompt. Recorded so the
+    /// strict-mode gate can require a real nudge pass (not just a
+    /// perfunctory recall) before mutating code.
+    NudgeInvoked {
+        /// Correlation id so follow-up events can tie back to the nudge.
+        id: EventId,
+        /// One-sentence intent the agent supplied when expanding the
+        /// prompt (e.g. "refactor the retry wrapper").
+        intent: String,
+        /// Timestamp.
+        at: OffsetDateTime,
+    },
 }
 
 /// Outcome of applying an answer.

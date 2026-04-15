@@ -11,15 +11,10 @@ description = "Embedded storage backends: redb (KV + graph), tantivy (BM25), Lan
 [dependencies]
 thoth-core   = { workspace = true }
 tokio        = { workspace = true }
-async-trait  = { workspace = true }
-thiserror    = { workspace = true }
-anyhow       = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 tracing      = { workspace = true }
-uuid         = { workspace = true }
 time         = { workspace = true }
-blake3       = { workspace = true }
 parking_lot  = { workspace = true }
 
 # Graph / KV (redb — pure Rust embedded B-tree store)
@@ -47,7 +42,7 @@ arrow-schema = { version = "52",   optional = true }
 futures      = { workspace = true, optional = true }
 
 [features]
-default = ["lance"]
+default = []
 # Reserved feature flag for the SQLite flat-cosine vector store's "rich
 # search" mode (currently always-on; left here for future gating).
 vector = []
@@ -61,3 +56,4 @@ lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = { workspace = true }
+uuid = {workspace = true}

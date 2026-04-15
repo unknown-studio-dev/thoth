@@ -128,8 +128,7 @@ impl Indexer {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.walk_opts.extra_ignore_patterns =
-            patterns.into_iter().map(Into::into).collect();
+        self.walk_opts.extra_ignore_patterns = patterns.into_iter().map(Into::into).collect();
         self
     }
 
@@ -202,7 +201,12 @@ impl Indexer {
         let root = root.as_ref().to_path_buf();
         let files = walk_sources(&root, &self.registry, &self.walk_opts);
         let total = files.len();
-        debug!(count = total, ?root, concurrency = self.concurrency, "indexing");
+        debug!(
+            count = total,
+            ?root,
+            concurrency = self.concurrency,
+            "indexing"
+        );
         self.emit(IndexProgress {
             stage: "walk",
             done: 0,

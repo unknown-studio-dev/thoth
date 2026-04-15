@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Discussions
+    url: https://github.com/unknown-studio-dev/thoth/discussions
+    about: Open-ended questions, ideas, showing off your LESSONS.md.
+  - name: 📚 Read the design doc
+    url: https://github.com/unknown-studio-dev/thoth/blob/main/DESIGN.md
+    about: North-star design. Changes there need a PR first, not an issue.
+  - name: 🛠 Troubleshooting
+    url: https://github.com/unknown-studio-dev/thoth/blob/main/plugins/thoth-discipline/README.md#troubleshooting
+    about: Common fixes for hook / gate / MCP issues before you file a bug.

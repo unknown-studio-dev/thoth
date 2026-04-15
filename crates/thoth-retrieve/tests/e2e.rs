@@ -116,10 +116,7 @@ pub fn helper(x: i32) -> i32 {
     idx.index_path(src_dir.path()).await.unwrap();
 
     let r = Retriever::new(store);
-    let out = r
-        .recall(&Query::text("do_heavy_lifting"))
-        .await
-        .unwrap();
+    let out = r.recall(&Query::text("do_heavy_lifting")).await.unwrap();
 
     // Find the chunk whose symbol is do_heavy_lifting.
     let heavy = out

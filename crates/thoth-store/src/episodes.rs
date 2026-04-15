@@ -376,12 +376,15 @@ fn event_kind_tag(ev: &Event) -> &'static str {
         Event::QueryIssued { .. } => "query_issued",
         Event::AnswerReturned { .. } => "answer_returned",
         Event::OutcomeObserved { .. } => "outcome_observed",
+        Event::NudgeInvoked { .. } => "nudge_invoked",
     }
 }
 
 fn event_id_of(ev: &Event) -> Option<EventId> {
     match ev {
-        Event::QueryIssued { id, .. } | Event::AnswerReturned { id, .. } => Some(*id),
+        Event::QueryIssued { id, .. }
+        | Event::AnswerReturned { id, .. }
+        | Event::NudgeInvoked { id, .. } => Some(*id),
         Event::OutcomeObserved { related_to, .. } => Some(*related_to),
         _ => None,
     }
@@ -393,7 +396,8 @@ fn event_at_ns(ev: &Event) -> i64 {
         | Event::FileDeleted { at, .. }
         | Event::QueryIssued { at, .. }
         | Event::AnswerReturned { at, .. }
-        | Event::OutcomeObserved { at, .. } => at,
+        | Event::OutcomeObserved { at, .. }
+        | Event::NudgeInvoked { at, .. } => at,
     };
     t.unix_timestamp_nanos().min(i64::MAX as i128) as i64
 }
@@ -409,16 +413,12 @@ fn store<E: std::fmt::Display>(e: E) -> Error {
 fn ensure_decay_columns(c: &Connection) -> Result<()> {
     let existing = existing_columns(c)?;
     if !existing.iter().any(|n| n == "salience") {
-        c.execute_batch(
-            "ALTER TABLE episodes ADD COLUMN salience REAL NOT NULL DEFAULT 1.0",
-        )
-        .map_err(store)?;
+        c.execute_batch("ALTER TABLE episodes ADD COLUMN salience REAL NOT NULL DEFAULT 1.0")
+            .map_err(store)?;
     }
     if !existing.iter().any(|n| n == "access_count") {
-        c.execute_batch(
-            "ALTER TABLE episodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
-        )
-        .map_err(store)?;
+        c.execute_batch("ALTER TABLE episodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0")
+            .map_err(store)?;
     }
     if !existing.iter().any(|n| n == "last_accessed_ns") {
         // Nullable: NULL means "never retrieved"; the forget pass falls
@@ -430,9 +430,7 @@ fn ensure_decay_columns(c: &Connection) -> Result<()> {
 }
 
 fn existing_columns(c: &Connection) -> Result<Vec<String>> {
-    let mut stmt = c
-        .prepare("PRAGMA table_info(episodes)")
-        .map_err(store)?;
+    let mut stmt = c.prepare("PRAGMA table_info(episodes)").map_err(store)?;
     let mut rows = stmt.query([]).map_err(store)?;
     let mut out = Vec::new();
     while let Some(r) = rows.next().map_err(store)? {

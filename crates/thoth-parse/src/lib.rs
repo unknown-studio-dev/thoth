@@ -202,8 +202,7 @@ fn walk_ast(
 
     // ---- calls -------------------------------------------------------------
     if lang.is_call_node(kind_str)
-        && let (Some((caller, _)), Some(callee)) =
-            (stack.last(), lang.extract_callee(node, source))
+        && let (Some((caller, _)), Some(callee)) = (stack.last(), lang.extract_callee(node, source))
         && !callee.is_empty()
     {
         table.calls.push((caller.clone(), callee));

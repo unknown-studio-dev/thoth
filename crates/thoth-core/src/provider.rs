@@ -42,10 +42,7 @@ pub trait Synthesizer: Send + Sync {
     ///
     /// The default implementation returns nothing, so plain `critique`-only
     /// synthesizers keep working unchanged.
-    async fn propose_session_memory(
-        &self,
-        session: &[Event],
-    ) -> Result<NudgeProposal> {
+    async fn propose_session_memory(&self, session: &[Event]) -> Result<NudgeProposal> {
         let _ = session;
         Ok(NudgeProposal::default())
     }

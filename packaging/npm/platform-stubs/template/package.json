@@ -1,0 +1,19 @@
+{
+  "name": "thoth-memory-{PLATFORM}",
+  "version": "0.2.0",
+  "description": "Platform-specific native binary for thoth-memory ({TRIPLE}).",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unknown-studio-dev/thoth.git"
+  },
+  "os": [
+    "{OS}"
+  ],
+  "cpu": [
+    "{CPU}"
+  ],
+  "files": [
+    "bin/"
+  ]
+}

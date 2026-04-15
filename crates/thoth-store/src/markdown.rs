@@ -47,11 +47,77 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use thoth_core::{Fact, Lesson, MemoryKind, MemoryMeta, Result, Skill};
+use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
+
+/// One entry in the caller-facing API for `memory-history.jsonl`.
+///
+/// Kept separate from [`HistoryEntryOnDisk`] so callers don't have to
+/// invent timestamps — they're added automatically on append.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    /// Operation: `stage`, `promote`, `reject`, `quarantine`,
+    /// `restore`, `undo`, …
+    pub op: &'static str,
+    /// Target memory type: `fact`, `lesson`, `skill`.
+    pub kind: &'static str,
+    /// Human-readable title or trigger — the first line of the entry.
+    pub title: String,
+    /// Optional actor string (e.g. `"agent"`, `"user:alice"`).
+    pub actor: Option<String>,
+    /// Optional free-form reason (for rejects and quarantines).
+    pub reason: Option<String>,
+}
+
+/// Same shape as [`HistoryEntry`] but with an RFC3339 timestamp. This is
+/// what's serialized to disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntryOnDisk {
+    /// Unix-epoch seconds when the event was recorded.
+    pub at_unix: i64,
+    /// RFC3339 representation of `at_unix` — redundant but makes
+    /// `memory-history.jsonl` human-readable without tools.
+    pub at_rfc3339: String,
+    /// Operation.
+    pub op: String,
+    /// Memory kind.
+    pub kind: String,
+    /// Title / trigger.
+    pub title: String,
+    /// Actor.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub actor: Option<String>,
+    /// Reason.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
+}
+
+impl From<&HistoryEntry> for HistoryEntryOnDisk {
+    fn from(e: &HistoryEntry) -> Self {
+        let now = OffsetDateTime::now_utc();
+        let at_rfc3339 = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| now.unix_timestamp().to_string());
+        Self {
+            at_unix: now.unix_timestamp(),
+            at_rfc3339,
+            op: e.op.to_string(),
+            kind: e.kind.to_string(),
+            title: e.title.clone(),
+            actor: e.actor.clone(),
+            reason: e.reason.clone(),
+        }
+    }
+}
 
 const MEMORY_MD: &str = "MEMORY.md";
 const LESSONS_MD: &str = "LESSONS.md";
+const MEMORY_PENDING_MD: &str = "MEMORY.pending.md";
+const LESSONS_PENDING_MD: &str = "LESSONS.pending.md";
+const LESSONS_QUARANTINED_MD: &str = "LESSONS.quarantined.md";
+const MEMORY_HISTORY_JSONL: &str = "memory-history.jsonl";
 const SKILLS_DIR: &str = "skills";
 const SKILL_MD: &str = "SKILL.md";
 
@@ -154,11 +220,7 @@ impl MarkdownStore {
         self.bump_lesson_counters(triggers, false).await
     }
 
-    async fn bump_lesson_counters(
-        &self,
-        triggers: &[String],
-        success: bool,
-    ) -> Result<usize> {
+    async fn bump_lesson_counters(&self, triggers: &[String], success: bool) -> Result<usize> {
         if triggers.is_empty() {
             return Ok(0);
         }
@@ -189,6 +251,270 @@ impl MarkdownStore {
         Ok(bumped)
     }
 
+    // -- staging (review mode) -----------------------------------------
+
+    /// Append a fact to the pending file instead of canonical `MEMORY.md`.
+    ///
+    /// Used in `memory_mode = "review"` — the user must then promote or
+    /// reject the entry via [`Self::promote_pending_fact`] or
+    /// [`Self::reject_pending_fact`].
+    pub async fn append_pending_fact(&self, f: &Fact) -> Result<()> {
+        let path = self.root.join(MEMORY_PENDING_MD);
+        append_atomic(&path, &render_fact(f)).await?;
+        self.append_history(&HistoryEntry {
+            op: "stage",
+            kind: "fact",
+            title: first_line(&f.text),
+            actor: None,
+            reason: None,
+        })
+        .await
+    }
+
+    /// Append a lesson to the pending file (see
+    /// [`Self::append_pending_fact`]).
+    pub async fn append_pending_lesson(&self, l: &Lesson) -> Result<()> {
+        let path = self.root.join(LESSONS_PENDING_MD);
+        append_atomic(&path, &render_lesson(l)).await?;
+        self.append_history(&HistoryEntry {
+            op: "stage",
+            kind: "lesson",
+            title: l.trigger.trim().to_string(),
+            actor: None,
+            reason: None,
+        })
+        .await
+    }
+
+    /// Read every pending fact (returns `Vec::new()` if the file is missing).
+    pub async fn read_pending_facts(&self) -> Result<Vec<Fact>> {
+        let path = self.root.join(MEMORY_PENDING_MD);
+        let text = read_or_empty(&path).await?;
+        Ok(parse_facts(&text))
+    }
+
+    /// Read every pending lesson.
+    pub async fn read_pending_lessons(&self) -> Result<Vec<Lesson>> {
+        let path = self.root.join(LESSONS_PENDING_MD);
+        let text = read_or_empty(&path).await?;
+        Ok(parse_lessons(&text))
+    }
+
+    /// Promote the pending fact at `index` (0-based) to `MEMORY.md`.
+    ///
+    /// Returns `Ok(None)` if the index is out of range. Both files are
+    /// rewritten atomically; on success an entry is appended to
+    /// `memory-history.jsonl`.
+    pub async fn promote_pending_fact(&self, index: usize) -> Result<Option<Fact>> {
+        let mut pending = self.read_pending_facts().await?;
+        if index >= pending.len() {
+            return Ok(None);
+        }
+        let fact = pending.remove(index);
+        self.append_fact(&fact).await?;
+        self.rewrite_pending_facts(&pending).await?;
+        self.append_history(&HistoryEntry {
+            op: "promote",
+            kind: "fact",
+            title: first_line(&fact.text),
+            actor: None,
+            reason: None,
+        })
+        .await?;
+        Ok(Some(fact))
+    }
+
+    /// Reject the pending fact at `index`. `reason` is recorded in the
+    /// history log but the fact is not retained.
+    pub async fn reject_pending_fact(
+        &self,
+        index: usize,
+        reason: Option<&str>,
+    ) -> Result<Option<Fact>> {
+        let mut pending = self.read_pending_facts().await?;
+        if index >= pending.len() {
+            return Ok(None);
+        }
+        let fact = pending.remove(index);
+        self.rewrite_pending_facts(&pending).await?;
+        self.append_history(&HistoryEntry {
+            op: "reject",
+            kind: "fact",
+            title: first_line(&fact.text),
+            actor: None,
+            reason: reason.map(|s| s.to_string()),
+        })
+        .await?;
+        Ok(Some(fact))
+    }
+
+    /// Promote the pending lesson at `index` to `LESSONS.md`.
+    pub async fn promote_pending_lesson(&self, index: usize) -> Result<Option<Lesson>> {
+        let mut pending = self.read_pending_lessons().await?;
+        if index >= pending.len() {
+            return Ok(None);
+        }
+        let lesson = pending.remove(index);
+        self.append_lesson(&lesson).await?;
+        self.rewrite_pending_lessons(&pending).await?;
+        self.append_history(&HistoryEntry {
+            op: "promote",
+            kind: "lesson",
+            title: lesson.trigger.trim().to_string(),
+            actor: None,
+            reason: None,
+        })
+        .await?;
+        Ok(Some(lesson))
+    }
+
+    /// Reject the pending lesson at `index`.
+    pub async fn reject_pending_lesson(
+        &self,
+        index: usize,
+        reason: Option<&str>,
+    ) -> Result<Option<Lesson>> {
+        let mut pending = self.read_pending_lessons().await?;
+        if index >= pending.len() {
+            return Ok(None);
+        }
+        let lesson = pending.remove(index);
+        self.rewrite_pending_lessons(&pending).await?;
+        self.append_history(&HistoryEntry {
+            op: "reject",
+            kind: "lesson",
+            title: lesson.trigger.trim().to_string(),
+            actor: None,
+            reason: reason.map(|s| s.to_string()),
+        })
+        .await?;
+        Ok(Some(lesson))
+    }
+
+    async fn rewrite_pending_facts(&self, facts: &[Fact]) -> Result<()> {
+        let path = self.root.join(MEMORY_PENDING_MD);
+        if facts.is_empty() {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            return Ok(());
+        }
+        let mut body = String::from("# MEMORY.pending.md\n");
+        for f in facts {
+            body.push_str(&render_fact(f));
+        }
+        write_atomic(&path, &body).await
+    }
+
+    async fn rewrite_pending_lessons(&self, lessons: &[Lesson]) -> Result<()> {
+        let path = self.root.join(LESSONS_PENDING_MD);
+        if lessons.is_empty() {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            return Ok(());
+        }
+        let mut body = String::from("# LESSONS.pending.md\n");
+        for l in lessons {
+            body.push_str(&render_lesson(l));
+        }
+        write_atomic(&path, &body).await
+    }
+
+    // -- quarantine -----------------------------------------------------
+
+    /// Move a set of lessons (by `trigger`, case-insensitive) from
+    /// `LESSONS.md` to `LESSONS.quarantined.md`. Returns the number of
+    /// lessons actually moved.
+    pub async fn quarantine_lessons(&self, triggers: &[String]) -> Result<u64> {
+        if triggers.is_empty() {
+            return Ok(0);
+        }
+        let wanted: std::collections::HashSet<String> = triggers
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        let lessons = self.read_lessons().await?;
+        let mut kept = Vec::with_capacity(lessons.len());
+        let mut quarantined = Vec::new();
+        for l in lessons {
+            if wanted.contains(&l.trigger.trim().to_ascii_lowercase()) {
+                quarantined.push(l);
+            } else {
+                kept.push(l);
+            }
+        }
+        let moved = quarantined.len() as u64;
+        if moved == 0 {
+            return Ok(0);
+        }
+        // Append to quarantine file (never rewrite — quarantine is
+        // cumulative history, useful for offline review).
+        let path = self.root.join(LESSONS_QUARANTINED_MD);
+        let mut body = String::new();
+        for l in &quarantined {
+            body.push_str(&render_lesson(l));
+        }
+        append_atomic(&path, &body).await?;
+        self.rewrite_lessons(&kept).await?;
+        for l in &quarantined {
+            self.append_history(&HistoryEntry {
+                op: "quarantine",
+                kind: "lesson",
+                title: l.trigger.trim().to_string(),
+                actor: None,
+                reason: Some(format!(
+                    "failures={}, successes={}",
+                    l.failure_count, l.success_count
+                )),
+            })
+            .await?;
+        }
+        Ok(moved)
+    }
+
+    // -- history log ----------------------------------------------------
+
+    /// Append a line to `<root>/memory-history.jsonl`. Failures are
+    /// swallowed (memory changes must not abort because a log write failed).
+    pub async fn append_history(&self, entry: &HistoryEntry) -> Result<()> {
+        let path = self.root.join(MEMORY_HISTORY_JSONL);
+        let json = serde_json::to_string(&HistoryEntryOnDisk::from(entry))
+            .unwrap_or_else(|_| "{}".to_string());
+        let mut line = json;
+        line.push('\n');
+        if let Err(e) = append_atomic(&path, &line).await {
+            tracing::warn!(error = %e, "memory-history: append failed");
+        }
+        Ok(())
+    }
+
+    /// Read the entire history log (one entry per JSONL line). Malformed
+    /// lines are skipped with a warning.
+    pub async fn read_history(&self) -> Result<Vec<HistoryEntryOnDisk>> {
+        let path = self.root.join(MEMORY_HISTORY_JSONL);
+        let text = read_or_empty(&path).await?;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<HistoryEntryOnDisk>(line) {
+                Ok(e) => out.push(e),
+                Err(e) => tracing::warn!(error = %e, "memory-history: skipping bad line"),
+            }
+        }
+        Ok(out)
+    }
+
     // -- skills/ --------------------------------------------------------
 
     /// Copy a skill directory into `<root>/skills/<slug>/`.
@@ -197,10 +523,7 @@ impl MarkdownStore {
     /// from the frontmatter's `name:` if present, otherwise from the
     /// source directory's file name. Overwrites any existing skill at the
     /// same slug (so re-running is idempotent).
-    pub async fn install_from_directory(
-        &self,
-        src: impl AsRef<Path>,
-    ) -> Result<Skill> {
+    pub async fn install_from_directory(&self, src: impl AsRef<Path>) -> Result<Skill> {
         let src = src.as_ref();
         let skill_md_src = src.join(SKILL_MD);
         if !skill_md_src.is_file() {
@@ -216,16 +539,13 @@ impl MarkdownStore {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let slug = name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if fallback_slug.is_empty() {
-                    "skill".to_string()
-                } else {
-                    fallback_slug.clone()
-                }
-            });
+        let slug = name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+            if fallback_slug.is_empty() {
+                "skill".to_string()
+            } else {
+                fallback_slug.clone()
+            }
+        });
         let dest = self.root.join(SKILLS_DIR).join(&slug);
         if dest.exists() {
             tokio::fs::remove_dir_all(&dest).await?;
@@ -236,10 +556,7 @@ impl MarkdownStore {
             meta: MemoryMeta::new(MemoryKind::Procedural),
             slug,
             description: description.unwrap_or_default(),
-            path: dest
-                .strip_prefix(&self.root)
-                .unwrap_or(&dest)
-                .to_path_buf(),
+            path: dest.strip_prefix(&self.root).unwrap_or(&dest).to_path_buf(),
         })
     }
 
