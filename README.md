@@ -112,13 +112,16 @@ export ANTHROPIC_API_KEY=...
 ./target/release/thoth --synth anthropic memory nudge
 ```
 
-The vector index lives at `.thoth/index/vectors.sqlite` — a single SQLite
-file, safe to delete and rebuild.
+The vector index lives at `.thoth/vectors.db` — a single SQLite file, safe
+to delete and rebuild. (With `--features lance` it is replaced by
+`.thoth/chunks.lance/`.)
 
-Everything is a normal directory. `.thoth/index/` holds the derived
-`redb`/`tantivy`/`sqlite` files and is safe to delete (it will be rebuilt on
-next `index`). `MEMORY.md`, `LESSONS.md`, and `skills/` are the human-editable
-source of truth — commit them alongside your code.
+Everything is a normal directory. `.thoth/graph.redb`, `.thoth/fts.tantivy/`,
+`.thoth/episodes.db`, and `.thoth/vectors.db` are the derived indexes and
+are safe to delete — they will be rebuilt on the next `index` run. Legacy
+stores under `.thoth/index/` from earlier versions are migrated in-place the
+first time Thoth opens them. `MEMORY.md`, `LESSONS.md`, and `skills/` are
+the human-editable source of truth — commit them alongside your code.
 
 ## Dogfood Makefile
 
@@ -130,11 +133,11 @@ make help          # list targets
 make demo          # build → init → index → run 6 sample queries
 make eval          # run the precision@k gold set in eval/gold.toml
 make watch         # re-index on change
-make mcp           # run the MCP stdio server against .thoth-self/
+make mcp           # run the MCP stdio server against .thoth/
 ```
 
 See `make help` for the full surface. Everything Thoth writes goes under
-`.thoth-self/` (git-ignored).
+`.thoth/` (git-ignored).
 
 ## MCP server
 
@@ -173,23 +176,40 @@ connects.
 
 ## Claude Code integration
 
-Two one-shot commands wire Thoth into Claude Code — the skill makes it
-discoverable to the agent, the hooks make memory passive (dumped at
-session start, recall injected on every prompt, incremental re-index
-after every edit, forget + nudge at stop).
+One-shot wiring — installs the skill, the hook block, and the MCP server
+in a single command. Everything is idempotent and safe to re-run:
 
 ```bash
-# Install the agentskills.io-compatible skill.
-thoth skills install --scope project   # writes .thoth/skills/thoth/SKILL.md
+thoth install                          # project scope (default)
+thoth install --scope user             # global for your user account
+thoth uninstall                        # undo everything in that scope
+```
+
+Under the hood this is three fine-grained commands you can also run
+individually:
+
+```bash
+# 1) Make the skill discoverable to Claude Code.
+thoth skills install --scope project   # writes ./.claude/skills/thoth/SKILL.md
 thoth skills install --scope user      # writes ~/.claude/skills/thoth/SKILL.md
 
-# Install the Claude Code hook block into settings.json.
-thoth hooks install --scope project    # writes .claude/settings.json
-thoth hooks install --scope user       # writes ~/.claude/settings.json
+# 2) Wire the hook block into settings.json (SessionStart / UserPromptSubmit
+#    / PostToolUse / Stop).
+thoth hooks install   --scope project  # writes ./.claude/settings.json
+thoth hooks install   --scope user     # writes ~/.claude/settings.json
+thoth hooks uninstall --scope project  # removes only Thoth's hooks
 
-# Remove Thoth's hook block (leaves user-owned hooks untouched).
-thoth hooks uninstall --scope project
+# 3) Register the Thoth MCP server (thoth-mcp) under mcpServers.thoth.
+thoth mcp install   --scope project    # writes mcpServers.thoth into settings.json
+thoth mcp uninstall --scope project    # removes only Thoth's MCP entry
 ```
+
+All three merges preserve any pre-existing user-owned entries in
+`settings.json`: `hooks install` skips hook events whose command doesn't
+match `thoth hooks exec`, and `mcp install` only writes under the
+`mcpServers.thoth` key, leaving other MCP servers untouched. The
+`--root` in the MCP entry is rewritten to the CLI's `--root` value, so
+`thoth mcp install --root /abs/path/.thoth` is honoured at runtime.
 
 The `install` merge is idempotent — running it twice leaves
 `settings.json` unchanged. Four hook events are wired:
@@ -206,8 +226,8 @@ the hook payload from stdin as JSON, runs the action, and prints any new
 context back on stdout. Errors are swallowed so a failing hook never
 blocks the agent.
 
-To also expose the MCP tools directly, add the `thoth-mcp` server block
-to the same `settings.json`:
+`thoth install` also handles the MCP wiring; if you prefer to do it
+manually, the equivalent block is:
 
 ```json
 {
@@ -219,8 +239,6 @@ to the same `settings.json`:
   }
 }
 ```
-
-(Template bundled at `crates/thoth-cli/assets/hooks/mcp.json`.)
 
 ## Memory lifecycle
 
@@ -246,7 +264,7 @@ The `thoth eval` subcommand runs a gold set of queries against the current
 index and prints precision@k. See `eval/gold.toml` for the schema:
 
 ```bash
-thoth --root .thoth-self eval --gold eval/gold.toml -k 8
+thoth --root .thoth eval --gold eval/gold.toml -k 8
 ```
 
 The binary exits non-zero on any miss, so it slots neatly into CI. The
@@ -288,7 +306,7 @@ use thoth_retrieve::{Indexer, Retriever};
 use thoth_store::{StoreRoot, VectorStore};
 
 let store    = StoreRoot::open(".thoth").await?;
-let vectors  = VectorStore::open(".thoth/index/vectors.sqlite").await?;
+let vectors  = VectorStore::open(StoreRoot::vectors_sqlite_path(".thoth".as_ref())).await?;
 let embed: Arc<dyn Embedder>   = Arc::new(VoyageEmbedder::from_env()?);
 let synth: Arc<dyn Synthesizer> = Arc::new(AnthropicSynthesizer::from_env()?);
 

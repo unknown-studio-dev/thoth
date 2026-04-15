@@ -16,6 +16,10 @@
 //! thoth hooks install [--scope project|user]
 //! thoth hooks uninstall [--scope project|user]
 //! thoth hooks exec <event>              # runtime dispatcher (Claude Code)
+//! thoth mcp install [--scope project|user]
+//! thoth mcp uninstall [--scope project|user]
+//! thoth install [--scope project|user]  # skill + hooks + mcp in one shot
+//! thoth uninstall [--scope project|user]
 //! ```
 //!
 //! Mode::Full flags (enabled by the matching Cargo feature):
@@ -38,6 +42,7 @@ use thoth_retrieve::{IndexProgress, Indexer, Retriever};
 use thoth_store::{StoreRoot, VectorStore};
 use tracing::warn;
 
+mod daemon;
 mod hooks;
 
 // ------------------------------------------------------------------ CLI spec
@@ -88,11 +93,11 @@ enum SynthKind {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Initialise a new `.thoth/` directory.
+    /// Initialize a new `.thoth/` directory.
     Init,
 
     /// Parse + index a source tree. With `--embedder` set, also writes
-    /// semantic vectors into `index/vectors.sqlite`.
+    /// semantic vectors into `<root>/vectors.db`.
     Index {
         /// Source path to scan (defaults to `.`).
         #[arg(default_value = ".")]
@@ -138,6 +143,25 @@ enum Cmd {
     Hooks {
         #[command(subcommand)]
         cmd: HooksCmd,
+    },
+
+    /// Register the Thoth MCP server in `settings.json`.
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
+
+    /// One-shot: install skill + hooks + MCP server (the whole integration).
+    /// Idempotent — safe to re-run.
+    Install {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: hooks::Scope,
+    },
+
+    /// One-shot: remove skill + hooks + MCP server.
+    Uninstall {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: hooks::Scope,
     },
 
     /// Run a precision@k evaluation over a gold query set (TOML).
@@ -195,8 +219,23 @@ enum SkillsCmd {
     List,
     /// Install the bundled `thoth` skill so Claude Code can discover it.
     Install {
-        /// Where to install. `project` drops it into `<root>/skills/thoth/`,
+        /// Where to install. `project` drops it into `./.claude/skills/thoth/`,
         /// `user` drops it into `~/.claude/skills/thoth/`.
+        #[arg(long, value_enum, default_value = "project")]
+        scope: hooks::Scope,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// Register `thoth-mcp` under `mcpServers.thoth` in `settings.json`.
+    /// Idempotent.
+    Install {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: hooks::Scope,
+    },
+    /// Remove the `mcpServers.thoth` entry. Other MCP servers are preserved.
+    Uninstall {
         #[arg(long, value_enum, default_value = "project")]
         scope: hooks::Scope,
     },
@@ -229,11 +268,11 @@ enum HooksCmd {
 
 /// Install a `tracing` subscriber tuned for a CLI.
 ///
-/// By default we're *silent* — only `error` propagates, so a clean run of
+/// By default, we're *silent* — only `error` propagates, so a clean run of
 /// `thoth init` or `thoth index` shows only the commands own `println!`
 /// output (no `INFO thoth_retrieve::indexer: …` noise). `-v` opens the tap
 /// to `info`, `-vv` to `debug`, `-vvv` to `trace`. If `RUST_LOG` is set
-/// *and* no `-v` flag was passed we honour it so power users keep their
+/// *and* no `-v` flag was passed we honor it so power users keep their
 /// usual workflow.
 fn init_tracing(verbose: u8) {
     let filter = match verbose {
@@ -302,6 +341,12 @@ async fn main() -> anyhow::Result<()> {
             HooksCmd::Uninstall { scope } => hooks::uninstall(scope).await?,
             HooksCmd::Exec { event } => hooks::exec(event, &cli.root).await?,
         },
+        Cmd::Mcp { cmd } => match cmd {
+            McpCmd::Install { scope } => hooks::mcp_install(scope, &cli.root).await?,
+            McpCmd::Uninstall { scope } => hooks::mcp_uninstall(scope).await?,
+        },
+        Cmd::Install { scope } => hooks::install_all(scope, &cli.root).await?,
+        Cmd::Uninstall { scope } => hooks::uninstall_all(scope, &cli.root).await?,
         Cmd::Eval { gold, top_k } => cmd_eval(&cli.root, &gold, top_k, cli.json).await?,
     }
 
@@ -369,7 +414,7 @@ fn build_synth(kind: Option<SynthKind>) -> anyhow::Result<Option<Arc<dyn Synthes
 }
 
 async fn open_vectors(store: &StoreRoot) -> anyhow::Result<VectorStore> {
-    let path = store.path.join("index").join("vectors.sqlite");
+    let path = StoreRoot::vectors_path(&store.path);
     Ok(VectorStore::open(&path).await?)
 }
 
@@ -387,6 +432,15 @@ async fn cmd_init(root: &std::path::Path) -> anyhow::Result<()> {
             seeded.push(name);
         }
     }
+    // Scaffold a documented config.toml on first run. Every knob is
+    // commented-out so the file documents defaults without overriding
+    // them — users uncomment only what they want to change. Never
+    // overwrite an existing config.
+    let cfg_path = store.path.join("config.toml");
+    if !cfg_path.exists() {
+        tokio::fs::write(&cfg_path, DEFAULT_CONFIG_TOML).await?;
+        seeded.push("config.toml");
+    }
     let verb = if existed { "refreshed" } else { "created" };
     println!("✓ {verb} {}", store.path.display());
     if !seeded.is_empty() {
@@ -396,13 +450,88 @@ async fn cmd_init(root: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Scaffold written on `thoth init`. Every setting is commented out so the
+/// file only documents defaults — uncomment to override. Kept inline (not
+/// a separate `include_str!` fixture) so the CLI binary has no external
+/// runtime dependency on the repo layout.
+const DEFAULT_CONFIG_TOML: &str = r#"# Thoth config. All fields are optional; defaults shown.
+# Uncomment the ones you want to change.
+
+[index]
+# Gitignore-syntax patterns. Applied on top of `.gitignore`, `.ignore`, and
+# any `.thothignore` found in the project. Supports re-including with `!`.
+#
+# ignore = [
+#     "target/",
+#     "node_modules/",
+#     "dist/",
+#     "build/",
+#     "*.generated.rs",
+#     "docs/internal/",
+#     "!docs/internal/README.md",
+# ]
+
+# Max file size (bytes) considered for indexing. Files larger than this
+# are skipped with a debug log. Default: 2 MiB.
+# max_file_size = 2097152
+
+# Descend into hidden dirs (e.g. `.github`). Default: false.
+# include_hidden = false
+
+# Follow symlinks. Default: false — prevents indexing sibling projects.
+# follow_symlinks = false
+
+[memory]
+# How many days an episode survives before TTL eviction. Default: 30.
+# episodic_ttl_days = 30
+
+# Hard cap on episode count before capacity-based eviction. Default: 50_000.
+# max_episodes = 50000
+
+# Lessons with a success ratio below this floor (and at least
+# `lesson_min_attempts` attempts) are dropped by the forget pass.
+# lesson_floor = 0.2
+# lesson_min_attempts = 3
+
+# Exponential decay rate per day for the retention score, and the floor
+# below which an episode is dropped. Set `decay_floor = 0.0` to disable
+# decay-based eviction entirely (Mode::Zero deterministic).
+# decay_lambda = 0.02
+# decay_floor  = 0.05
+
+# Whether to run the LLM nudge at session end (Mode::Full only).
+# enable_nudge = true
+"#;
+
 async fn cmd_index(
     root: &std::path::Path,
     src: &std::path::Path,
     embedder_kind: Option<EmbedderKind>,
 ) -> anyhow::Result<()> {
+    // Try forwarding to a running MCP daemon first (avoids redb lock).
+    // Note: `--embedder` is silently ignored here because the running
+    // daemon was configured at launch time and we can't retrofit an
+    // embedder into it from the outside. Cold indexing (no daemon)
+    // honours `--embedder` as before.
+    if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        let result = d
+            .call(
+                "thoth_index",
+                serde_json::json!({ "path": src.to_string_lossy() }),
+            )
+            .await?;
+        if daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", daemon::tool_text(&result));
+        }
+        println!("{}", daemon::tool_text(&result));
+        return Ok(());
+    }
+
     let store = StoreRoot::open(root).await?;
-    let mut idx = Indexer::new(store.clone(), LanguageRegistry::new());
+    // Honour `[index]` in `<root>/config.toml` — ignore patterns, max file
+    // size, hidden-dir / symlink toggles. Missing file → defaults.
+    let cfg = thoth_retrieve::IndexConfig::load_or_default(root).await;
+    let mut idx = Indexer::new(store.clone(), LanguageRegistry::new()).with_config(&cfg);
     if let Some(embedder) = build_embedder(embedder_kind)? {
         let vectors = open_vectors(&store).await?;
         idx = idx.with_embedding(embedder, vectors);
@@ -480,6 +609,35 @@ async fn cmd_query(
     embedder_kind: Option<EmbedderKind>,
     synth_kind: Option<SynthKind>,
 ) -> anyhow::Result<()> {
+    // Try forwarding to a running MCP daemon first (avoids redb lock).
+    // The daemon always runs in Mode::Zero (no embedder/synth), so
+    // `--embedder` / `--synth` force a direct-store fallback below.
+    let wants_full = embedder_kind.is_some() || synth_kind.is_some();
+    if !wants_full
+        && let Some(mut d) = daemon::DaemonClient::try_connect(root).await
+    {
+        let result = d
+            .call(
+                "thoth_recall",
+                serde_json::json!({ "query": text, "top_k": top_k }),
+            )
+            .await?;
+        if daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", daemon::tool_text(&result));
+        }
+        if json {
+            // The daemon's `data` is a full `Retrieval` — same shape
+            // as the direct path below.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&daemon::tool_data(&result))?
+            );
+        } else {
+            println!("{}", daemon::tool_text(&result));
+        }
+        return Ok(());
+    }
+
     let store = StoreRoot::open(root).await?;
 
     let embedder = build_embedder(embedder_kind)?;
@@ -514,28 +672,7 @@ async fn cmd_query(
         return Ok(());
     }
 
-    if out.chunks.is_empty() {
-        println!("(no matches — did you run `thoth index`?)");
-        return Ok(());
-    }
-    for (i, c) in out.chunks.iter().enumerate() {
-        let sym = c.symbol.as_deref().unwrap_or("-");
-        println!(
-            "\n[{i:>2}] score={:.4} src={:?}  {}  {}:{}-{}",
-            c.score,
-            c.source,
-            sym,
-            c.path.display(),
-            c.span.0,
-            c.span.1
-        );
-        if !c.preview.is_empty() {
-            println!("     {}", c.preview);
-        }
-    }
-    if let Some(answer) = &out.synthesized {
-        println!("\n─── synthesized ───\n{answer}");
-    }
+    print!("{}", out.render());
     Ok(())
 }
 
@@ -545,8 +682,23 @@ async fn cmd_watch(
     debounce: Duration,
     embedder_kind: Option<EmbedderKind>,
 ) -> anyhow::Result<()> {
+    // `watch` is long-running and needs its own Indexer + redb handle. We
+    // can't multiplex that through the daemon's socket (each request is a
+    // short-lived call). So if the daemon is up — meaning the store is
+    // locked — fail fast with a useful message rather than exploding on
+    // `StoreRoot::open`.
+    if daemon::DaemonClient::try_connect(root).await.is_some() {
+        anyhow::bail!(
+            "thoth-mcp daemon is running on {}; stop it before running `thoth watch` \
+             (they would fight for the redb exclusive lock). Either close Claude Code \
+             or run the re-index through the daemon with `thoth index .`.",
+            root.display()
+        );
+    }
+
     let store = StoreRoot::open(root).await?;
-    let mut idx = Indexer::new(store.clone(), LanguageRegistry::new());
+    let cfg = thoth_retrieve::IndexConfig::load_or_default(root).await;
+    let mut idx = Indexer::new(store.clone(), LanguageRegistry::new()).with_config(&cfg);
     if let Some(embedder) = build_embedder(embedder_kind)? {
         let vectors = open_vectors(&store).await?;
         idx = idx.with_embedding(embedder, vectors);
@@ -582,28 +734,56 @@ async fn cmd_watch(
                     batch.push(extra);
                 }
 
-                let mut touched = std::collections::HashSet::new();
+                // Split into change vs. delete sets so deletions only
+                // purge (no reparse on a missing file).
+                let mut changed = std::collections::HashSet::new();
+                let mut deleted = std::collections::HashSet::new();
                 for ev in batch {
                     match ev {
-                        thoth_core::Event::FileChanged { path, .. }
-                        | thoth_core::Event::FileDeleted { path, .. } => {
-                            touched.insert(path);
+                        thoth_core::Event::FileChanged { path, .. } => {
+                            deleted.remove(&path);
+                            changed.insert(path);
+                        }
+                        thoth_core::Event::FileDeleted { path, .. } => {
+                            changed.remove(&path);
+                            deleted.insert(path);
                         }
                         _ => {}
                     }
                 }
-                let n = touched.len();
-                for path in touched {
+
+                let changed_n = changed.len();
+                let deleted_n = deleted.len();
+
+                for path in deleted {
+                    if let Err(e) = idx.purge_path(&path).await {
+                        warn!(?path, error = %e, "purge failed");
+                    }
+                }
+                for path in changed {
                     if let Err(e) = idx.index_file(&path).await {
                         warn!(?path, error = %e, "re-index failed");
                     }
                 }
-                if n > 0 {
-                    println!("  ↻ reindexed {n} file{}", if n == 1 { "" } else { "s" });
-                }
-                // Flush BM25 writes so the next `query` sees them.
-                if let Err(e) = idx_commit(&idx).await {
-                    warn!(error = %e, "fts commit failed");
+
+                // Flush BM25 writes so the next `query` (or hook pull) sees
+                // them — both deletes and adds need to be committed.
+                if changed_n + deleted_n > 0 {
+                    if let Err(e) = idx.commit().await {
+                        warn!(error = %e, "fts commit failed");
+                    }
+                    if changed_n > 0 {
+                        println!(
+                            "  ↻ reindexed {changed_n} file{}",
+                            if changed_n == 1 { "" } else { "s" }
+                        );
+                    }
+                    if deleted_n > 0 {
+                        println!(
+                            "  🗑 purged {deleted_n} file{}",
+                            if deleted_n == 1 { "" } else { "s" }
+                        );
+                    }
                 }
             }
         }
@@ -611,21 +791,27 @@ async fn cmd_watch(
     Ok(())
 }
 
-/// Small helper: commit the FTS writer after a batch of per-file re-indexes.
-/// We go through the `Indexer`'s store since `Indexer` doesn't expose commit
-/// directly (it only commits at the end of a full `index_path`).
-async fn idx_commit(_idx: &Indexer) -> anyhow::Result<()> {
-    // No-op fallback: the indexer commits at end-of-path; for single-file
-    // updates we rely on tantivy's next search picking up uncommitted docs at
-    // the next full `index_path`. This keeps the watch loop simple until the
-    // Indexer grows an explicit `commit()` hook.
-    Ok(())
-}
-
 async fn cmd_memory_show(root: &std::path::Path) -> anyhow::Result<()> {
-    let store = StoreRoot::open(root).await?;
+    // `memory show` is pure-filesystem (no redb) so strictly it doesn't
+    // need the daemon to avoid lock conflicts. We still prefer the daemon
+    // when available because the MCP server is the single writer — reading
+    // through it guarantees we see the same view Claude Code sees.
+    if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        let result = d
+            .call("thoth_memory_show", serde_json::json!({}))
+            .await?;
+        if daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", daemon::tool_text(&result));
+        }
+        println!("{}", daemon::tool_text(&result));
+        return Ok(());
+    }
+
+    // No daemon — read the files directly. We deliberately do NOT call
+    // `StoreRoot::open` here: that would acquire the redb lock just to
+    // read two markdown files, and collide with a daemon that raced us.
     for name in ["MEMORY.md", "LESSONS.md"] {
-        let p = store.path.join(name);
+        let p = root.join(name);
         println!("─── {name} ───");
         match tokio::fs::read_to_string(&p).await {
             Ok(s) => println!("{s}"),
@@ -639,9 +825,19 @@ async fn cmd_memory_show(root: &std::path::Path) -> anyhow::Result<()> {
 }
 
 async fn cmd_memory_edit(root: &std::path::Path) -> anyhow::Result<()> {
-    let store = StoreRoot::open(root).await?;
+    // `memory edit` only touches MEMORY.md on disk — no redb access needed.
+    // We intentionally skip `StoreRoot::open` so it can run even when the
+    // MCP daemon owns the database lock.
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let path = store.path.join("MEMORY.md");
+    // Ensure the root exists; otherwise the editor would create the file
+    // in a non-existent parent and fail confusingly.
+    if !root.exists() {
+        anyhow::bail!(
+            "{} not found — run `thoth init` first",
+            root.display()
+        );
+    }
+    let path = root.join("MEMORY.md");
     if !path.exists() {
         tokio::fs::write(&path, "# MEMORY.md\n").await?;
     }
@@ -674,6 +870,20 @@ async fn cmd_memory_fact(
         })
         .unwrap_or_default();
 
+    if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        let result = d
+            .call(
+                "thoth_remember_fact",
+                serde_json::json!({ "text": text, "tags": tags }),
+            )
+            .await?;
+        if daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", daemon::tool_text(&result));
+        }
+        println!("{}", daemon::tool_text(&result));
+        return Ok(());
+    }
+
     let store = StoreRoot::open(root).await?;
     let fact = Fact {
         meta: MemoryMeta::new(MemoryKind::Semantic),
@@ -696,6 +906,20 @@ async fn cmd_memory_lesson(
         anyhow::bail!("both --when and advice text must be non-empty");
     }
 
+    if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        let result = d
+            .call(
+                "thoth_remember_lesson",
+                serde_json::json!({ "trigger": when, "advice": advice }),
+            )
+            .await?;
+        if daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", daemon::tool_text(&result));
+        }
+        println!("{}", daemon::tool_text(&result));
+        return Ok(());
+    }
+
     let store = StoreRoot::open(root).await?;
     let lesson = Lesson {
         meta: MemoryMeta::new(MemoryKind::Reflective),
@@ -713,6 +937,24 @@ async fn cmd_memory_lesson(
 }
 
 async fn cmd_memory_forget(root: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        let result = d
+            .call("thoth_memory_forget", serde_json::json!({}))
+            .await?;
+        if daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", daemon::tool_text(&result));
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&daemon::tool_data(&result))?
+            );
+        } else {
+            println!("{}", daemon::tool_text(&result));
+        }
+        return Ok(());
+    }
+
     let mm = MemoryManager::open(root).await?;
     let report = mm.forget_pass().await?;
     if json {
@@ -796,21 +1038,49 @@ async fn cmd_eval(
         anyhow::bail!("gold set is empty");
     }
 
-    let store = StoreRoot::open(root).await?;
-    let r = Retriever::new(store);
+    // Prefer the running daemon so `thoth eval` works while Claude Code
+    // holds the redb lock. Each gold query becomes one `thoth_recall`
+    // call; the structured `data` half of `ToolOutput` is the same
+    // `Retrieval` shape we'd get from the direct path below.
+    let daemon_client = daemon::DaemonClient::try_connect(root).await;
+    let direct = if daemon_client.is_some() {
+        None
+    } else {
+        let store = StoreRoot::open(root).await?;
+        Some(Retriever::new(store))
+    };
 
     let mut hits = 0usize;
     let total = gold.query.len();
     let mut per_query = Vec::with_capacity(total);
 
+    // One shared client across the loop — cheap, and reusing the
+    // connection avoids a connect-per-query round trip.
+    let mut client = daemon_client;
+
     for gq in &gold.query {
-        let out = r
-            .recall(&Query {
-                text: gq.q.clone(),
-                top_k,
-                ..Query::text("")
-            })
-            .await?;
+        let out: thoth_core::Retrieval = if let Some(c) = client.as_mut() {
+            let result = c
+                .call(
+                    "thoth_recall",
+                    serde_json::json!({ "query": gq.q, "top_k": top_k }),
+                )
+                .await?;
+            if daemon::tool_is_error(&result) {
+                anyhow::bail!("{}", daemon::tool_text(&result));
+            }
+            serde_json::from_value(daemon::tool_data(&result))?
+        } else {
+            direct
+                .as_ref()
+                .unwrap()
+                .recall(&Query {
+                    text: gq.q.clone(),
+                    top_k,
+                    ..Query::text("")
+                })
+                .await?
+        };
 
         let got = out.chunks.iter().any(|c| {
             let p = c.path.to_string_lossy().to_lowercase();
@@ -863,6 +1133,25 @@ async fn cmd_eval(
 }
 
 async fn cmd_skills_list(root: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        let result = d
+            .call("thoth_skills_list", serde_json::json!({}))
+            .await?;
+        if daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", daemon::tool_text(&result));
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&daemon::tool_data(&result))?
+            );
+        } else {
+            // `text` already handles the empty-list message for us.
+            print!("{}", daemon::tool_text(&result));
+        }
+        return Ok(());
+    }
+
     let store = StoreRoot::open(root).await?;
     let skills = store.markdown.list_skills().await?;
     if json {

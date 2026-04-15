@@ -41,7 +41,7 @@ Thoth is the substrate for that — a single embedded library, not a service.
 | Language | Rust 2021, 100% |
 | Async runtime | `tokio` |
 | Operating mode | `Mode::Zero` (offline, symbolic) + `Mode::Full` (embedding + LLM) |
-| Storage (vector) | [LanceDB](https://lancedb.com) — embedded, Arrow-based |
+| Storage (vector) | SQLite flat-cosine (default); [LanceDB](https://lancedb.com) behind the `lance` feature (planned) |
 | Storage (KV / graph / metadata) | [redb](https://github.com/cberner/redb) — pure-Rust embedded KV |
 | Storage (full-text / BM25) | [tantivy](https://github.com/quickwit-oss/tantivy) |
 | Storage (episodic log) | SQLite + FTS5 (through `rusqlite`) |
@@ -224,10 +224,18 @@ pub trait Synthesizer: Send + Sync {
 - **Capacity cap**: if episode store exceeds `max_episodes`, drop lowest-scored.
 
 ### Learn
-- **Nudge** (Mode::Full): at session end, `Synthesizer::critique` is given the
-  session transcript. It may return zero or more `Lesson` / `Skill` drafts.
-- **Confidence evolves**: each lesson tracks `success_count` / `failure_count`
-  as it is retrieved and used. Lessons below floor are dropped.
+- **Nudge** (Mode::Full): at session end the memory manager runs two passes
+  against the synthesizer:
+  1. `Synthesizer::critique` on each recent `OutcomeObserved` event —
+     produces zero or one `Lesson` per outcome.
+  2. `Synthesizer::propose_session_memory` on the full recent window —
+     returns a `NudgeProposal` bundle of `Fact`, `Lesson`, and `Skill`
+     drafts. Facts are deduped by first-line title, lessons by trigger,
+     and skills by slug, so the pass is idempotent across sessions.
+- **Confidence evolves**: each lesson tracks `success_count` /
+  `failure_count` as a hidden `<!-- success: N / failure: N -->` footer
+  in `LESSONS.md`. The forget pass drops any lesson whose ratio is below
+  `lesson_floor` once it has reached `lesson_min_attempts` retrievals.
 
 ## 10. Influences
 
@@ -267,6 +275,24 @@ The design borrows deliberately and acknowledges sources.
 - **Encryption at rest.** Defer; relies on filesystem permissions for v1.
 - **Remote Thoth (shared team memory).** Out of scope; local-first only.
 - **Fine-tuning on collected episodes.** Export hooks yes, training no.
+- **LanceDB as the default vector store.** §3 and the storage diagram show
+  LanceDB because it's the long-term target — Arrow-native, columnar, and
+  purpose-built for this use case. v1 ships with a SQLite flat-cosine index
+  (`thoth_store::VectorStore`) because it (a) keeps the dependency surface
+  small, (b) piggybacks on the same SQLite file the episodic log already
+  needs, and (c) is trivially deterministic in tests. LanceDB support is
+  planned behind the `lance` Cargo feature in `thoth-store`; the
+  `chunks.lance/` path in §7 is reserved for it. Cut-over happens once the
+  flat-cosine index becomes a bottleneck on real repos (tens of thousands
+  of chunks with per-token embedding latency).
+- **Dynamic tree-sitter grammar loading (`libloading`).** §3 lists this as the
+  long-term direction, but the v1 implementation statically links a fixed set
+  of grammars (Rust, Python, TypeScript, JavaScript, Go) behind Cargo features
+  in `thoth-parse`. Dynamic loading is deferred because (a) the `tree-sitter`
+  crate ABI for externally-compiled grammars is unstable across versions, and
+  (b) shipping `.so`/`.dylib` grammars complicates install on Windows and in
+  distroless containers. Revisit once the grammar set needs to expand past
+  what's convenient to vendor.
 
 ## 13. Credits
 

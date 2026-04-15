@@ -4,9 +4,9 @@
 # and counts as a hit when *either* an expected path substring or an expected
 # text substring matches a chunk in the top-k. Run with:
 #
-#     make index     # build / refresh .thoth-self
+#     make index     # build / refresh .thoth
 #     cargo run -p thoth-cli --release -- \
-#         --root .thoth-self eval --gold eval/gold.toml -k 8
+#         --root .thoth eval --gold eval/gold.toml -k 8
 #
 # Add cases greedily; the harness exits non-zero if any query misses, which
 # makes it easy to wire into CI or a pre-release check.

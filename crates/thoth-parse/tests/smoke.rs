@@ -141,6 +141,108 @@ async fn walk_respects_gitignore_and_extensions() {
     );
 }
 
+/// `.thothignore` uses gitignore syntax and is honoured even when the dir
+/// isn't under git and has no `.gitignore`.
+#[tokio::test]
+async fn walk_respects_thothignore() {
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("keep.rs"), "fn main() {}")
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join("skip.rs"), "fn x() {}")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(dir.path().join("generated"))
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join("generated").join("out.rs"), "fn g() {}")
+        .await
+        .unwrap();
+    tokio::fs::write(
+        dir.path().join(".thothignore"),
+        "skip.rs\ngenerated/\n",
+    )
+    .await
+    .unwrap();
+
+    let reg = LanguageRegistry::new();
+    let files = walk_sources(dir.path(), &reg, &WalkOptions::default());
+    let names: Vec<_> = files
+        .iter()
+        .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    assert!(names.contains(&"keep.rs".to_string()), "keep.rs missing: {names:?}");
+    assert!(
+        !names.contains(&"skip.rs".to_string()),
+        ".thothignore file rule not honoured: {names:?}",
+    );
+    assert!(
+        !names.contains(&"out.rs".to_string()),
+        ".thothignore dir rule not honoured: {names:?}",
+    );
+}
+
+/// Inline patterns passed via `WalkOptions::extra_ignore_patterns` apply on
+/// top of the usual file-based rules.
+#[tokio::test]
+async fn walk_respects_extra_ignore_patterns() {
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("a.rs"), "fn a() {}")
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join("a.generated.rs"), "fn gen() {}")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(dir.path().join("vendor"))
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join("vendor").join("dep.rs"), "fn d() {}")
+        .await
+        .unwrap();
+
+    let reg = LanguageRegistry::new();
+    let opts = WalkOptions {
+        extra_ignore_patterns: vec!["*.generated.rs".into(), "vendor/".into()],
+        ..WalkOptions::default()
+    };
+    let files = walk_sources(dir.path(), &reg, &opts);
+    let names: Vec<_> = files
+        .iter()
+        .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    assert!(names.contains(&"a.rs".to_string()), "a.rs missing: {names:?}");
+    assert!(
+        !names.contains(&"a.generated.rs".to_string()),
+        "glob pattern not honoured: {names:?}",
+    );
+    assert!(
+        !names.contains(&"dep.rs".to_string()),
+        "directory pattern not honoured: {names:?}",
+    );
+}
+
+/// Malformed inline patterns are logged and skipped, not fatal.
+#[tokio::test]
+async fn walk_survives_bad_extra_pattern() {
+    let dir = tempdir().unwrap();
+    tokio::fs::write(dir.path().join("a.rs"), "fn a() {}")
+        .await
+        .unwrap();
+
+    let reg = LanguageRegistry::new();
+    let opts = WalkOptions {
+        // "[" is an unclosed character class — GitignoreBuilder rejects it.
+        extra_ignore_patterns: vec!["[".into(), "".into(), "# comment".into()],
+        ..WalkOptions::default()
+    };
+    let files = walk_sources(dir.path(), &reg, &opts);
+    let names: Vec<_> = files
+        .iter()
+        .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    assert!(names.contains(&"a.rs".to_string()), "good files dropped: {names:?}");
+}
+
 #[tokio::test]
 async fn watcher_emits_events_on_change() {
     let dir = tempdir().unwrap();

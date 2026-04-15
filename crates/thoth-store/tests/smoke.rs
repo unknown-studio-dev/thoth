@@ -18,11 +18,49 @@ async fn store_root_opens_all_backends() {
     let root = StoreRoot::open(dir.path()).await.unwrap();
 
     assert!(root.path.exists());
-    assert!(root.path.join("index").exists());
-    assert!(root.path.join("index/kv.redb").exists());
-    assert!(root.path.join("index/fts").exists());
-    assert!(root.path.join("index/episodes.sqlite").exists());
+    // DESIGN §7 flat layout — index files live at the root now.
+    assert!(root.path.join("graph.redb").exists());
+    assert!(root.path.join("fts.tantivy").exists());
+    assert!(root.path.join("episodes.db").exists());
     assert!(root.path.join("skills").exists());
+}
+
+#[tokio::test]
+async fn store_root_migrates_legacy_index_layout() {
+    use tokio::fs;
+    let dir = tempdir().unwrap();
+    let legacy = dir.path().join("index");
+    fs::create_dir_all(&legacy).await.unwrap();
+    // Seed real backend files at the legacy paths so the migration moves
+    // genuine databases rather than placeholder bytes that would fail to
+    // reopen on the new paths.
+    {
+        let kv = KvStore::open(legacy.join("kv.redb")).await.unwrap();
+        kv.put_meta("migration-marker", b"present").await.unwrap();
+        drop(kv);
+
+        let fts = FtsIndex::open(legacy.join("fts")).await.unwrap();
+        drop(fts);
+
+        let eps = EpisodeLog::open(legacy.join("episodes.sqlite"))
+            .await
+            .unwrap();
+        drop(eps);
+    }
+
+    let root = StoreRoot::open(dir.path()).await.unwrap();
+
+    // New-layout files exist at the root after migration …
+    assert!(root.path.join("graph.redb").exists());
+    assert!(root.path.join("fts.tantivy").exists());
+    assert!(root.path.join("episodes.db").exists());
+    // … and carry the legacy data (the kv marker survives the rename).
+    assert_eq!(
+        root.kv.get_meta("migration-marker").await.unwrap().as_deref(),
+        Some(&b"present"[..])
+    );
+    // Legacy dir is pruned after a successful migration.
+    assert!(!root.path.join("index").exists());
 }
 
 #[tokio::test]

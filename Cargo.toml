@@ -1,5 +1,9 @@
 [workspace]
-resolver = "2"
+# resolver = "3" enables MSRV-aware dependency resolution — cargo will pick
+# versions whose `rust-version` is <= ours (1.89), so MSRV-bumping upstreams
+# (notably the aws-sdk-* tree pulled in by lancedb → lance → object_store)
+# don't break our build.
+resolver = "3"
 members = [
     "crates/thoth",
     "crates/thoth-core",
@@ -17,7 +21,7 @@ members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/unknown-studio-dev/thoth.git"
 authors = ["Than The Van"]

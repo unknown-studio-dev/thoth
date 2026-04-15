@@ -219,3 +219,65 @@ pub struct ResourceContents {
     /// Inline text body.
     pub text: String,
 }
+
+/// Canonical output of every tool inside the server.
+///
+/// Two downstream wrappers consume this:
+///
+/// - The **MCP** `tools/call` handler projects it onto
+///   [`CallToolResult`] by keeping only the rendered `text` (as a single
+///   text content block). That's what Claude Code / Cowork / Cursor see,
+///   because the MCP wire format is text-centric.
+/// - The **Thoth** `thoth.call` handler (a private RPC extension used only
+///   by the CLI thin-client over the Unix socket) returns the struct
+///   verbatim so the CLI can look at `data` and honour `--json`,
+///   pretty-print tables, etc.
+///
+/// Tools should populate both fields. `data` is the machine-readable
+/// truth; `text` is a human fallback used when structured data is not
+/// consumed (e.g. MCP clients, terminals without `--json`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolOutput {
+    /// Structured result. Shape is tool-specific; see each tool's docs.
+    pub data: Value,
+    /// Pretty-printed rendering of `data` for direct display. Usually a
+    /// short multi-line string; never contains ANSI colour codes.
+    pub text: String,
+    /// `true` if the tool considered the call a failure. Both the MCP
+    /// wrapper and the CLI use this to pick an error exit path.
+    #[serde(rename = "isError", default)]
+    pub is_error: bool,
+}
+
+impl ToolOutput {
+    /// Successful output with both structured data and a rendered form.
+    pub fn new(data: Value, text: impl Into<String>) -> Self {
+        Self {
+            data,
+            text: text.into(),
+            is_error: false,
+        }
+    }
+
+    /// Shortcut for purely textual results (e.g. "remembered fact: ...").
+    /// `data` falls back to `{ "message": <text> }` so CLI --json still
+    /// produces something meaningful.
+    pub fn message(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            data: serde_json::json!({ "message": text }),
+            text,
+            is_error: false,
+        }
+    }
+
+    /// Error output. `data.error` holds the message; `text` is "error: …".
+    pub fn error(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        Self {
+            data: serde_json::json!({ "error": msg }),
+            text: format!("error: {msg}"),
+            is_error: true,
+        }
+    }
+}

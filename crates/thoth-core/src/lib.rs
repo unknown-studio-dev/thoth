@@ -26,5 +26,7 @@ pub use error::{Error, Result};
 pub use event::{Event, EventId, Outcome};
 pub use memory::{Fact, Lesson, MemoryKind, MemoryMeta, Skill};
 pub use mode::Mode;
-pub use provider::{Embedder, Prompt, Synthesis, Synthesizer};
-pub use query::{Chunk, Citation, Query, QueryScope, Retrieval, RetrievalSource};
+pub use provider::{Embedder, NudgeProposal, Prompt, Synthesis, Synthesizer};
+pub use query::{
+    Chunk, ChunkContext, Citation, Query, QueryScope, Retrieval, RetrievalSource, SymbolRef,
+};

@@ -41,7 +41,7 @@ pub use thoth_core::{
     Synthesizer,
 };
 
-pub use thoth_memory::{MemoryConfig, MemoryManager, NudgeReport};
+pub use thoth_memory::{MemoryConfig, MemoryManager, NudgeReport, WorkingMemory, WorkingNote};
 pub use thoth_parse::LanguageRegistry;
 pub use thoth_retrieve::{IndexProgress, IndexStats, Indexer, Retriever};
 pub use thoth_store::{StoreRoot, VectorStore};
@@ -64,17 +64,24 @@ pub struct CodeMemory {
     store: StoreRoot,
     memory: MemoryManager,
     registry: LanguageRegistry,
+    working: WorkingMemory,
 }
 
 impl CodeMemory {
     /// Open (or create) a Thoth memory rooted at `path`.
     ///
     /// Side effects:
-    /// - creates `path/` and `path/index/` if missing,
+    /// - creates `path/` if missing,
+    /// - migrates any legacy `path/index/` layout to the current flat
+    ///   filenames (see [`StoreRoot::open`]),
     /// - opens `MEMORY.md`, `LESSONS.md`, redb KV, tantivy FTS, and the
     ///   episodic SQLite log,
+    /// - loads `<path>/config.toml` (via
+    ///   [`MemoryConfig::load_or_default`]) so TTL / decay / nudge flags
+    ///   take effect immediately,
     /// - seeds empty markdown files so downstream reads never observe a
-    ///   half-initialised layout.
+    ///   half-initialised layout,
+    /// - creates an in-process [`WorkingMemory`] scratchpad.
     ///
     /// The vector store is *not* opened here; it is opened lazily by
     /// [`Self::recall`] when `Mode::Full` is requested.
@@ -96,6 +103,7 @@ impl CodeMemory {
             store,
             memory,
             registry: LanguageRegistry::new(),
+            working: WorkingMemory::with_capacity(128),
         })
     }
 
@@ -113,6 +121,14 @@ impl CodeMemory {
     /// Borrow the memory manager (markdown + episodic TTL + nudge).
     pub fn memory(&self) -> &MemoryManager {
         &self.memory
+    }
+
+    /// Borrow the in-process session scratchpad (DESIGN §5 working memory).
+    ///
+    /// Cloning returns another handle onto the *same* buffer, so feel free
+    /// to hand clones to background tasks.
+    pub fn working(&self) -> &WorkingMemory {
+        &self.working
     }
 
     /// Build an [`Indexer`] bound to this memory. Callers can chain
@@ -140,8 +156,9 @@ impl CodeMemory {
     ///
     /// In `Mode::Zero` this runs the symbol / BM25 / graph / markdown
     /// fusion. In `Mode::Full` it additionally opens the SQLite vector
-    /// store at `<root>/index/vectors.sqlite`, plugs in the caller-supplied
-    /// embedder + synthesizer, and runs the full hybrid pipeline.
+    /// store at `<root>/vectors.db` (per DESIGN §7), plugs in the
+    /// caller-supplied embedder + synthesizer, and runs the full hybrid
+    /// pipeline.
     pub async fn recall(&self, q: Query, mode: Mode) -> Result<Retrieval> {
         match mode {
             Mode::Zero => self.retriever().recall(&q).await,
@@ -149,7 +166,7 @@ impl CodeMemory {
                 embedder,
                 synthesizer,
             } => {
-                let vectors_path = self.store.path.join("index").join("vectors.sqlite");
+                let vectors_path = StoreRoot::vectors_path(&self.root);
                 let vectors = VectorStore::open(&vectors_path).await?;
                 let embedder: Option<Arc<dyn Embedder>> = embedder.map(Arc::from);
                 let synth: Option<Arc<dyn Synthesizer>> = synthesizer.map(Arc::from);
@@ -211,7 +228,18 @@ mod tests {
         let mem = CodeMemory::open(dir.path()).await.unwrap();
         assert!(mem.root().join("MEMORY.md").exists());
         assert!(mem.root().join("LESSONS.md").exists());
-        assert!(mem.root().join("index").exists());
+        // New DESIGN §7 layout puts index files at the root, not under `index/`.
+        assert!(mem.root().join("graph.redb").exists());
+        assert!(mem.root().join("episodes.db").exists());
+        assert!(mem.root().join("fts.tantivy").exists());
+    }
+
+    #[tokio::test]
+    async fn working_memory_handle_is_live() {
+        let dir = tempdir().unwrap();
+        let mem = CodeMemory::open(dir.path()).await.unwrap();
+        mem.working().push(WorkingNote::new("recent query")).await;
+        assert_eq!(mem.working().len().await, 1);
     }
 
     #[tokio::test]

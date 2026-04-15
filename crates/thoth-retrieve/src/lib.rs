@@ -20,9 +20,13 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
+pub mod config;
+pub mod enrich;
 pub mod indexer;
 pub mod retriever;
 
+pub use config::IndexConfig;
+pub use enrich::{enrich_chunks, extract_docstring};
 pub use indexer::{IndexProgress, IndexStats, Indexer, chunk_id, read_span};
 pub use retriever::Retriever;
 
@@ -35,8 +39,9 @@ use thoth_store::{StoreRoot, VectorStore};
 /// [`Mode`] and runs a single recall.
 ///
 /// In Mode::Zero the synthesizer and vector stages are skipped. In Mode::Full
-/// the vector store is opened at `<root>/index/vectors.sqlite` and the
-/// caller-supplied embedder / synthesizer are plugged into the retriever.
+/// the vector store is opened at `<root>/vectors.db` (per DESIGN §7) and
+/// the caller-supplied embedder / synthesizer are plugged into the
+/// retriever.
 pub async fn recall(store: StoreRoot, q: Query, mode: Mode) -> Result<Retrieval> {
     match mode {
         Mode::Zero => Retriever::new(store).recall(&q).await,
@@ -44,7 +49,7 @@ pub async fn recall(store: StoreRoot, q: Query, mode: Mode) -> Result<Retrieval>
             embedder,
             synthesizer,
         } => {
-            let vectors_path = store.path.join("index").join("vectors.sqlite");
+            let vectors_path = StoreRoot::vectors_path(&store.path);
             let vectors = VectorStore::open(&vectors_path).await?;
             let embedder: Option<Arc<dyn Embedder>> = embedder.map(Arc::from);
             let synth: Option<Arc<dyn Synthesizer>> = synthesizer.map(Arc::from);

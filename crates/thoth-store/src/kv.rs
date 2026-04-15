@@ -148,6 +148,24 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Remove a meta value. No-op if the key was never set. Returns
+    /// whether a row was actually removed.
+    pub async fn delete_meta(&self, key: impl Into<String>) -> Result<bool> {
+        let db = self.db.clone();
+        let key = key.into();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let wtxn = db.begin_write().map_err(store)?;
+            let removed = {
+                let mut t = wtxn.open_table(META).map_err(store)?;
+                t.remove(key.as_str()).map_err(store)?.is_some()
+            };
+            wtxn.commit().map_err(store)?;
+            Ok(removed)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     // --- symbols --------------------------------------------------------
 
     /// Insert or replace a symbol row. Key is the FQN.
@@ -287,6 +305,133 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Delete every symbol row whose `path` matches `path`, returning the
+    /// FQNs that were removed so the caller can also prune the graph nodes
+    /// and edges that referenced them.
+    ///
+    /// There is no secondary index on `path` — this walks the whole symbols
+    /// table. Fine at our scale; if it ever isn't we can add a `path → fqn`
+    /// side table.
+    pub async fn delete_symbols_by_path(&self, path: impl AsRef<Path>) -> Result<Vec<String>> {
+        let db = self.db.clone();
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(SYMBOLS).map_err(store)?;
+            let mut keys: Vec<String> = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (k, v) = entry.map_err(store)?;
+                let row: SymbolRow = match serde_json::from_slice(v.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if row.path == path {
+                    keys.push(k.value().to_string());
+                }
+            }
+            drop(t);
+            drop(rtxn);
+
+            if keys.is_empty() {
+                return Ok(keys);
+            }
+            let wtxn = db.begin_write().map_err(store)?;
+            {
+                let mut t = wtxn.open_table(SYMBOLS).map_err(store)?;
+                for k in &keys {
+                    t.remove(k.as_str()).map_err(store)?;
+                }
+            }
+            wtxn.commit().map_err(store)?;
+            Ok(keys)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Delete every graph node whose JSON payload `path` field matches
+    /// `path`. Returns the list of node ids removed (so the caller can clean
+    /// up the edges that touch them).
+    pub async fn delete_nodes_by_path(&self, path: impl AsRef<Path>) -> Result<Vec<String>> {
+        let db = self.db.clone();
+        let path_str = path.as_ref().to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(NODES).map_err(store)?;
+            let mut keys: Vec<String> = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (k, v) = entry.map_err(store)?;
+                let row: NodeRow = match serde_json::from_slice(v.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let p = row.payload.get("path").and_then(|x| x.as_str());
+                if p == Some(path_str.as_str()) {
+                    keys.push(k.value().to_string());
+                }
+            }
+            drop(t);
+            drop(rtxn);
+
+            if keys.is_empty() {
+                return Ok(keys);
+            }
+            let wtxn = db.begin_write().map_err(store)?;
+            {
+                let mut t = wtxn.open_table(NODES).map_err(store)?;
+                for k in &keys {
+                    t.remove(k.as_str()).map_err(store)?;
+                }
+            }
+            wtxn.commit().map_err(store)?;
+            Ok(keys)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Delete every edge whose `src` or `dst` appears in `ids`.
+    pub async fn delete_edges_touching(&self, ids: &[String]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let db = self.db.clone();
+        let ids: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(EDGES).map_err(store)?;
+            let mut to_drop: Vec<String> = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (k, v) = entry.map_err(store)?;
+                let row: EdgeRow = match serde_json::from_slice(v.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if ids.contains(&row.src) || ids.contains(&row.dst) {
+                    to_drop.push(k.value().to_string());
+                }
+            }
+            drop(t);
+            drop(rtxn);
+
+            if to_drop.is_empty() {
+                return Ok(0);
+            }
+            let n = to_drop.len();
+            let wtxn = db.begin_write().map_err(store)?;
+            {
+                let mut t = wtxn.open_table(EDGES).map_err(store)?;
+                for k in &to_drop {
+                    t.remove(k.as_str()).map_err(store)?;
+                }
+            }
+            wtxn.commit().map_err(store)?;
+            Ok(n)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Get a node by id.
     pub async fn get_node(&self, id: impl Into<String>) -> Result<Option<NodeRow>> {
         let db = self.db.clone();
@@ -298,6 +443,35 @@ impl KvStore {
                 return Ok(None);
             };
             Ok(Some(serde_json::from_slice(g.value())?))
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Return every graph node whose payload `path` field matches `path`.
+    ///
+    /// There is no secondary index on `path` — this walks the whole nodes
+    /// table. Fine at our scale (called at most `top_k` times per query) and
+    /// symmetric with [`Self::delete_nodes_by_path`].
+    pub async fn nodes_for_path(&self, path: impl AsRef<Path>) -> Result<Vec<NodeRow>> {
+        let db = self.db.clone();
+        let path_str = path.as_ref().to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || -> Result<Vec<NodeRow>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(NODES).map_err(store)?;
+            let mut out = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (_k, v) = entry.map_err(store)?;
+                let row: NodeRow = match serde_json::from_slice(v.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let p = row.payload.get("path").and_then(|x| x.as_str());
+                if p == Some(path_str.as_str()) {
+                    out.push(row);
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| Error::Store(format!("join: {e}")))?

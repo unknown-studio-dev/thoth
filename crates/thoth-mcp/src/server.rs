@@ -18,7 +18,8 @@ use tracing::{debug, warn};
 
 use crate::proto::{
     CallToolResult, Capabilities, ContentBlock, InitializeResult, MCP_PROTOCOL_VERSION, Resource,
-    ResourceContents, RpcError, RpcIncoming, RpcResponse, ServerInfo, Tool, error_codes,
+    ResourceContents, RpcError, RpcIncoming, RpcResponse, ServerInfo, Tool, ToolOutput,
+    error_codes,
 };
 
 /// URI of the `MEMORY.md` resource.
@@ -33,11 +34,11 @@ const LESSONS_URI: &str = "thoth://memory/LESSONS.md";
 /// MCP server handle. Cheap to clone — all backing state is behind `Arc`.
 #[derive(Clone)]
 pub struct Server {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
-struct Inner {
-    root: PathBuf,
+pub(crate) struct Inner {
+    pub(crate) root: PathBuf,
     store: StoreRoot,
     indexer: Indexer,
     retriever: Retriever,
@@ -74,6 +75,11 @@ impl Server {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.tools_list()),
             "tools/call" => self.tools_call(msg.params).await,
+            // Thoth-private extension: same dispatch as `tools/call` but
+            // returns the raw `ToolOutput` (with structured `data`) instead
+            // of the text-only `CallToolResult`. Consumed by the CLI
+            // thin-client so it can honour `--json` and pretty-print.
+            "thoth.call" => self.thoth_call(msg.params).await,
             "resources/list" => Ok(self.resources_list()),
             "resources/read" => self.resources_read(msg.params).await,
             other => Err(RpcError::new(
@@ -116,7 +122,34 @@ impl Server {
         json!({ "tools": tools_catalog() })
     }
 
+    /// MCP `tools/call` — returns a text-only [`CallToolResult`] (which is
+    /// what every MCP client understands). The structured `data` half of
+    /// [`ToolOutput`] is dropped; clients wanting the machine-readable
+    /// form should call [`Self::thoth_call`] via `thoth.call` instead.
     async fn tools_call(&self, params: Value) -> Result<Value, RpcError> {
+        let out = self.dispatch_tool(params).await?;
+        let wrapped = CallToolResult {
+            content: vec![ContentBlock::text(out.text)],
+            is_error: out.is_error,
+        };
+        serde_json::to_value(wrapped)
+            .map_err(|e| RpcError::new(error_codes::INTERNAL_ERROR, e.to_string()))
+    }
+
+    /// Thoth-private `thoth.call` — returns the raw [`ToolOutput`] so the
+    /// CLI thin-client can honour `--json` and pretty-print structured
+    /// data. Dispatch logic is shared with [`Self::tools_call`].
+    async fn thoth_call(&self, params: Value) -> Result<Value, RpcError> {
+        let out = self.dispatch_tool(params).await?;
+        serde_json::to_value(out)
+            .map_err(|e| RpcError::new(error_codes::INTERNAL_ERROR, e.to_string()))
+    }
+
+    /// Shared dispatch used by both `tools/call` and `thoth.call`. Tool
+    /// errors are folded into `ToolOutput { is_error: true, .. }` so the
+    /// RPC layer can still emit a successful envelope (callers inspect
+    /// `is_error` on the payload).
+    async fn dispatch_tool(&self, params: Value) -> Result<ToolOutput, RpcError> {
         #[derive(Deserialize)]
         struct CallParams {
             name: String,
@@ -142,15 +175,10 @@ impl Server {
             }
         };
 
-        let value = match result {
-            Ok(r) => serde_json::to_value(r),
-            Err(e) => serde_json::to_value(CallToolResult {
-                content: vec![ContentBlock::text(format!("error: {e:#}"))],
-                is_error: true,
-            }),
-        }
-        .map_err(|e| RpcError::new(error_codes::INTERNAL_ERROR, e.to_string()))?;
-        Ok(value)
+        Ok(match result {
+            Ok(out) => out,
+            Err(e) => ToolOutput::error(format!("{e:#}")),
+        })
     }
 
     fn resources_list(&self) -> Value {
@@ -207,7 +235,7 @@ impl Server {
 
     // ---- tool impls -------------------------------------------------------
 
-    async fn tool_recall(&self, args: Value) -> anyhow::Result<CallToolResult> {
+    async fn tool_recall(&self, args: Value) -> anyhow::Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
             query: String,
@@ -221,14 +249,15 @@ impl Server {
             ..Query::text("")
         };
         let out = self.inner.retriever.recall(&q).await?;
-        let rendered = render_retrieval(&out);
-        Ok(CallToolResult {
-            content: vec![ContentBlock::text(rendered)],
-            is_error: false,
-        })
+        let text = render_retrieval(&out);
+        // Serialize the full `Retrieval` so CLI `--json` sees the same
+        // shape as the direct-store path. Fall back to an empty object on
+        // serde failure (shouldn't happen — `Retrieval: Serialize`).
+        let data = serde_json::to_value(&out).unwrap_or_else(|_| json!({}));
+        Ok(ToolOutput::new(data, text))
     }
 
-    async fn tool_index(&self, args: Value) -> anyhow::Result<CallToolResult> {
+    async fn tool_index(&self, args: Value) -> anyhow::Result<ToolOutput> {
         #[derive(Deserialize, Default)]
         struct Args {
             #[serde(default)]
@@ -246,13 +275,19 @@ impl Server {
             stats.calls,
             stats.imports
         );
-        Ok(CallToolResult {
-            content: vec![ContentBlock::text(text)],
-            is_error: false,
-        })
+        let data = json!({
+            "path": src.display().to_string(),
+            "files": stats.files,
+            "chunks": stats.chunks,
+            "symbols": stats.symbols,
+            "calls": stats.calls,
+            "imports": stats.imports,
+            "embedded": stats.embedded,
+        });
+        Ok(ToolOutput::new(data, text))
     }
 
-    async fn tool_remember_fact(&self, args: Value) -> anyhow::Result<CallToolResult> {
+    async fn tool_remember_fact(&self, args: Value) -> anyhow::Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
             text: String,
@@ -266,16 +301,16 @@ impl Server {
             tags,
         };
         self.inner.store.markdown.append_fact(&fact).await?;
-        Ok(CallToolResult {
-            content: vec![ContentBlock::text(format!(
-                "remembered fact: {}",
-                first_line(&fact.text)
-            ))],
-            is_error: false,
-        })
+        let text = format!("remembered fact: {}", first_line(&fact.text));
+        let data = json!({
+            "text": fact.text,
+            "tags": fact.tags,
+            "path": self.inner.root.join("MEMORY.md").display().to_string(),
+        });
+        Ok(ToolOutput::new(data, text))
     }
 
-    async fn tool_remember_lesson(&self, args: Value) -> anyhow::Result<CallToolResult> {
+    async fn tool_remember_lesson(&self, args: Value) -> anyhow::Result<ToolOutput> {
         #[derive(Deserialize)]
         struct Args {
             trigger: String,
@@ -290,16 +325,16 @@ impl Server {
             failure_count: 0,
         };
         self.inner.store.markdown.append_lesson(&lesson).await?;
-        Ok(CallToolResult {
-            content: vec![ContentBlock::text(format!(
-                "recorded lesson for trigger: {}",
-                lesson.trigger
-            ))],
-            is_error: false,
-        })
+        let text = format!("recorded lesson for trigger: {}", lesson.trigger);
+        let data = json!({
+            "trigger": lesson.trigger,
+            "advice": lesson.advice,
+            "path": self.inner.root.join("LESSONS.md").display().to_string(),
+        });
+        Ok(ToolOutput::new(data, text))
     }
 
-    async fn tool_skills_list(&self) -> anyhow::Result<CallToolResult> {
+    async fn tool_skills_list(&self) -> anyhow::Result<ToolOutput> {
         let skills = self.inner.store.markdown.list_skills().await?;
         let text = if skills.is_empty() {
             format!(
@@ -313,42 +348,54 @@ impl Server {
             }
             buf
         };
-        Ok(CallToolResult {
-            content: vec![ContentBlock::text(text)],
-            is_error: false,
-        })
+        let data = serde_json::to_value(&skills).unwrap_or_else(|_| json!([]));
+        Ok(ToolOutput::new(data, text))
     }
 
-    async fn tool_memory_forget(&self) -> anyhow::Result<CallToolResult> {
+    async fn tool_memory_forget(&self) -> anyhow::Result<ToolOutput> {
         let mm = MemoryManager::open(&self.inner.root).await?;
         let report = mm.forget_pass().await?;
-        Ok(CallToolResult {
-            content: vec![ContentBlock::text(format!(
-                "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={}",
-                report.episodes_ttl, report.episodes_cap, report.lessons_dropped
-            ))],
-            is_error: false,
-        })
+        let text = format!(
+            "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={}",
+            report.episodes_ttl, report.episodes_cap, report.lessons_dropped
+        );
+        let data = json!({
+            "episodes_ttl": report.episodes_ttl,
+            "episodes_cap": report.episodes_cap,
+            "lessons_dropped": report.lessons_dropped,
+        });
+        Ok(ToolOutput::new(data, text))
     }
 
-    async fn tool_memory_show(&self) -> anyhow::Result<CallToolResult> {
-        let mut out = String::new();
+    async fn tool_memory_show(&self) -> anyhow::Result<ToolOutput> {
+        let mut text = String::new();
+        let mut memory_md: Option<String> = None;
+        let mut lessons_md: Option<String> = None;
+
         for name in ["MEMORY.md", "LESSONS.md"] {
-            out.push_str(&format!("─── {name} ───\n"));
+            text.push_str(&format!("─── {name} ───\n"));
             let p = self.inner.root.join(name);
-            match tokio::fs::read_to_string(&p).await {
-                Ok(s) => out.push_str(&s),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    out.push_str("(not found)\n");
-                }
+            let body = match tokio::fs::read_to_string(&p).await {
+                Ok(s) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e.into()),
+            };
+            match &body {
+                Some(s) => text.push_str(s),
+                None => text.push_str("(not found)\n"),
             }
-            out.push('\n');
+            text.push('\n');
+            match name {
+                "MEMORY.md" => memory_md = body,
+                "LESSONS.md" => lessons_md = body,
+                _ => {}
+            }
         }
-        Ok(CallToolResult {
-            content: vec![ContentBlock::text(out)],
-            is_error: false,
-        })
+        let data = json!({
+            "memory_md": memory_md,
+            "lessons_md": lessons_md,
+        });
+        Ok(ToolOutput::new(data, text))
     }
 }
 
@@ -441,26 +488,9 @@ fn tools_catalog() -> Vec<Tool> {
 // ===========================================================================
 
 fn render_retrieval(r: &thoth_core::Retrieval) -> String {
-    if r.chunks.is_empty() {
-        return "(no matches — did you run thoth_index?)".to_string();
-    }
-    let mut out = String::new();
-    for (i, c) in r.chunks.iter().enumerate() {
-        let sym = c.symbol.as_deref().unwrap_or("-");
-        out.push_str(&format!(
-            "[{i:>2}] score={:.4} src={:?}  {}  {}:{}-{}\n",
-            c.score,
-            c.source,
-            sym,
-            c.path.display(),
-            c.span.0,
-            c.span.1
-        ));
-        if !c.preview.is_empty() {
-            out.push_str(&format!("     {}\n", c.preview));
-        }
-    }
-    out
+    // The rendering lives on `Retrieval::render()` so the CLI and the
+    // MCP-text surface stay byte-for-byte identical.
+    r.render()
 }
 
 fn first_line(s: &str) -> String {
@@ -511,6 +541,97 @@ pub async fn run_stdio(server: Server) -> anyhow::Result<()> {
             stdout.write_all(text.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
             stdout.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+/// Canonical path for the Unix domain socket that the CLI connects to.
+pub fn socket_path(root: &Path) -> std::path::PathBuf {
+    root.join("mcp.sock")
+}
+
+/// Run a Unix-socket sidecar alongside the stdio transport.
+///
+/// Binds `.thoth/mcp.sock` and accepts connections in a loop. Each
+/// connection is a short-lived JSON-RPC session (one line in → one line
+/// out, then close). The socket is removed on clean shutdown.
+///
+/// This is the "thin-client" entry point: when the CLI detects the socket
+/// it forwards requests here instead of opening the store directly,
+/// avoiding the redb exclusive-lock conflict.
+pub async fn run_socket(server: Server) -> anyhow::Result<()> {
+    use tokio::net::{UnixListener, UnixStream};
+
+    let sock = socket_path(&server.inner.root);
+
+    // Try binding first. Only if it fails with `AddrInUse` do we probe
+    // the existing socket and, if nothing is listening, unlink and retry.
+    // This avoids the race where two daemons start at the same time, and
+    // the "remove stale and rebind" pattern of the previous version would
+    // happily overwrite an actively-used socket.
+    let listener = match UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Peer responsive? Then another daemon owns the socket — bail.
+            if UnixStream::connect(&sock).await.is_ok() {
+                return Err(anyhow::anyhow!(
+                    "another thoth-mcp is already listening on {}",
+                    sock.display()
+                ));
+            }
+            // Stale socket file — safe to remove and retry.
+            let _ = std::fs::remove_file(&sock);
+            UnixListener::bind(&sock)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    debug!(path = %sock.display(), "mcp socket listening");
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let server = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_socket_conn(server, stream).await {
+                debug!(error = %e, "socket connection error");
+            }
+        });
+    }
+}
+
+/// Handle one Unix-socket connection: read lines, dispatch, respond.
+async fn handle_socket_conn(
+    server: Server,
+    stream: tokio::net::UnixStream,
+) -> anyhow::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let response = match serde_json::from_str::<RpcIncoming>(trimmed) {
+            Ok(msg) => server.handle(msg).await,
+            Err(e) => Some(RpcResponse::err(
+                Value::Null,
+                RpcError::new(error_codes::PARSE_ERROR, format!("parse error: {e}")),
+            )),
+        };
+
+        if let Some(resp) = response {
+            let text = serde_json::to_string(&resp)?;
+            writer.write_all(text.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
         }
     }
     Ok(())

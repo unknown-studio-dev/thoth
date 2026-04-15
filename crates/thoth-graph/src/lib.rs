@@ -154,6 +154,74 @@ impl Graph {
         self.bfs(fqn, depth, Direction::Both, None).await
     }
 
+    /// Delete every node and every edge that touches any symbol declared in
+    /// `path`. Returns `(nodes_dropped, edges_dropped)`.
+    ///
+    /// Called by [`thoth_retrieve::Indexer::purge_path`] when a file is
+    /// deleted or about to be re-indexed; keeps the graph in lock-step with
+    /// the source tree.
+    pub async fn purge_path(&self, path: impl AsRef<std::path::Path>) -> Result<(usize, usize)> {
+        let nodes = self.kv.delete_nodes_by_path(path).await?;
+        let edges = self.kv.delete_edges_touching(&nodes).await?;
+        Ok((nodes.len(), edges))
+    }
+
+    /// Every node declared inside `path`. Symmetric with
+    /// [`Self::purge_path`] — together they form the read/write surface
+    /// for file-level graph lookups.
+    pub async fn symbols_in_file(&self, path: impl AsRef<std::path::Path>) -> Result<Vec<Node>> {
+        Ok(self
+            .kv
+            .nodes_for_path(path)
+            .await?
+            .into_iter()
+            .map(row_to_node)
+            .collect())
+    }
+
+    /// Distinct FQNs this file imports. Walks outgoing `Imports` edges
+    /// for every symbol declared in `path`, plus the file's synthetic
+    /// "module" node (file stem) which the indexer uses as the source of
+    /// file-level `use`/`import` statements. Destinations are deduped;
+    /// order is stable (insertion order of first occurrence).
+    pub async fn imports_of_file(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Vec<String>> {
+        let path = path.as_ref();
+        let nodes = self.symbols_in_file(path).await?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+
+        // Per-symbol imports (rare — most languages attach imports at
+        // file scope — but cheap to check).
+        for n in &nodes {
+            for e in self.outgoing(&n.fqn).await? {
+                if matches!(e.kind, EdgeKind::Imports) && seen.insert(e.to.clone()) {
+                    out.push(e.to);
+                }
+            }
+        }
+
+        // File-level imports: the indexer writes these with the file
+        // stem as the `from` of an `Imports` edge. The stem has no
+        // corresponding Node (see `thoth-retrieve::indexer::module_fqn`)
+        // so a node-driven scan alone would miss them.
+        if let Some(stem) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        {
+            for e in self.outgoing(&stem).await? {
+                if matches!(e.kind, EdgeKind::Imports) && seen.insert(e.to.clone()) {
+                    out.push(e.to);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Direct outgoing edges of any kind.
     pub async fn outgoing(&self, fqn: &str) -> Result<Vec<Edge>> {
         Ok(self

@@ -36,4 +36,4 @@
 pub mod proto;
 pub mod server;
 
-pub use server::{Server, run_stdio};
+pub use server::{Server, run_socket, run_stdio, socket_path};

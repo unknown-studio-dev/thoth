@@ -15,7 +15,9 @@ Thumbs.db
 # Thoth local data.
 #
 # The markdown source-of-truth (MEMORY.md, LESSONS.md, skills/) can be
-# committed alongside the repo. Everything under `index/` is derivable and
+# committed alongside the repo. Everything else in `.thoth/` — the
+# `graph.redb`, `fts.tantivy/`, `episodes.db`, `vectors.db`,
+# `chunks.lance/`, and any legacy `index/` directory — is derivable and
 # should never be tracked.
 .thoth*/
 
@@ -33,3 +35,5 @@ Thumbs.db
 # Build artifacts
 *.profraw
 *.profdata
+.claude/
+CLAUDE.md

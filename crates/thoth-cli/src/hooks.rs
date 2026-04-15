@@ -31,9 +31,16 @@ const SKILL_MD: &str = include_str!("../assets/skills/thoth/SKILL.md");
 /// Claude Code hook template — merged into `settings.json` on install.
 const HOOKS_TEMPLATE: &str = include_str!("../assets/hooks/claude-code.json");
 
+/// MCP server template — merged into `settings.json` (`mcpServers.thoth`).
+const MCP_TEMPLATE: &str = include_str!("../assets/hooks/mcp.json");
+
 /// Comment included with `_comment` in the rendered settings block. Keeps
 /// the file self-documenting after an install.
 const THOTH_MARKER: &str = "thoth hooks exec";
+
+/// Key under `mcpServers` that identifies the Thoth entry so we can dedupe
+/// and cleanly uninstall.
+const MCP_SERVER_KEY: &str = "thoth";
 
 /// Scope of a settings edit.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -55,9 +62,14 @@ impl Scope {
         }
     }
 
-    fn skills_dir(self, root: &Path) -> anyhow::Result<PathBuf> {
+    /// Where Claude Code looks for skills. Mirrors [`Self::settings_path`]:
+    /// project-local skills live next to `.claude/settings.json`, not under
+    /// Thoth's own `.thoth/` root. The `_root` arg is unused today but kept
+    /// for forward compatibility (e.g. a future `thoth skills install
+    /// --scope thoth` that targets Thoth's own registry).
+    fn skills_dir(self, _root: &Path) -> anyhow::Result<PathBuf> {
         match self {
-            Scope::Project => Ok(root.join("skills")),
+            Scope::Project => Ok(PathBuf::from(".claude").join("skills")),
             Scope::User => {
                 let home = home_dir().context("could not locate home directory")?;
                 Ok(home.join(".claude").join("skills"))
@@ -176,6 +188,40 @@ fn strip_hooks(v: &mut Value) {
     }
 }
 
+/// Merge the Thoth MCP server block into an existing `settings.json`. Only
+/// writes under `mcpServers.thoth` — other server entries are preserved.
+/// Idempotent.
+fn merge_mcp(existing: &mut Value, template: &Value) {
+    let Some(template_servers) = template.get("mcpServers").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(entry) = template_servers.get(MCP_SERVER_KEY) else {
+        return;
+    };
+    let servers = existing
+        .as_object_mut()
+        .expect("settings root must be an object")
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| json!({}));
+    let servers = servers
+        .as_object_mut()
+        .expect("mcpServers must be an object");
+    servers.insert(MCP_SERVER_KEY.to_string(), entry.clone());
+}
+
+/// Drop Thoth's MCP entry; prune an empty `mcpServers` key.
+fn strip_mcp(v: &mut Value) {
+    let Some(servers) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else {
+        return;
+    };
+    servers.remove(MCP_SERVER_KEY);
+    if servers.is_empty()
+        && let Some(obj) = v.as_object_mut()
+    {
+        obj.remove("mcpServers");
+    }
+}
+
 // ------------------------------------------------------------- public commands
 
 /// `thoth hooks install [--scope ...]`
@@ -219,6 +265,77 @@ pub async fn skills_install(scope: Scope, root: &Path) -> anyhow::Result<()> {
     let dest = dest_dir.join("SKILL.md");
     tokio::fs::write(&dest, SKILL_MD).await?;
     println!("✓ skill installed at {}", dest.display());
+    Ok(())
+}
+
+/// `thoth mcp install [--scope ...]` — registers `thoth-mcp` under
+/// `mcpServers.thoth` in `settings.json`. Idempotent.
+pub async fn mcp_install(scope: Scope, root: &Path) -> anyhow::Result<()> {
+    let path = scope.settings_path()?;
+    let mut template: Value = serde_json::from_str(MCP_TEMPLATE)?;
+    // Rewrite the bundled --root arg to match the user's actual root so
+    // the server looks in the right place.
+    if let Some(entry) = template
+        .get_mut("mcpServers")
+        .and_then(|s| s.get_mut(MCP_SERVER_KEY))
+        .and_then(|v| v.as_object_mut())
+    {
+        entry.insert(
+            "args".to_string(),
+            json!(["--root", root.display().to_string()]),
+        );
+    }
+
+    let mut settings = read_settings(&path).await?;
+    if !settings.is_object() {
+        bail!(
+            "{} exists but isn't a JSON object — refusing to overwrite",
+            path.display()
+        );
+    }
+    merge_mcp(&mut settings, &template);
+    write_settings(&path, &settings).await?;
+    println!("✓ mcp server `thoth` installed into {}", path.display());
+    println!("  command: thoth-mcp --root {}", root.display());
+    println!("  uninstall: thoth mcp uninstall");
+    Ok(())
+}
+
+/// `thoth mcp uninstall [--scope ...]`
+pub async fn mcp_uninstall(scope: Scope) -> anyhow::Result<()> {
+    let path = scope.settings_path()?;
+    if !path.exists() {
+        println!("no settings at {} — nothing to remove", path.display());
+        return Ok(());
+    }
+    let mut settings = read_settings(&path).await?;
+    strip_mcp(&mut settings);
+    write_settings(&path, &settings).await?;
+    println!("✓ mcp server `thoth` removed from {}", path.display());
+    Ok(())
+}
+
+/// `thoth install` — convenience one-shot: skill + hooks + mcp, all in the
+/// same scope. Idempotent; safe to re-run.
+pub async fn install_all(scope: Scope, root: &Path) -> anyhow::Result<()> {
+    skills_install(scope, root).await?;
+    install(scope).await?;
+    mcp_install(scope, root).await?;
+    println!();
+    println!("✓ thoth fully wired into Claude Code ({scope:?} scope)");
+    Ok(())
+}
+
+/// `thoth uninstall` — removes skill + hooks + mcp from `settings.json`.
+pub async fn uninstall_all(scope: Scope, root: &Path) -> anyhow::Result<()> {
+    // Skill file removal — best effort; only drops our own directory.
+    let skill_dir = scope.skills_dir(root)?.join("thoth");
+    if skill_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&skill_dir).await;
+        println!("✓ skill removed from {}", skill_dir.display());
+    }
+    uninstall(scope).await?;
+    mcp_uninstall(scope).await?;
     Ok(())
 }
 
@@ -344,10 +461,13 @@ async fn run_post_tool(root: &Path, payload: &Value) -> anyhow::Result<()> {
         return Ok(());
     }
     let store = StoreRoot::open(root).await?;
-    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
+    let idx = Indexer::new(store, LanguageRegistry::new());
     // Best effort — if the language isn't supported we just skip silently.
+    // `index_file` purges stale rows for this path before re-writing, and
+    // the explicit `commit` flushes the BM25 writer so the next recall
+    // picks up the edit.
     let _ = idx.index_file(p).await;
-    let _ = store.fts.commit().await;
+    let _ = idx.commit().await;
     Ok(())
 }
 
@@ -473,5 +593,59 @@ mod tests {
         merge_hooks(&mut settings, &template);
         strip_hooks(&mut settings);
         assert!(settings.get("hooks").is_none());
+    }
+
+    #[test]
+    fn mcp_merge_is_idempotent() {
+        let template: Value = serde_json::from_str(MCP_TEMPLATE).unwrap();
+        let mut settings = json!({});
+        merge_mcp(&mut settings, &template);
+        let once = settings.clone();
+        merge_mcp(&mut settings, &template);
+        assert_eq!(once, settings);
+        assert!(
+            settings
+                .get("mcpServers")
+                .and_then(|s| s.get("thoth"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn mcp_merge_preserves_other_servers() {
+        let template: Value = serde_json::from_str(MCP_TEMPLATE).unwrap();
+        let mut settings = json!({
+            "mcpServers": {
+                "other": { "command": "other-mcp" }
+            }
+        });
+        merge_mcp(&mut settings, &template);
+        let servers = settings.get("mcpServers").unwrap().as_object().unwrap();
+        assert!(servers.contains_key("other"));
+        assert!(servers.contains_key("thoth"));
+    }
+
+    #[test]
+    fn mcp_uninstall_removes_only_thoth() {
+        let template: Value = serde_json::from_str(MCP_TEMPLATE).unwrap();
+        let mut settings = json!({
+            "mcpServers": {
+                "other": { "command": "other-mcp" }
+            }
+        });
+        merge_mcp(&mut settings, &template);
+        strip_mcp(&mut settings);
+        let servers = settings.get("mcpServers").unwrap().as_object().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("other"));
+    }
+
+    #[test]
+    fn mcp_uninstall_prunes_empty_mcp_servers() {
+        let template: Value = serde_json::from_str(MCP_TEMPLATE).unwrap();
+        let mut settings = json!({});
+        merge_mcp(&mut settings, &template);
+        strip_mcp(&mut settings);
+        assert!(settings.get("mcpServers").is_none());
     }
 }

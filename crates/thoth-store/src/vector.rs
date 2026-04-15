@@ -152,6 +152,35 @@ impl VectorStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Delete every vector whose id begins with `"{path}:"`.
+    ///
+    /// The indexer uses `chunk_id = "{path}:{start}-{end}"` so every chunk
+    /// that belongs to a given file shares the same prefix. Returns the
+    /// number of rows deleted.
+    pub async fn delete_by_path(&self, path: &str) -> Result<u64> {
+        let prefix = format!("{path}:");
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let c = conn.lock();
+            // `LIKE` with an explicit ESCAPE so ids containing `%` or `_`
+            // (rare in practice, but possible) don't widen the match.
+            let esc = prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("{esc}%");
+            let n = c
+                .execute(
+                    "DELETE FROM vectors WHERE id LIKE ?1 ESCAPE '\\'",
+                    params![pattern],
+                )
+                .map_err(store)?;
+            Ok(n as u64)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Delete a single vector by id.
     pub async fn delete(&self, id: &str) -> Result<()> {
         let id = id.to_string();

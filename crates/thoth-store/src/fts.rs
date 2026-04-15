@@ -103,9 +103,13 @@ impl FtsIndex {
             let index = Index::open_or_create(mmap, schema).map_err(store)?;
 
             let writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).map_err(store)?;
+            // `OnCommitWithDelay` batches reloads and leaves a visible lag
+            // between `commit()` and the next `search()` — bad for watch /
+            // hook flows where we want the post-edit query to see the edit.
+            // `Manual` lets us explicitly reload in `commit()` below.
             let reader = index
                 .reader_builder()
-                .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+                .reload_policy(tantivy::ReloadPolicy::Manual)
                 .try_into()
                 .map_err(store)?;
 
@@ -152,12 +156,39 @@ impl FtsIndex {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Delete every document whose `path` field matches `path`.
+    ///
+    /// Keyed on the STRING `path` field so a full file can be purged without
+    /// having to enumerate every stale chunk id first. The caller is still
+    /// responsible for calling [`FtsIndex::commit`] before the next search.
+    pub async fn delete_path(&self, path: &str) -> Result<()> {
+        let writer = self.writer.clone();
+        let fields = self.fields.clone();
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let w = writer.lock();
+            let term = tantivy::Term::from_field_text(fields.path, &path);
+            w.delete_term(term);
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Commit any pending writes so they become searchable.
+    ///
+    /// Also explicitly reloads the reader, because we configure the index
+    /// with [`tantivy::ReloadPolicy::Manual`] — the default `OnCommitWithDelay`
+    /// left a window where a query fired right after a per-file reindex
+    /// would still see the pre-commit segments.
     pub async fn commit(&self) -> Result<()> {
         let writer = self.writer.clone();
+        let reader = self.reader.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut w = writer.lock();
             w.commit().map_err(store)?;
+            drop(w);
+            reader.reload().map_err(store)?;
             Ok(())
         })
         .await

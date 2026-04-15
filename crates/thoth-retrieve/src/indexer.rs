@@ -96,6 +96,10 @@ pub struct Indexer {
     on_progress: Option<ProgressFn>,
     /// Max concurrent per-file pipelines during [`Indexer::index_path`].
     concurrency: usize,
+    /// Walker options: ignore patterns, max file size, hidden-dir toggle,
+    /// symlink handling. Typically sourced from `config.toml`'s
+    /// `[index]` table via [`Indexer::with_config`].
+    walk_opts: WalkOptions,
 }
 
 impl Indexer {
@@ -110,7 +114,46 @@ impl Indexer {
             vectors: None,
             on_progress: None,
             concurrency: default_concurrency(),
+            walk_opts: WalkOptions::default(),
         }
+    }
+
+    /// Attach extra ignore patterns (gitignore syntax) that will be applied
+    /// during [`Indexer::index_path`] on top of `.gitignore`, `.ignore`, and
+    /// `.thothignore`. Malformed patterns are logged and skipped.
+    ///
+    /// Typical source: `config.toml`'s `[index] ignore = [...]`.
+    pub fn with_ignore_patterns<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.walk_opts.extra_ignore_patterns =
+            patterns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replace the [`WalkOptions`] wholesale. Useful for callers that want
+    /// to tweak `max_file_size` / `include_hidden` / `follow_symlinks`
+    /// programmatically without round-tripping through `config.toml`.
+    pub fn with_walk_options(mut self, opts: WalkOptions) -> Self {
+        self.walk_opts = opts;
+        self
+    }
+
+    /// Apply a user-facing [`IndexConfig`] (typically loaded from
+    /// `config.toml`) to this indexer. Sets the ignore list, max file size,
+    /// hidden-dir toggle, and symlink handling in one call.
+    ///
+    /// This is the "one-stop wire" for apps: load once, pass here, done.
+    pub fn with_config(mut self, cfg: &crate::IndexConfig) -> Self {
+        self.walk_opts = WalkOptions {
+            max_file_size: cfg.max_file_size,
+            follow_symlinks: cfg.follow_symlinks,
+            include_hidden: cfg.include_hidden,
+            extra_ignore_patterns: cfg.ignore.clone(),
+        };
+        self
     }
 
     /// Override the per-file concurrency cap used by [`Indexer::index_path`].
@@ -157,8 +200,7 @@ impl Indexer {
     /// 4. Commit the BM25 writer so fresh docs become searchable.
     pub async fn index_path(&self, root: impl AsRef<Path>) -> Result<IndexStats> {
         let root = root.as_ref().to_path_buf();
-        let opts = WalkOptions::default();
-        let files = walk_sources(&root, &self.registry, &opts);
+        let files = walk_sources(&root, &self.registry, &self.walk_opts);
         let total = files.len();
         debug!(count = total, ?root, concurrency = self.concurrency, "indexing");
         self.emit(IndexProgress {
@@ -258,6 +300,12 @@ impl Indexer {
     /// Index a single file. Public so callers (e.g. the watcher) can
     /// re-index on change. Embeds the file's chunks inline if a provider is
     /// configured.
+    ///
+    /// Any pre-existing index state for `path` (FTS chunks, KV symbol rows,
+    /// graph nodes/edges, and — in Mode::Full — vectors) is purged before
+    /// the new parse is written, so line shifts, renames, and deleted
+    /// symbols don't leave stale rows behind. The caller is still
+    /// responsible for calling [`Indexer::commit`] before the next query.
     pub async fn index_file(&self, path: &Path) -> Result<IndexStats> {
         let (mut s, chunks) = self.index_file_no_embed(path).await?;
         if let Some(n) = self.embed_chunks(&chunks).await? {
@@ -266,10 +314,83 @@ impl Indexer {
         Ok(s)
     }
 
+    /// Remove every indexed artefact that references `path` — FTS chunks,
+    /// KV symbol rows, graph nodes/edges, and (if Mode::Full) vectors.
+    ///
+    /// Used by both [`Indexer::index_file`] (purge-before-write) and the
+    /// watcher's `FileDeleted` branch (purge-only, no reparse). Commit is
+    /// the caller's responsibility so batched watch events can coalesce
+    /// into a single flush.
+    pub async fn purge_path(&self, path: &Path) -> Result<()> {
+        let path_str = path.to_string_lossy().into_owned();
+
+        // 1. FTS — delete every doc whose `path` field matches.
+        self.store.fts.delete_path(&path_str).await?;
+
+        // 2. KV symbols — collect the FQNs we're dropping so we can also
+        //    prune graph nodes and any edges that touch them.
+        let symbol_fqns = self.store.kv.delete_symbols_by_path(path).await?;
+
+        // 3. Graph nodes + edges.
+        let (_node_count, _edge_count) = self.graph.purge_path(path).await?;
+        if !symbol_fqns.is_empty() {
+            // `delete_nodes_by_path` will usually be a superset, but some
+            // symbol rows live without matching graph nodes (e.g. when the
+            // parser produced a symbol but not a node — rare, belt-and-
+            // braces). Drop any edges keyed on those FQNs explicitly.
+            let _ = self.store.kv.delete_edges_touching(&symbol_fqns).await?;
+        }
+
+        // 4. Vectors — Mode::Full only. Safe to skip otherwise.
+        if let Some(vectors) = &self.vectors {
+            let _ = vectors.delete_by_path(&path_str).await?;
+        }
+
+        // 5. Drop the content-hash sentinel so the next writer sees a miss
+        //    and rebuilds from scratch. Without this, deleting + recreating
+        //    a file would short-circuit on the old hash.
+        self.store.kv.delete_meta(hash_meta_key(path)).await?;
+
+        Ok(())
+    }
+
+    /// Flush the BM25 writer so previously indexed chunks become
+    /// searchable. Safe to call repeatedly.
+    pub async fn commit(&self) -> Result<()> {
+        self.store.fts.commit().await
+    }
+
     /// Internal: parse + write chunks/symbols/edges for one file, returning
     /// the parsed chunks so a caller (e.g. [`Indexer::index_path`]) can defer
     /// embedding and batch it across files.
+    ///
+    /// The file's previous index state is purged before the new parse is
+    /// written so stale chunks (e.g. from a function that moved lines or
+    /// was deleted) can never linger.
+    ///
+    /// # Content-hash gating
+    ///
+    /// Before doing any work, we blake3 the file bytes and compare against
+    /// the hash we stored under `hash:<path>` the last time this file was
+    /// indexed. If they match, the on-disk state is authoritative and we
+    /// short-circuit — no purge, no reparse, no writes. This is DESIGN §9's
+    /// "content-hash gated" writer clause. On a hash miss (new file, real
+    /// edit, or first-ever index) we fall through to the full pipeline and
+    /// record the new hash at the end.
     async fn index_file_no_embed(&self, path: &Path) -> Result<(IndexStats, Vec<SourceChunk>)> {
+        let bytes = tokio::fs::read(path).await?;
+        let new_hash = blake3::hash(&bytes);
+        let hash_key = hash_meta_key(path);
+
+        let new_hash_bytes: &[u8] = new_hash.as_bytes();
+        if let Some(prev) = self.store.kv.get_meta(hash_key.clone()).await?
+            && prev.as_slice() == new_hash_bytes
+        {
+            debug!(?path, "skip: content hash unchanged");
+            return Ok((IndexStats::default(), Vec::new()));
+        }
+
+        self.purge_path(path).await?;
         let mut s = IndexStats::default();
         let (chunks, table) = thoth_parse::parse_file(&self.registry, path).await?;
 
@@ -285,6 +406,10 @@ impl Indexer {
         s.calls += table.calls.len();
         self.write_import_edges(&table, path).await?;
         s.imports += table.imports.len();
+
+        // Record the new content hash *after* all the writes succeeded — if
+        // we crash mid-write, next run will see a hash miss and retry.
+        self.store.kv.put_meta(hash_key, new_hash_bytes).await?;
 
         Ok((s, chunks))
     }
@@ -401,6 +526,14 @@ fn symbol_kind_tag(k: SymbolKind) -> &'static str {
         SymbolKind::Module => "module",
         SymbolKind::Binding => "binding",
     }
+}
+
+/// Meta key under which we store the blake3 hash of the last-indexed bytes
+/// of `path`. Kept private to the indexer — callers shouldn't need to read
+/// it. The `hash:` prefix leaves room for future per-path sentinels (e.g.
+/// `mtime:`) without colliding.
+fn hash_meta_key(path: &Path) -> String {
+    format!("hash:{}", path.display())
 }
 
 fn module_fqn(path: &Path) -> String {

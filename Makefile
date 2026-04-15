@@ -5,9 +5,9 @@
 #
 #   make help            # list targets
 #   make demo            # full happy path: build → init → index → sample queries
-#   make mcp             # run the MCP stdio server against .thoth-self
+#   make mcp             # run the MCP stdio server against .thoth
 #
-# Everything that Thoth writes goes to $(THOTH_ROOT) (default .thoth-self/) so
+# Everything that Thoth writes goes to $(THOTH_ROOT) (default .thoth/) so
 # it stays out of git and clippy's sight.
 
 SHELL            := /usr/bin/env bash
@@ -26,7 +26,7 @@ THOTH            := $(BIN_DIR)/thoth
 THOTH_MCP        := $(BIN_DIR)/thoth-mcp
 
 # Where the self-index lives. Override with `make index THOTH_ROOT=...`.
-THOTH_ROOT       ?= .thoth-self
+THOTH_ROOT       ?= .thoth
 # Source tree we point Thoth at. Defaults to this repo.
 SRC              ?= .
 

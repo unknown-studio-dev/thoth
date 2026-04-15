@@ -19,14 +19,17 @@
 //! [rrf]: https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thoth_core::{
-    Chunk, Embedder, Prompt, Query, Result, Retrieval, RetrievalSource, Synthesizer,
+    Chunk, Embedder, Event, Prompt, Query, QueryScope, Result, Retrieval, RetrievalSource,
+    Synthesizer,
 };
 use thoth_graph::Graph;
-use thoth_store::{FtsHit, KvStore, MarkdownStore, StoreRoot, SymbolRow, VectorHit, VectorStore};
+use thoth_store::{
+    EpisodeHit, FtsHit, KvStore, MarkdownStore, StoreRoot, SymbolRow, VectorHit, VectorStore,
+};
 use uuid::Uuid;
 
 use crate::indexer::{chunk_id, read_span};
@@ -98,16 +101,32 @@ impl Retriever {
         with_synth: bool,
     ) -> Result<Retrieval> {
         let k = q.top_k.max(1);
+        let scope = &q.scope;
+
+        // 0. (Mode::Full) optional query rewrite via the Synthesizer. We fall
+        //    back to the original on `Ok(None)` or any error — retrieval
+        //    should never harden-fail because a rewrite failed.
+        let search_text: String = if with_synth
+            && let Some(s) = self.synthesizer.as_ref()
+        {
+            match s.rewrite_query(&q.text).await {
+                Ok(Some(rewritten)) if !rewritten.trim().is_empty() => rewritten,
+                _ => q.text.clone(),
+            }
+        } else {
+            q.text.clone()
+        };
+
         let mut fused: HashMap<String, FusedRow> = HashMap::new();
 
         // 1. symbol lookup
-        let sym_hits = self.symbol_stage(&q.text).await?;
+        let sym_hits = filter_scope(self.symbol_stage(&search_text).await?, scope);
         for (rank, cand) in sym_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
 
         // 2. BM25
-        let fts_hits = self.bm25_stage(&q.text, k * 3).await?;
+        let fts_hits = filter_scope(self.bm25_stage(&search_text, k * 3).await?, scope);
         for (rank, cand) in fts_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
@@ -119,24 +138,32 @@ impl Retriever {
             .filter_map(|c| c.symbol.clone())
             .take(8)
             .collect();
-        let graph_hits = self.graph_stage(&seeds).await?;
+        let graph_hits = filter_scope(self.graph_stage(&seeds).await?, scope);
         for (rank, cand) in graph_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
 
-        // 4. markdown grep
-        let md_hits = self.markdown_stage(&q.text).await?;
+        // 4. markdown grep (scope doesn't apply — MEMORY.md is global)
+        let md_hits = self.markdown_stage(&search_text).await?;
         for (rank, cand) in md_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
 
-        // 5. (Mode::Full) vector similarity — only if both an embedder and a
+        // 5. episodic log — past queries / answers / outcomes. Scope filters
+        //    do not apply; episodes are cross-cutting.
+        let ep_hits = self.episodic_stage(&search_text, k * 2).await?;
+        for (rank, cand) in ep_hits.iter().enumerate() {
+            fuse(&mut fused, cand, rank);
+        }
+
+        // 6. (Mode::Full) vector similarity — only if both an embedder and a
         //    vector store are configured. Silent no-op otherwise so that
         //    Mode::Full without a key still degrades to Mode::Zero recall.
         if with_vector
-            && let Some(hits) = self.vector_stage(&q.text, k * 3).await?
+            && let Some(hits) = self.vector_stage(&search_text, k * 3).await?
         {
-            for (rank, cand) in hits.iter().enumerate() {
+            let scoped = filter_scope(hits, scope);
+            for (rank, cand) in scoped.iter().enumerate() {
                 fuse(&mut fused, cand, rank);
             }
         }
@@ -149,12 +176,26 @@ impl Retriever {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // Dedup by (path, symbol) *before* truncating to k so we don't
+        // lose a slot to a near-duplicate hit. Different spans of the
+        // same symbol (e.g. the symbol stage reported the declaration
+        // and BM25 reported a paragraph inside it) collapse to the
+        // highest-scoring representative.
+        let ranked = dedupe_by_path_symbol(ranked);
+
         let mut chunks = Vec::with_capacity(k);
         for row in ranked.into_iter().take(k) {
             chunks.push(self.materialize(row).await?);
         }
 
-        // 6. (Mode::Full) synthesis.
+        // Enrich the top-K with graph context (callers/callees/imports/
+        // siblings/doc). Best-effort — a failure here should never sink
+        // an otherwise-successful recall, so log and continue.
+        if let Err(e) = crate::enrich::enrich_chunks(&self.graph, &mut chunks).await {
+            tracing::debug!(error = %e, "enrichment failed; returning unenriched chunks");
+        }
+
+        // 7. (Mode::Full) synthesis.
         let synthesized = if with_synth {
             self.synthesize(&q.text, &chunks).await?
         } else {
@@ -236,6 +277,39 @@ impl Retriever {
         Ok(out)
     }
 
+    /// Search the episodic log for relevant past events. Silently returns
+    /// an empty vec if the FTS5 query can't be built (e.g. the user query
+    /// contained only stopwords or punctuation).
+    ///
+    /// Every hit also has its `access_count` / `last_accessed_ns` bumped on
+    /// the way out so the decay-based forget pass (DESIGN §9) sees the
+    /// retrieval. Bump failures are logged and ignored — they must not
+    /// break recall.
+    async fn episodic_stage(&self, text: &str, k: usize) -> Result<Vec<Candidate>> {
+        let match_expr = match fts5_match_expr(text) {
+            Some(m) => m,
+            None => return Ok(Vec::new()),
+        };
+        let hits: Vec<EpisodeHit> = match self.store.episodes.search(match_expr, k).await {
+            Ok(h) => h,
+            // A malformed MATCH expression, a locked DB, etc. shouldn't
+            // break the rest of retrieval. Log-worthy, but not fatal.
+            Err(_) => return Ok(Vec::new()),
+        };
+        let now_ns = now_unix_ns();
+        let mut out = Vec::with_capacity(hits.len());
+        for h in hits {
+            let row_id = h.id;
+            if let Some(c) = Candidate::from_episode(h) {
+                out.push(c);
+                if let Err(e) = self.store.episodes.bump_access_by_id(row_id, now_ns).await {
+                    tracing::debug!(error = %e, row_id, "episodic: bump_access failed");
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Returns `Ok(None)` when the vector stage is disabled (no embedder or
     /// no vector store configured). Returns `Ok(Some(vec))` — possibly empty
     /// — when the stage ran.
@@ -296,7 +370,10 @@ impl Retriever {
 
     async fn materialize(&self, row: FusedRow) -> Result<Chunk> {
         let (body, preview) = match row.cand.source {
-            RetrievalSource::Markdown => {
+            RetrievalSource::Markdown | RetrievalSource::Episodic => {
+                // Both already carry their body inline — no on-disk span to
+                // re-read. Episodic payloads come from the SQLite log, and
+                // markdown facts from the MEMORY.md grep above.
                 let p = row.cand.preview.clone().unwrap_or_default();
                 (p.clone(), p)
             }
@@ -323,6 +400,7 @@ impl Retriever {
             body,
             score: row.score,
             source: row.cand.source,
+            context: None,
         })
     }
 }
@@ -364,6 +442,25 @@ impl Candidate {
             preview: None,
         }
     }
+
+    /// Build a candidate from an episodic log hit. Returns `None` when the
+    /// event kind carries no surfaceable text (e.g. `FileDeleted`, which is
+    /// useful for audit but nothing for retrieval to show).
+    fn from_episode(h: EpisodeHit) -> Option<Self> {
+        let preview = episode_preview(&h.event)?;
+        // Stable id scoped under an `episode:` prefix so it never collides
+        // with file-backed chunk ids or markdown memory ids.
+        let id = format!("episode:{}", h.id);
+        Some(Self {
+            id,
+            path: PathBuf::from("<episodes.db>"),
+            start_line: 0,
+            end_line: 0,
+            symbol: None,
+            source: RetrievalSource::Episodic,
+            preview: Some(preview),
+        })
+    }
 }
 
 struct FusedRow {
@@ -384,6 +481,39 @@ fn fuse(map: &mut HashMap<String, FusedRow>, c: &Candidate, rank: usize) {
 fn dedupe(v: &mut Vec<Candidate>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|c| seen.insert(c.id.clone()));
+}
+
+/// Collapse near-duplicate hits into a single ranked slot.
+///
+/// Two `FusedRow`s are considered the "same symbol" when they share a
+/// path and a non-empty `symbol` field. The highest-scoring representative
+/// wins; the loser's score is *added* to the winner so the fusion signal
+/// isn't silently discarded.
+///
+/// Rows without a symbol (markdown/episodic/vector hits that never hit
+/// the graph) pass through untouched — there's no meaningful way to fold
+/// them together, and they each carry their own stable id.
+///
+/// The output retains the original descending-score ordering.
+fn dedupe_by_path_symbol(ranked: Vec<FusedRow>) -> Vec<FusedRow> {
+    let mut out: Vec<FusedRow> = Vec::with_capacity(ranked.len());
+    let mut index: HashMap<(PathBuf, String), usize> = HashMap::new();
+    for row in ranked {
+        let Some(sym) = row.cand.symbol.clone() else {
+            out.push(row);
+            continue;
+        };
+        let key = (row.cand.path.clone(), sym);
+        if let Some(&i) = index.get(&key) {
+            // Fold the loser's score into the winner. We don't swap —
+            // the winner was already ranked higher.
+            out[i].score += row.score;
+        } else {
+            index.insert(key, out.len());
+            out.push(row);
+        }
+    }
+    out
 }
 
 fn tokens(text: &str) -> Vec<String> {
@@ -410,6 +540,143 @@ fn short_preview(body: &str) -> String {
         .join(" ⏎ ")
 }
 
+/// Current wall-clock as Unix nanoseconds, clamped into `i64`. Used when
+/// stamping `last_accessed_ns` on episodic rows.
+fn now_unix_ns() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// Apply a [`QueryScope`] filter to a batch of candidates. An empty scope is
+/// a no-op. When any of `paths` / `languages` / `symbols` is non-empty, a
+/// candidate must pass every populated axis to survive:
+///
+/// * **paths** — candidate path starts with *any* listed prefix.
+/// * **languages** — candidate file extension maps to *any* listed language.
+/// * **symbols** — candidate symbol contains (case-insensitive) *any* listed
+///   token. Candidates with no symbol are dropped when this filter is set.
+fn filter_scope(cands: Vec<Candidate>, scope: &QueryScope) -> Vec<Candidate> {
+    if scope.paths.is_empty() && scope.languages.is_empty() && scope.symbols.is_empty() {
+        return cands;
+    }
+    cands
+        .into_iter()
+        .filter(|c| {
+            if !scope.paths.is_empty() && !scope.paths.iter().any(|p| path_has_prefix(&c.path, p))
+            {
+                return false;
+            }
+            if !scope.languages.is_empty()
+                && !scope
+                    .languages
+                    .iter()
+                    .any(|l| path_language_matches(&c.path, l))
+            {
+                return false;
+            }
+            if !scope.symbols.is_empty() {
+                let Some(sym) = c.symbol.as_deref() else {
+                    return false;
+                };
+                let sym_lc = sym.to_ascii_lowercase();
+                if !scope
+                    .symbols
+                    .iter()
+                    .any(|s| sym_lc.contains(&s.to_ascii_lowercase()))
+                {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+fn path_has_prefix(path: &Path, prefix: &Path) -> bool {
+    // Accept both exact-prefix matches and lexical `starts_with` on the
+    // string form — lets callers pass either a directory or a substring
+    // like `"src/auth"`.
+    if path.starts_with(prefix) {
+        return true;
+    }
+    let p = path.to_string_lossy();
+    let pre = prefix.to_string_lossy();
+    p.contains(pre.as_ref())
+}
+
+/// Map an extension to a language name using the same table `thoth-parse`
+/// uses. Keeping the mapping inline here avoids pulling `thoth-parse` into
+/// `thoth-retrieve`'s dep graph just for a scope filter.
+fn path_language_matches(path: &Path, lang: &str) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let lang = lang.to_ascii_lowercase();
+    let ext = ext.to_ascii_lowercase();
+    match lang.as_str() {
+        "rust" => ext == "rs",
+        "python" => matches!(ext.as_str(), "py" | "pyi"),
+        "javascript" => matches!(ext.as_str(), "js" | "mjs" | "cjs" | "jsx"),
+        "typescript" => matches!(ext.as_str(), "ts" | "tsx"),
+        "go" => ext == "go",
+        "markdown" => matches!(ext.as_str(), "md" | "markdown"),
+        other => ext == other, // fall back to raw-extension match
+    }
+}
+
+/// Render a retrieval-friendly preview of an episodic event. Returns `None`
+/// for events that have no useful surface text (e.g. `FileDeleted`, which
+/// is audit-only).
+fn episode_preview(ev: &Event) -> Option<String> {
+    use thoth_core::Outcome;
+    match ev {
+        Event::QueryIssued { text, .. } => Some(format!("past query: {text}")),
+        Event::AnswerReturned { chunk_ids, .. } if !chunk_ids.is_empty() => {
+            Some(format!("past answer cited: {}", chunk_ids.join(", ")))
+        }
+        Event::OutcomeObserved { outcome, .. } => Some(match outcome {
+            Outcome::Test { passed, suite } => {
+                let status = if *passed { "pass" } else { "fail" };
+                format!("past outcome — test {suite}: {status}")
+            }
+            Outcome::Commit { sha, .. } => format!("past outcome — commit {sha}"),
+            Outcome::Revert { sha, reason } => {
+                let why = reason.as_deref().unwrap_or("");
+                format!("past outcome — revert {sha}: {why}").trim().to_string()
+            }
+            Outcome::UserFeedback { signal, note } => {
+                let tail = note.as_deref().unwrap_or("");
+                format!("past outcome — feedback {signal:?}: {tail}")
+                    .trim()
+                    .to_string()
+            }
+            Outcome::Error { summary, .. } => format!("past outcome — error: {summary}"),
+        }),
+        Event::FileChanged { path, .. } => Some(format!("file changed: {}", path.display())),
+        Event::FileDeleted { .. } | Event::AnswerReturned { .. } => None,
+    }
+}
+
+/// Build a safe FTS5 MATCH expression from free-form query text. Splits on
+/// non-word characters, keeps tokens of length >= 3, and joins them with
+/// `OR`. Returns `None` if no usable token remains — in which case the
+/// episodic stage is silently skipped rather than raising.
+fn fts5_match_expr(text: &str) -> Option<String> {
+    let toks: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.len() >= 3)
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .collect();
+    if toks.is_empty() {
+        None
+    } else {
+        Some(toks.join(" OR "))
+    }
+}
+
 /// Parse a `chunk_id` shaped like `"<path>:<start>-<end>"` back into its
 /// components. Returns `None` if the id doesn't match the expected shape —
 /// e.g. markdown memory ids which use a different scheme.
@@ -425,8 +692,9 @@ fn parse_chunk_id(id: &str) -> Option<(PathBuf, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_chunk_id;
+    use super::*;
     use std::path::PathBuf;
+    use thoth_core::QueryScope;
 
     #[test]
     fn parse_plain_chunk_id() {
@@ -448,5 +716,105 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_chunk_id("no-colon-here").is_none());
         assert!(parse_chunk_id("path:not-numbers").is_none());
+    }
+
+    fn cand(path: &str, symbol: Option<&str>) -> Candidate {
+        Candidate {
+            id: format!("{path}:1-1"),
+            path: PathBuf::from(path),
+            start_line: 1,
+            end_line: 1,
+            symbol: symbol.map(str::to_owned),
+            source: RetrievalSource::Symbol,
+            preview: None,
+        }
+    }
+
+    #[test]
+    fn empty_scope_is_a_noop() {
+        let cands = vec![
+            cand("src/auth.rs", Some("auth::verify")),
+            cand("src/user.rs", Some("user::new")),
+        ];
+        let scope = QueryScope::default();
+        let out = filter_scope(cands.clone(), &scope);
+        assert_eq!(out.len(), cands.len());
+    }
+
+    #[test]
+    fn scope_paths_narrows_to_prefix() {
+        let cands = vec![
+            cand("src/auth/jwt.rs", None),
+            cand("src/user/mod.rs", None),
+            cand("tests/e2e.rs", None),
+        ];
+        let scope = QueryScope {
+            paths: vec![PathBuf::from("src/auth")],
+            ..Default::default()
+        };
+        let out = filter_scope(cands, &scope);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, PathBuf::from("src/auth/jwt.rs"));
+    }
+
+    #[test]
+    fn scope_languages_matches_extensions() {
+        let cands = vec![
+            cand("src/lib.rs", None),
+            cand("src/a.py", None),
+            cand("src/b.ts", None),
+        ];
+        let scope = QueryScope {
+            languages: vec!["rust".into(), "python".into()],
+            ..Default::default()
+        };
+        let out = filter_scope(cands, &scope);
+        let exts: Vec<_> = out
+            .iter()
+            .map(|c| c.path.extension().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        assert!(exts.contains(&"rs".to_string()));
+        assert!(exts.contains(&"py".to_string()));
+        assert!(!exts.contains(&"ts".to_string()));
+    }
+
+    #[test]
+    fn scope_symbols_drops_unsymboled_candidates() {
+        let cands = vec![
+            cand("a.rs", Some("auth::verify_token")),
+            cand("b.rs", Some("user::User")),
+            cand("c.rs", None),
+        ];
+        let scope = QueryScope {
+            symbols: vec!["verify".into()],
+            ..Default::default()
+        };
+        let out = filter_scope(cands, &scope);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].symbol.as_deref(), Some("auth::verify_token"));
+    }
+
+    #[test]
+    fn fts5_expr_builds_or_clause_from_tokens() {
+        let m = fts5_match_expr("how does verify_token work").unwrap();
+        assert!(m.contains("\"how\""));
+        assert!(m.contains("\"does\""));
+        assert!(m.contains("\"verify_token\""));
+        assert!(m.contains("\"work\""));
+        assert!(m.contains(" OR "));
+    }
+
+    #[test]
+    fn fts5_expr_is_none_when_all_tokens_too_short() {
+        assert!(fts5_match_expr("a b c ?").is_none());
+        assert!(fts5_match_expr("   ").is_none());
+    }
+
+    #[test]
+    fn fts5_expr_strips_double_quotes() {
+        let m = fts5_match_expr(r#"find "foobarbaz""#).unwrap();
+        // `"foobarbaz"` in the input should become the single quoted token
+        // `"foobarbaz"` in the output — i.e. the inner quotes are stripped.
+        assert!(m.contains("\"foobarbaz\""));
     }
 }

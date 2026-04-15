@@ -8,11 +8,14 @@
 //!
 //! ```sql
 //! CREATE TABLE episodes(
-//!     id         INTEGER PRIMARY KEY,
-//!     event_id   TEXT NOT NULL,   -- uuid from Event when present
-//!     kind       TEXT NOT NULL,   -- "file_changed", "query_issued", ...
-//!     at_unix_ns INTEGER NOT NULL,
-//!     payload    TEXT NOT NULL    -- serde_json of Event
+//!     id               INTEGER PRIMARY KEY,
+//!     event_id         TEXT NOT NULL,   -- uuid from Event when present
+//!     kind             TEXT NOT NULL,   -- "file_changed", "query_issued", ...
+//!     at_unix_ns       INTEGER NOT NULL,
+//!     payload          TEXT NOT NULL,   -- serde_json of Event
+//!     salience         REAL NOT NULL DEFAULT 1.0,
+//!     access_count     INTEGER NOT NULL DEFAULT 0,
+//!     last_accessed_ns INTEGER             -- NULL until first bump
 //! );
 //! CREATE VIRTUAL TABLE episodes_fts USING fts5(
 //!     kind, payload,
@@ -21,7 +24,16 @@
 //! );
 //! ```
 //!
-//! Triggers keep `episodes_fts` in sync.
+//! Triggers keep `episodes_fts` in sync. `salience`, `access_count`, and
+//! `last_accessed_ns` are populated by the retriever + memory manager to
+//! support DESIGN §9's decay-based retention formula:
+//!
+//! ```text
+//! effective = salience · exp(-λ·days_idle) · ln(e + access_count)
+//! ```
+//!
+//! The columns are added by a one-shot migration in [`EpisodeLog::open`],
+//! so existing stores upgrade in place.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,11 +87,14 @@ impl EpisodeLog {
             c.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS episodes (
-                    id         INTEGER PRIMARY KEY,
-                    event_id   TEXT NOT NULL,
-                    kind       TEXT NOT NULL,
-                    at_unix_ns INTEGER NOT NULL,
-                    payload    TEXT NOT NULL
+                    id               INTEGER PRIMARY KEY,
+                    event_id         TEXT NOT NULL,
+                    kind             TEXT NOT NULL,
+                    at_unix_ns       INTEGER NOT NULL,
+                    payload          TEXT NOT NULL,
+                    salience         REAL NOT NULL DEFAULT 1.0,
+                    access_count     INTEGER NOT NULL DEFAULT 0,
+                    last_accessed_ns INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_episodes_at ON episodes(at_unix_ns);
                 CREATE INDEX IF NOT EXISTS idx_episodes_kind ON episodes(kind);
@@ -102,6 +117,11 @@ impl EpisodeLog {
                 "#,
             )
             .map_err(store)?;
+
+            // Forward-migrate any store that was created before the decay
+            // columns existed. `ALTER TABLE ... ADD COLUMN` errors out if
+            // the column is already there, so gate on `PRAGMA table_info`.
+            ensure_decay_columns(&c)?;
 
             Ok(c)
         })
@@ -217,6 +237,96 @@ impl EpisodeLog {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Record that episode `row_id` was retrieved — bumps `access_count`
+    /// by 1 and refreshes `last_accessed_ns` to `now_ns`.
+    ///
+    /// Silently returns `Ok(())` if `row_id` no longer exists; the retriever
+    /// shouldn't bubble a 404 back to the caller just because a decay pass
+    /// raced ahead of it.
+    pub async fn bump_access_by_id(&self, row_id: i64, now_ns: i64) -> Result<()> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let c = conn.lock();
+            c.execute(
+                "UPDATE episodes \
+                 SET access_count = access_count + 1, \
+                     last_accessed_ns = ?2 \
+                 WHERE id = ?1",
+                params![row_id, now_ns],
+            )
+            .map_err(store)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Stream out every episode's decay metadata, one per row. Used by the
+    /// forget pass to compute `effective_retention_score` and drop rows
+    /// that fall below the configured floor.
+    ///
+    /// Returned tuples are `(row_id, salience, access_count,
+    /// last_accessed_ns_or_at_ns)` — if `last_accessed_ns` is NULL we fall
+    /// back to the row's `at_unix_ns` so first-pass decay is calculated
+    /// relative to when the episode was created, not to an impossible zero.
+    pub async fn iter_with_decay_meta(&self) -> Result<Vec<(i64, f32, u64, i64)>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(i64, f32, u64, i64)>> {
+            let c = conn.lock();
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, salience, access_count, \
+                            COALESCE(last_accessed_ns, at_unix_ns) \
+                     FROM episodes",
+                )
+                .map_err(store)?;
+            let mut rows = stmt.query([]).map_err(store)?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().map_err(store)? {
+                let id: i64 = r.get(0).map_err(store)?;
+                let salience: f64 = r.get(1).map_err(store)?;
+                let access_count: i64 = r.get(2).map_err(store)?;
+                let last_ns: i64 = r.get(3).map_err(store)?;
+                out.push((id, salience as f32, access_count.max(0) as u64, last_ns));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Batch delete episodes by row id. Returns the number of rows removed.
+    /// Used by the decay-based forget pass after it has computed which rows
+    /// fall below the retention floor.
+    pub async fn delete_by_ids(&self, ids: &[i64]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.clone();
+        let ids: Vec<i64> = ids.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let c = conn.lock();
+            // Many-row DELETE using rarray-style parameter wouldn't work
+            // without the bundled rarray feature, so chunk into fixed-size
+            // batches and issue them with an explicit `IN (?, ?, ...)`.
+            let mut total = 0u64;
+            for chunk in ids.chunks(512) {
+                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                let sql = format!(
+                    "DELETE FROM episodes WHERE id IN ({})",
+                    placeholders.join(",")
+                );
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let n = c.execute(&sql, params.as_slice()).map_err(store)?;
+                total += n as u64;
+            }
+            Ok(total)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Trim the log to at most `max` rows (newest kept). Returns the number
     /// of rows removed.
     pub async fn trim_to_capacity(&self, max: usize) -> Result<u64> {
@@ -290,4 +400,45 @@ fn event_at_ns(ev: &Event) -> i64 {
 
 fn store<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
+}
+
+/// Idempotently add the decay-related columns to a pre-existing `episodes`
+/// table. `CREATE TABLE IF NOT EXISTS` above already produces the new shape
+/// on fresh stores, so this only fires on databases that were created
+/// before the columns existed.
+fn ensure_decay_columns(c: &Connection) -> Result<()> {
+    let existing = existing_columns(c)?;
+    if !existing.iter().any(|n| n == "salience") {
+        c.execute_batch(
+            "ALTER TABLE episodes ADD COLUMN salience REAL NOT NULL DEFAULT 1.0",
+        )
+        .map_err(store)?;
+    }
+    if !existing.iter().any(|n| n == "access_count") {
+        c.execute_batch(
+            "ALTER TABLE episodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+        )
+        .map_err(store)?;
+    }
+    if !existing.iter().any(|n| n == "last_accessed_ns") {
+        // Nullable: NULL means "never retrieved"; the forget pass falls
+        // back to `at_unix_ns` in that case.
+        c.execute_batch("ALTER TABLE episodes ADD COLUMN last_accessed_ns INTEGER")
+            .map_err(store)?;
+    }
+    Ok(())
+}
+
+fn existing_columns(c: &Connection) -> Result<Vec<String>> {
+    let mut stmt = c
+        .prepare("PRAGMA table_info(episodes)")
+        .map_err(store)?;
+    let mut rows = stmt.query([]).map_err(store)?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().map_err(store)? {
+        // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+        let name: String = r.get(1).map_err(store)?;
+        out.push(name);
+    }
+    Ok(out)
 }

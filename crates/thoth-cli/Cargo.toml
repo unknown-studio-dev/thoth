@@ -20,6 +20,9 @@ voyage    = ["thoth-embed/voyage"]
 openai    = ["thoth-embed/openai"]
 cohere    = ["thoth-embed/cohere"]
 anthropic = ["thoth-synth/anthropic"]
+# LanceDB-backed vector store (local-only). Flips every `VectorStore`
+# reference in thoth-retrieve / thoth to the LanceDB implementation.
+lance     = ["thoth-retrieve/lance", "thoth-store/lance"]
 full      = ["voyage", "openai", "cohere", "anthropic"]
 
 [dependencies]
@@ -31,7 +34,7 @@ thoth-memory   = { workspace = true }
 thoth-embed    = { workspace = true }
 thoth-synth    = { workspace = true }
 
-tokio                = { workspace = true, features = ["signal", "process", "io-std"] }
+tokio                = { workspace = true, features = ["signal", "process", "io-std", "net"] }
 anyhow               = { workspace = true }
 tracing              = { workspace = true }
 tracing-subscriber   = { workspace = true }

@@ -64,8 +64,8 @@ jobs:
         run: cargo build --release -p thoth-cli
       - name: self-index
         run: |
-          mkdir -p .thoth-self
-          ./target/release/thoth --root .thoth-self init
-          ./target/release/thoth --root .thoth-self index .
+          mkdir -p .thoth
+          ./target/release/thoth --root .thoth init
+          ./target/release/thoth --root .thoth index .
       - name: eval
-        run: ./target/release/thoth --root .thoth-self eval --gold eval/gold.toml -k 8
+        run: ./target/release/thoth --root .thoth eval --gold eval/gold.toml -k 8

@@ -19,11 +19,19 @@ thiserror    = { workspace = true }
 anyhow       = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
+toml         = { workspace = true }
 tracing      = { workspace = true }
 uuid         = { workspace = true }
 blake3       = { workspace = true }
 parking_lot  = { workspace = true }
 futures      = { workspace = true }
+
+[features]
+default = []
+# Swap the vector backend from SQLite flat-cosine to LanceDB. Propagates
+# the feature down to `thoth-store`; every call site already uses the
+# `thoth_store::VectorStore` alias so no code change is needed.
+lance = ["thoth-store/lance"]
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

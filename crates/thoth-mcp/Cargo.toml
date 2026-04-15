@@ -23,7 +23,7 @@ thoth-store    = { workspace = true }
 thoth-retrieve = { workspace = true }
 thoth-memory   = { workspace = true }
 
-tokio                = { workspace = true, features = ["io-std", "signal"] }
+tokio                = { workspace = true, features = ["io-std", "signal", "net"] }
 anyhow               = { workspace = true }
 tracing              = { workspace = true }
 tracing-subscriber   = { workspace = true }

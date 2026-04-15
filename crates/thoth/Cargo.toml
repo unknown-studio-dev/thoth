@@ -18,6 +18,13 @@ thoth-retrieve = { workspace = true }
 
 tokio        = { workspace = true }
 
+[features]
+default = []
+# Switch Thoth's vector backend to LanceDB (local-only; cloud object-store
+# features in `lancedb` are disabled at the `thoth-store` level). Passes
+# through to `thoth-retrieve` → `thoth-store`.
+lance = ["thoth-retrieve/lance", "thoth-store/lance"]
+
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = { workspace = true }

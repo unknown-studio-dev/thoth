@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use thoth_mcp::{Server, run_stdio};
+use thoth_mcp::{Server, run_socket, run_stdio, socket_path};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,7 +34,22 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(root = %root.display(), "thoth-mcp starting");
 
     let server = Server::open(&root).await?;
+
+    // Run stdio (for Claude Code / MCP clients) and a Unix socket (for the
+    // CLI thin-client) concurrently. When stdio hits EOF the process exits
+    // and the socket task is cancelled automatically.
+    let sock = socket_path(&root);
+    let socket_server = server.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_socket(socket_server).await {
+            tracing::warn!(error = %e, "socket listener exited");
+        }
+    });
+
     run_stdio(server).await?;
+
+    // Clean up the socket file on normal exit.
+    let _ = std::fs::remove_file(&sock);
 
     tracing::info!("thoth-mcp exiting");
     Ok(())
