@@ -1,0 +1,9 @@
+{
+  "_comment": "Add this block to ~/.claude/settings.json (or ./.claude/settings.json) under mcpServers to wire the Thoth MCP server into Claude Code.",
+  "mcpServers": {
+    "thoth": {
+      "command": "thoth-mcp",
+      "args": ["--root", ".thoth"]
+    }
+  }
+}

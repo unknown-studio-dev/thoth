@@ -1,0 +1,42 @@
+[package]
+name = "thoth-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The `thoth` command-line interface."
+
+[[bin]]
+name = "thoth"
+path = "src/main.rs"
+
+[features]
+# Mode::Zero is always available. Any adapter below opts in to Mode::Full
+# for the corresponding provider. `full` turns everything on.
+default   = []
+voyage    = ["thoth-embed/voyage"]
+openai    = ["thoth-embed/openai"]
+cohere    = ["thoth-embed/cohere"]
+anthropic = ["thoth-synth/anthropic"]
+full      = ["voyage", "openai", "cohere", "anthropic"]
+
+[dependencies]
+thoth-core     = { workspace = true }
+thoth-parse    = { workspace = true }
+thoth-store    = { workspace = true }
+thoth-retrieve = { workspace = true }
+thoth-memory   = { workspace = true }
+thoth-embed    = { workspace = true }
+thoth-synth    = { workspace = true }
+
+tokio                = { workspace = true, features = ["signal", "process", "io-std"] }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+tracing-subscriber   = { workspace = true }
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+toml                 = { workspace = true }
+clap                 = { workspace = true }
+indicatif            = "0.17"

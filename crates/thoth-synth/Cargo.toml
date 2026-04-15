@@ -1,0 +1,27 @@
+[package]
+name = "thoth-synth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Synthesizer adapters for Thoth (Anthropic Claude, ...). Feature-gated."
+
+[features]
+default    = []
+anthropic  = ["dep:reqwest"]
+
+[dependencies]
+thoth-core   = { workspace = true }
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { workspace = true }
+time         = { workspace = true }
+
+reqwest      = { workspace = true, optional = true }

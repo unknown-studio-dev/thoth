@@ -1,0 +1,20 @@
+[package]
+name = "thoth-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Memory lifecycle: markdown curator, skills manager, nudge loop, TTL decay."
+
+[dependencies]
+thoth-core   = { workspace = true }
+thoth-store  = { workspace = true }
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+serde        = { workspace = true }
+tracing      = { workspace = true }
+time         = { workspace = true }

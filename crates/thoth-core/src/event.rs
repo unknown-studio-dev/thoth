@@ -1,0 +1,113 @@
+//! Observable events — the input stream to Thoth's perception layer.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+/// Identifier for a single appended event.
+pub type EventId = Uuid;
+
+/// An observation that Thoth can learn from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Event {
+    /// A source file changed on disk.
+    FileChanged {
+        /// Absolute path.
+        path: PathBuf,
+        /// Optional commit hash this change is associated with.
+        commit: Option<String>,
+        /// Timestamp.
+        at: OffsetDateTime,
+    },
+    /// A source file was deleted.
+    FileDeleted {
+        /// Absolute path.
+        path: PathBuf,
+        /// Timestamp.
+        at: OffsetDateTime,
+    },
+    /// A query was issued by the agent or user.
+    QueryIssued {
+        /// Correlation id linking to future answers and outcomes.
+        id: EventId,
+        /// The question text.
+        text: String,
+        /// Timestamp.
+        at: OffsetDateTime,
+    },
+    /// An answer was returned for an earlier query.
+    AnswerReturned {
+        /// Correlation id matching the originating `QueryIssued.id`.
+        id: EventId,
+        /// Chunk ids that were used.
+        chunk_ids: Vec<String>,
+        /// Whether an LLM synthesized the answer (Mode::Full).
+        synthesized: bool,
+        /// Timestamp.
+        at: OffsetDateTime,
+    },
+    /// An outcome was observed.
+    OutcomeObserved {
+        /// Correlation id of the query whose answer produced this outcome.
+        related_to: EventId,
+        /// The outcome itself.
+        outcome: Outcome,
+        /// Timestamp.
+        at: OffsetDateTime,
+    },
+}
+
+/// Outcome of applying an answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    /// Tests ran; pass/fail reported.
+    Test {
+        /// Whether the test suite passed.
+        passed: bool,
+        /// Name of the suite.
+        suite: String,
+    },
+    /// A commit was made.
+    Commit {
+        /// Commit SHA.
+        sha: String,
+        /// Paths touched.
+        files: Vec<PathBuf>,
+    },
+    /// A revert was issued.
+    Revert {
+        /// SHA that was reverted.
+        sha: String,
+        /// Optional reason.
+        reason: Option<String>,
+    },
+    /// Explicit user feedback.
+    UserFeedback {
+        /// The signal.
+        signal: UserSignal,
+        /// Optional free-form note.
+        note: Option<String>,
+    },
+    /// An error surfaced from a tool or command.
+    Error {
+        /// Short error summary.
+        summary: String,
+        /// Captured stderr or stack trace.
+        detail: Option<String>,
+    },
+}
+
+/// User feedback signal.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserSignal {
+    /// User accepted the answer as-is.
+    Accept,
+    /// User edited the answer before applying.
+    Edit,
+    /// User rejected the answer.
+    Reject,
+}

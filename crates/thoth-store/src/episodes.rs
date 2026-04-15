@@ -1,0 +1,293 @@
+//! Append-only episodic log, backed by SQLite + FTS5.
+//!
+//! Every [`Event`] observed by Thoth is serialized to JSON and appended here,
+//! alongside a contentless FTS5 index so lessons and reflective memories can
+//! later grep the log for relevant past experiences.
+//!
+//! Schema:
+//!
+//! ```sql
+//! CREATE TABLE episodes(
+//!     id         INTEGER PRIMARY KEY,
+//!     event_id   TEXT NOT NULL,   -- uuid from Event when present
+//!     kind       TEXT NOT NULL,   -- "file_changed", "query_issued", ...
+//!     at_unix_ns INTEGER NOT NULL,
+//!     payload    TEXT NOT NULL    -- serde_json of Event
+//! );
+//! CREATE VIRTUAL TABLE episodes_fts USING fts5(
+//!     kind, payload,
+//!     content='episodes', content_rowid='id',
+//!     tokenize='porter unicode61'
+//! );
+//! ```
+//!
+//! Triggers keep `episodes_fts` in sync.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use rusqlite::{Connection, params};
+use thoth_core::{Error, Event, EventId, Result};
+use time::OffsetDateTime;
+
+/// A single row returned from an episode search.
+#[derive(Debug, Clone)]
+pub struct EpisodeHit {
+    /// Row id.
+    pub id: i64,
+    /// Event kind tag.
+    pub kind: String,
+    /// Timestamp.
+    pub at: OffsetDateTime,
+    /// Deserialized event.
+    pub event: Event,
+}
+
+/// Handle to the SQLite-backed episodic log.
+///
+/// Cheap to clone; the [`Connection`] is shared behind an [`Arc<Mutex<_>>`].
+#[derive(Clone)]
+pub struct EpisodeLog {
+    conn: Arc<Mutex<Connection>>,
+    #[allow(dead_code)]
+    path: PathBuf,
+}
+
+impl EpisodeLog {
+    /// Open (or create) the log at `path` (a `.sqlite` file).
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let path2 = path.clone();
+
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
+            let c = Connection::open(&path2).map_err(store)?;
+            // Pragmas for a write-heavy append log.
+            c.pragma_update(None, "journal_mode", "WAL")
+                .map_err(store)?;
+            c.pragma_update(None, "synchronous", "NORMAL")
+                .map_err(store)?;
+            c.pragma_update(None, "foreign_keys", "ON").map_err(store)?;
+
+            c.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS episodes (
+                    id         INTEGER PRIMARY KEY,
+                    event_id   TEXT NOT NULL,
+                    kind       TEXT NOT NULL,
+                    at_unix_ns INTEGER NOT NULL,
+                    payload    TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_episodes_at ON episodes(at_unix_ns);
+                CREATE INDEX IF NOT EXISTS idx_episodes_kind ON episodes(kind);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(
+                    kind, payload,
+                    content='episodes',
+                    content_rowid='id',
+                    tokenize='porter unicode61'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN
+                    INSERT INTO episodes_fts(rowid, kind, payload)
+                    VALUES (new.id, new.kind, new.payload);
+                END;
+                CREATE TRIGGER IF NOT EXISTS episodes_ad AFTER DELETE ON episodes BEGIN
+                    INSERT INTO episodes_fts(episodes_fts, rowid, kind, payload)
+                    VALUES ('delete', old.id, old.kind, old.payload);
+                END;
+                "#,
+            )
+            .map_err(store)?;
+
+            Ok(c)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))??;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path,
+        })
+    }
+
+    /// Append an event. Returns the autoincrementing row id.
+    pub async fn append(&self, ev: &Event) -> Result<i64> {
+        let conn = self.conn.clone();
+        let kind = event_kind_tag(ev).to_string();
+        let event_id = event_id_of(ev).map(|u| u.to_string()).unwrap_or_default();
+        let at_ns = event_at_ns(ev);
+        let payload = serde_json::to_string(ev)?;
+
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let c = conn.lock();
+            c.execute(
+                r#"INSERT INTO episodes(event_id, kind, at_unix_ns, payload)
+                   VALUES (?1, ?2, ?3, ?4)"#,
+                params![event_id, kind, at_ns, payload],
+            )
+            .map_err(store)?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Return the most recent `k` events, newest first.
+    pub async fn recent(&self, k: usize) -> Result<Vec<EpisodeHit>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<EpisodeHit>> {
+            let c = conn.lock();
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, kind, at_unix_ns, payload FROM episodes \
+                     ORDER BY id DESC LIMIT ?1",
+                )
+                .map_err(store)?;
+            let mut rows = stmt.query(params![k as i64]).map_err(store)?;
+
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().map_err(store)? {
+                out.push(row_to_hit(r)?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// FTS5 search over `kind` + `payload`. Pass a raw FTS5 MATCH expression.
+    pub async fn search(&self, match_expr: impl Into<String>, k: usize) -> Result<Vec<EpisodeHit>> {
+        let conn = self.conn.clone();
+        let m = match_expr.into();
+        tokio::task::spawn_blocking(move || -> Result<Vec<EpisodeHit>> {
+            let c = conn.lock();
+            let mut stmt = c
+                .prepare(
+                    "SELECT e.id, e.kind, e.at_unix_ns, e.payload \
+                     FROM episodes_fts f JOIN episodes e ON e.id = f.rowid \
+                     WHERE episodes_fts MATCH ?1 \
+                     ORDER BY rank LIMIT ?2",
+                )
+                .map_err(store)?;
+            let mut rows = stmt.query(params![m, k as i64]).map_err(store)?;
+
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().map_err(store)? {
+                out.push(row_to_hit(r)?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Total number of stored events.
+    pub async fn count(&self) -> Result<i64> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let c = conn.lock();
+            let n: i64 = c
+                .query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))
+                .map_err(store)?;
+            Ok(n)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Delete every event older than `cutoff_unix_ns`. Returns the number of
+    /// rows removed. The FTS mirror is cleaned up via the trigger.
+    pub async fn delete_older_than(&self, cutoff_unix_ns: i64) -> Result<u64> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let c = conn.lock();
+            let n = c
+                .execute(
+                    "DELETE FROM episodes WHERE at_unix_ns < ?1",
+                    params![cutoff_unix_ns],
+                )
+                .map_err(store)?;
+            Ok(n as u64)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Trim the log to at most `max` rows (newest kept). Returns the number
+    /// of rows removed.
+    pub async fn trim_to_capacity(&self, max: usize) -> Result<u64> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let c = conn.lock();
+            let n = c
+                .execute(
+                    "DELETE FROM episodes \
+                     WHERE id IN ( \
+                         SELECT id FROM episodes \
+                         ORDER BY id DESC \
+                         LIMIT -1 OFFSET ?1 \
+                     )",
+                    params![max as i64],
+                )
+                .map_err(store)?;
+            Ok(n as u64)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+fn row_to_hit(r: &rusqlite::Row<'_>) -> Result<EpisodeHit> {
+    let id: i64 = r.get(0).map_err(store)?;
+    let kind: String = r.get(1).map_err(store)?;
+    let at_ns: i64 = r.get(2).map_err(store)?;
+    let payload: String = r.get(3).map_err(store)?;
+    let event: Event = serde_json::from_str(&payload)?;
+    let at = OffsetDateTime::from_unix_timestamp_nanos(at_ns as i128)
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    Ok(EpisodeHit {
+        id,
+        kind,
+        at,
+        event,
+    })
+}
+
+fn event_kind_tag(ev: &Event) -> &'static str {
+    match ev {
+        Event::FileChanged { .. } => "file_changed",
+        Event::FileDeleted { .. } => "file_deleted",
+        Event::QueryIssued { .. } => "query_issued",
+        Event::AnswerReturned { .. } => "answer_returned",
+        Event::OutcomeObserved { .. } => "outcome_observed",
+    }
+}
+
+fn event_id_of(ev: &Event) -> Option<EventId> {
+    match ev {
+        Event::QueryIssued { id, .. } | Event::AnswerReturned { id, .. } => Some(*id),
+        Event::OutcomeObserved { related_to, .. } => Some(*related_to),
+        _ => None,
+    }
+}
+
+fn event_at_ns(ev: &Event) -> i64 {
+    let t = match ev {
+        Event::FileChanged { at, .. }
+        | Event::FileDeleted { at, .. }
+        | Event::QueryIssued { at, .. }
+        | Event::AnswerReturned { at, .. }
+        | Event::OutcomeObserved { at, .. } => at,
+    };
+    t.unix_timestamp_nanos().min(i64::MAX as i128) as i64
+}
+
+fn store<E: std::fmt::Display>(e: E) -> Error {
+    Error::Store(e.to_string())
+}

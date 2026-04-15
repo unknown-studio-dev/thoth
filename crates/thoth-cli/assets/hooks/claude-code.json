@@ -1,0 +1,49 @@
+{
+  "_comment": "Thoth hooks for Claude Code. Installed by `thoth hooks install`. Each command calls back into the `thoth` binary, which reads the hook's JSON payload from stdin and does the right thing. Remove the block or edit per-event as needed.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "thoth hooks exec session-start"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "thoth hooks exec user-prompt-submit"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "thoth hooks exec post-tool-use"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "thoth hooks exec stop"
+          }
+        ]
+      }
+    ]
+  }
+}

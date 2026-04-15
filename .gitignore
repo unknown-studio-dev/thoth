@@ -1,0 +1,39 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Thoth local data.
+#
+# The markdown source-of-truth (MEMORY.md, LESSONS.md, skills/) can be
+# committed alongside the repo. Everything under `index/` is derivable and
+# should never be tracked.
+.thoth*/
+!.thoth/
+!.thoth/MEMORY.md
+!.thoth/LESSONS.md
+!.thoth/skills/
+
+# Stray local databases from prototype runs
+/identifier.sqlite
+/identifier.sqlite-*
+# MCP local config
+.mcp.json
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+*.profraw
+*.profdata

@@ -1,0 +1,48 @@
+# Gold set for `thoth eval`.
+#
+# Each [[query]] block fires a real Mode::Zero recall against the self-index
+# and counts as a hit when *either* an expected path substring or an expected
+# text substring matches a chunk in the top-k. Run with:
+#
+#     make index     # build / refresh .thoth-self
+#     cargo run -p thoth-cli --release -- \
+#         --root .thoth-self eval --gold eval/gold.toml -k 8
+#
+# Add cases greedily; the harness exits non-zero if any query misses, which
+# makes it easy to wire into CI or a pre-release check.
+
+[[query]]
+q = "hybrid recall RRF fusion"
+expect_path = ["thoth-retrieve/src/retriever"]
+expect_text = ["rrf"]
+
+[[query]]
+q = "watch debounce reindex"
+expect_path = ["thoth-parse/src/watch", "thoth-cli/src/main"]
+
+[[query]]
+q = "tantivy fts index writer"
+expect_path = ["thoth-store/src/fts"]
+
+[[query]]
+q = "episodic log sqlite fts5"
+expect_path = ["thoth-store/src/episodes"]
+expect_text = ["episodes_fts"]
+
+[[query]]
+q = "graph bfs callers callees"
+expect_path = ["thoth-graph/src/lib"]
+
+[[query]]
+q = "MCP tool call json-rpc"
+expect_path = ["thoth-mcp/src"]
+expect_text = ["tools/call", "jsonrpc"]
+
+[[query]]
+q = "markdown append fact memory"
+expect_path = ["thoth-store/src/markdown"]
+expect_text = ["append_fact"]
+
+[[query]]
+q = "tree-sitter language registry"
+expect_path = ["thoth-parse/src/language"]

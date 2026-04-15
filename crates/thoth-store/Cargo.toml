@@ -1,0 +1,42 @@
+[package]
+name = "thoth-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Embedded storage backends: redb (KV + graph), tantivy (BM25), LanceDB (vectors), SQLite+FTS5 (episodes), markdown files."
+
+[dependencies]
+thoth-core   = { workspace = true }
+tokio        = { workspace = true }
+async-trait  = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { workspace = true }
+time         = { workspace = true }
+blake3       = { workspace = true }
+parking_lot  = { workspace = true }
+
+# Graph / KV (redb — pure Rust embedded B-tree store)
+redb         = { workspace = true }
+
+# Full-text search (BM25)
+tantivy      = { workspace = true }
+
+# Episodic log (SQLite + FTS5 contentless index)
+rusqlite     = { workspace = true }
+
+[features]
+default = []
+# Enables the Lance-backed vector store. Off by default because it pulls in
+# a much heavier dep graph (Arrow, async runtimes).
+vector = []
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = { workspace = true }
