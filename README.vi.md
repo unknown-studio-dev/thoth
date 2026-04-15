@@ -3,9 +3,10 @@
 </p>
 
 <h1 align="center">Thoth</h1>
-<p align="center"><em>"Thoth — thần ghi chép, người canh giữ tri thức."</em></p>
 
-<p align="center">Bộ nhớ dài hạn cho coding agent. Nhúng trực tiếp, viết bằng Rust, hiểu code.</p>
+<p align="center"><em>"Thoth — thần ghi chép, người lưu giữ tri thức."</em></p>
+
+<p align="center">Bộ nhớ dài hạn cho claude coding agent. Nhúng trực tiếp, viết bằng Rust.</p>
 
 <p align="center"><a href="./README.md">🇬🇧 English</a> · <strong>🇻🇳 Tiếng Việt</strong></p>
 
@@ -20,44 +21,33 @@
 
 ## Tổng quan
 
-Thoth là một thư viện Rust (kèm CLI, MCP server, và plugin Claude Code /
-Cowork) cho phép coding agent có bộ nhớ *lâu dài*, có *kỷ luật*, về một
-codebase. Dự án gồm hai tầng:
+Thoth là một thư viện Rust (kèm CLI, MCP server và plugin cho Claude Code / Cowork) giúp coding agent có **bộ nhớ dài hạn, có tổ chức** cho một codebase. Hệ thống gồm hai lớp:
 
-1. **Engine** — ba binary `thoth`, `thoth-mcp`, `thoth-gate`.
-2. **Plugin** — `thoth-discipline` (hooks + skills + MCP wiring) — biến
-   session Claude Code / Cowork thành vòng lặp *thực sự sử dụng* bộ nhớ
-   trên mỗi lượt.
+1. **Engine** — ba binary: `thoth`, `thoth-mcp`, `thoth-gate`.
+2. **Plugin** — `thoth-discipline` (hooks + skills + MCP wiring) — biến session Claude Code / Cowork thành một vòng lặp *thực sự sử dụng bộ nhớ ở mỗi lượt*.
 
-Bốn loại bộ nhớ, một store duy nhất:
+Một store duy nhất, bốn loại bộ nhớ:
 
-- **Semantic** — mọi symbol, call, import, reference được tree-sitter phân tích.
-- **Episodic** — mọi query / answer / outcome được ghi vào FTS5 log.
-- **Procedural** — skill tái sử dụng, lưu dạng folder tương thích `agentskills.io`.
-- **Reflective** — bài học rút ra từ sai lầm, có confidence score trong
-  `LESSONS.md`, tự động bị "cách ly" (quarantine) khi gây hại nhiều hơn lợi.
+- **Semantic** — toàn bộ symbol, call, import, reference được phân tích bằng tree-sitter.
+- **Episodic** — log toàn bộ query / answer / outcome bằng FTS5.
+- **Procedural** — các skill tái sử dụng, lưu dưới dạng folder tương thích `agentskills.io`.
+- **Reflective** — các bài học rút ra từ sai lầm, có confidence score trong `LESSONS.md`, tự động bị “cách ly” (quarantine) nếu gây hại nhiều hơn lợi.
 
 Hai chế độ hoạt động:
 
-- **`Mode::Zero`** — hoàn toàn offline, deterministic. Không LLM, không
-  embedding API. Tìm symbol, duyệt graph, BM25 qua tantivy, RRF fusion.
-- **`Mode::Full`** — gắn thêm `Embedder` (Voyage / OpenAI / Cohere) và/hoặc
-  `Synthesizer` (Anthropic Claude) để vector search và để LLM tự chắt lọc
-  bộ nhớ (flow "nudge"). Vector backend là SQLite flat cosine index — không
-  cần hạ tầng gì thêm.
+- **`Mode::Zero`** — chạy hoàn toàn offline, deterministic. Không dùng LLM, không embedding API. Truy vấn bằng symbol search, graph traversal, BM25 (tantivy), kết hợp RRF.
+- **`Mode::Full`** — bổ sung `Embedder` (Voyage / OpenAI / Cohere) và/hoặc `Synthesizer` (Anthropic Claude) để vector search và cho phép LLM tự tinh lọc bộ nhớ (flow "nudge"). Vector backend dùng SQLite (flat cosine index), không cần thêm hạ tầng.
 
 ## Cài đặt
 
-Thoth phát hành ba binary: `thoth` (CLI), `thoth-mcp` (MCP server),
-`thoth-gate` (hook strict mode). Chọn kênh nào cũng được — cả ba cùng
-trả về một bộ file.
+Thoth cung cấp ba binary: `thoth` (CLI), `thoth-mcp` (MCP server), `thoth-gate` (hook strict mode). Dùng kênh nào cũng được — tất cả cùng thao tác trên một bộ file.
 
 ### Homebrew (macOS + Linux)
 
 ```bash
 brew tap unknown-studio-dev/thoth
 brew install thoth
-```
+````
 
 ### npm
 
@@ -67,9 +57,9 @@ npm install -g thoth-memory
 npx thoth-memory setup
 ```
 
-npm publish `thoth-memory` cùng 4 subpackage theo platform
+Package `thoth-memory` publish kèm 4 subpackage theo platform
 (`thoth-memory-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}`);
-`optionalDependencies` sẽ khiến npm tự chọn đúng binary.
+`optionalDependencies` sẽ tự chọn đúng binary.
 
 ### Build từ source
 
@@ -94,25 +84,22 @@ thoth index .            # build code index
 thoth install            # gắn hook + skill + MCP cho Claude Code
 ```
 
-`thoth setup` hỏi những knob quan trọng — enforcement mode, memory mode,
-gate window — rồi ghi file `config.toml` có comment để bạn tinh chỉnh
-sau. Thêm `--show` để in config hiện tại, `--accept-defaults` để bootstrap
-không tương tác (ví dụ trong CI).
+`thoth setup` sẽ hỏi các cấu hình quan trọng — enforcement mode, memory mode, gate window — rồi sinh file `config.toml` có comment để bạn chỉnh sau.
 
-Plugin Cowork / Claude Code (`thoth-discipline`) là phần biến binary
-thành vòng lặp recall *được ép buộc*:
+* `--show`: in config hiện tại
+* `--accept-defaults`: bootstrap không cần tương tác (dùng trong CI)
 
-- Tải [`thoth-discipline-x.y.z.plugin`](https://github.com/unknown-studio-dev/thoth/releases)
-  từ GitHub Release khớp version binary của bạn.
-- Cài qua Cowork plugin picker, hoặc `claude plugin install` với Claude Code.
-- Chi tiết: [`plugins/thoth-discipline/README.md`](./plugins/thoth-discipline/README.md).
+Plugin Cowork / Claude Code (`thoth-discipline`) là thành phần biến binary thành vòng lặp recall *bắt buộc*:
 
-⚠️ **Cài plugin KHÔNG đủ.** Hook gọi `thoth-gate`, MCP entry khởi chạy
-`thoth-mcp` — cài binary trước đã.
+* Tải [`thoth-discipline-x.y.z.plugin`](https://github.com/unknown-studio-dev/thoth/releases)
+* Cài qua Cowork plugin picker hoặc `claude plugin install`
+* Xem chi tiết: [`plugins/thoth-discipline/README.md`](./plugins/thoth-discipline/README.md)
+
+⚠️ **Cài plugin thôi là chưa đủ.** Hook sẽ gọi `thoth-gate`, MCP sẽ chạy `thoth-mcp` — cần cài binary trước.
 
 ## Cấu hình
 
-`thoth setup` ghi toàn bộ; nếu muốn sửa tay, `<root>/config.toml` trông như:
+`thoth setup` sẽ generate toàn bộ. Nếu chỉnh tay, file `<root>/config.toml`:
 
 ```toml
 [memory]
@@ -134,12 +121,12 @@ quarantine_failure_ratio  = 0.66
 quarantine_min_attempts   = 5
 ```
 
-| Kịch bản              | `mode`   | `gate_require_nudge` | `memory_mode` |
-|-----------------------|----------|----------------------|---------------|
-| Solo, ít ma sát       | `soft`   | `false`              | `auto`        |
-| Solo, cẩn thận        | `strict` | `false`              | `auto`        |
-| Team, thử nghiệm      | `strict` | `true`               | `review`      |
-| Team, hậu v1          | `strict` | `true`               | `auto`        |
+| Kịch bản          | `mode`   | `gate_require_nudge` | `memory_mode` |
+| ----------------- | -------- | -------------------- | ------------- |
+| Solo, ít friction | `soft`   | `false`              | `auto`        |
+| Solo, an toàn hơn | `strict` | `false`              | `auto`        |
+| Team, thử nghiệm  | `strict` | `true`               | `review`      |
+| Team, production  | `strict` | `true`               | `auto`        |
 
 ## Kiến trúc
 
@@ -152,8 +139,8 @@ quarantine_min_attempts   = 5
   │   └── .mcp.json             khởi chạy `thoth-mcp`                  │
   │          │                                                         │
   │          ▼                                                         │
-  │   thoth-gate  ─ đọc SQLite (chỉ đọc) ─► episodes.db                │
-  │   (command hook ở PreToolUse, block nếu thiếu recall / nudge)      │
+  │   thoth-gate  ─ đọc SQLite (read-only) ─► episodes.db              │
+  │   (hook PreToolUse, block nếu thiếu recall / nudge)                │
   │                                                                    │
   └────────────────────────┬───────────────────────────────────────────┘
                            │ JSON-RPC / stdio
@@ -168,127 +155,100 @@ quarantine_min_attempts   = 5
                            │
                            ▼
   ┌── `.thoth/` store ─────────────────────────────────────────────────┐
-  │   episodes.db           event log (query_issued, nudge_invoked…)   │
+  │   episodes.db           event log                                  │
   │   graph.redb            symbol / import / call graph               │
   │   fts.tantivy/          BM25 index                                 │
-  │   vectors.db            flat cosine vector index (Mode::Full)      │
-  │   MEMORY.md             fact khai báo                              │
-  │   LESSONS.md            bài học đang áp dụng                       │
-  │   LESSONS.quarantined.md  bài học bị tự động hạ cấp                │
-  │   MEMORY.pending.md, LESSONS.pending.md  staged trong chế độ review│
-  │   memory-history.jsonl  audit trail có phiên bản                   │
+  │   vectors.db            vector index (Mode::Full)                  │
+  │   MEMORY.md             facts                                      │
+  │   LESSONS.md            lessons                                    │
+  │   LESSONS.quarantined.md  lessons bị loại                          │
+  │   MEMORY.pending.md, LESSONS.pending.md  staged (review mode)      │
+  │   memory-history.jsonl  audit trail                                │
   │   skills/               procedural skills                          │
   └────────────────────────────────────────────────────────────────────┘
 ```
 
-Ba tầng ép buộc, xếp theo độ khó bypass tăng dần:
+Ba lớp enforcement (tăng dần độ khó bypass):
 
-1. **Prompt + skill** — SessionStart hook dump lessons vào context;
-   skill `memory-discipline` dẫn agent qua vòng recall/nudge/act/reflect.
-2. **Hook prompt** — PreToolUse/PostToolUse hook đẩy reminder ngắn,
-   khó bỏ qua nhưng bản chất vẫn là text.
-3. **`thoth-gate`** (strict mode) — binary native chạy trên mỗi
-   `Write` / `Edit` / `Bash` PreToolUse. Nó query `episodes.db` trực tiếp
-   tìm event `query_issued` (và optionally `nudge_invoked`) còn mới, rồi
-   **chặn** tool call nếu thiếu. Model không thể "tự thuyết phục" qua
-   kết luận `{"decision":"block"}`.
+1. **Prompt + skill** — inject lessons vào context, skill điều hướng flow recall → nudge → act → reflect
+2. **Hook prompt** — reminder ngắn ở Pre/PostToolUse
+3. **`thoth-gate` (strict mode)** — binary native chặn trực tiếp tool call nếu thiếu recall/nudge
 
-`thoth-gate` **fail open** khi gặp lỗi (thiếu DB, không đọc được config)
-— gate hỏng không bao giờ làm đơ editor, đổi lại là âm thầm hạ về soft
-mode. Nếu strict có vẻ yếu, xem stderr trước.
+`thoth-gate` **fail-open** khi lỗi (DB/config lỗi sẽ không block) — ưu tiên không làm gián đoạn editor.
 
 ## CLI cheatsheet
 
 ```bash
 # lifecycle
-thoth setup                               # wizard config tương tác
-thoth setup --show                        # in config hiện tại
-thoth init                                # tạo .thoth/
-thoth index .                             # parse + index
-thoth watch .                             # nằm resident, reindex khi đổi
+thoth setup
+thoth setup --show
+thoth init
+thoth index .
+thoth watch .
 thoth query "how does the nudge flow work"
 
 # memory
 thoth memory show
 thoth memory fact "Auth tokens expire after 15m" --tags auth,jwt
 thoth memory lesson --when "touching db/migrations" "run make db-check"
-thoth memory pending                      # queue chờ review (chế độ review)
+thoth memory pending
 thoth memory promote lesson 0
 thoth memory reject  fact   2 --reason "trùng"
-thoth memory log --limit 50               # audit trail từ memory-history.jsonl
-thoth memory forget                       # TTL + quarantine pass
-thoth --synth anthropic memory nudge      # LLM chắt lọc lesson
+thoth memory log --limit 50
+thoth memory forget
+thoth --synth anthropic memory nudge
 
-# Wire vào Claude Code
-thoth install                             # skill + hook + MCP, scope project
-thoth install --scope user                # global
-thoth uninstall                           # gỡ trong scope đó
+# Claude Code
+thoth install
+thoth install --scope user
+thoth uninstall
 
 # eval
 thoth eval --gold eval/gold.toml -k 8
 ```
 
-Chạy `thoth --help` để xem toàn bộ.
-
 ## MCP server
 
-`thoth-mcp` nói JSON-RPC 2.0 qua stdio (MCP version `2024-11-05`).
-Tool công bố:
+`thoth-mcp` dùng JSON-RPC 2.0 qua stdio (MCP `2024-11-05`).
 
-| Tool                     | Tác dụng                                                     |
-|--------------------------|--------------------------------------------------------------|
-| `thoth_recall`           | Mode::Zero hybrid recall                                     |
-| `thoth_index`            | Walk + parse + index một path                                |
-| `thoth_remember_fact`    | Append / stage một fact                                      |
-| `thoth_remember_lesson`  | Append / stage một lesson (không ghi đè âm thầm)             |
-| `thoth_memory_show`      | Đọc hai file markdown                                        |
-| `thoth_memory_pending`   | Liệt kê entry đang stage                                     |
-| `thoth_memory_promote`   | Chấp nhận entry staged                                       |
-| `thoth_memory_reject`    | Bỏ entry staged kèm lý do                                    |
-| `thoth_memory_history`   | Tail `memory-history.jsonl`                                  |
-| `thoth_memory_forget`    | TTL + capacity eviction + auto-quarantine                    |
-| `thoth_lesson_outcome`   | Tăng counter success/failure của lesson                      |
-| `thoth_request_review`   | Gắn cờ cần human audit                                       |
-| `thoth_skill_propose`    | Draft skill mới từ ≥5 lesson đã consolidate                  |
-| `thoth_skills_list`      | Liệt kê skill đã cài                                         |
-
-Cộng 2 resource (`thoth://memory/MEMORY.md`, `thoth://memory/LESSONS.md`)
-và 2 prompt (`thoth.nudge`, `thoth.reflect`) — prompt nudge ghi event
-`NudgeInvoked` để gate hai-event của strict mode có thể kiểm tra.
+| Tool                    | Mô tả                        |
+| ----------------------- | ---------------------------- |
+| `thoth_recall`          | Hybrid recall (Mode::Zero)   |
+| `thoth_index`           | Parse + index                |
+| `thoth_remember_fact`   | Lưu fact                     |
+| `thoth_remember_lesson` | Lưu lesson (không overwrite) |
+| `thoth_memory_show`     | Đọc memory                   |
+| `thoth_memory_pending`  | Danh sách pending            |
+| `thoth_memory_promote`  | Approve                      |
+| `thoth_memory_reject`   | Reject                       |
+| `thoth_memory_history`  | Audit log                    |
+| `thoth_memory_forget`   | TTL + cleanup                |
+| `thoth_lesson_outcome`  | Track success/failure        |
+| `thoth_request_review`  | Yêu cầu review               |
+| `thoth_skill_propose`   | Đề xuất skill                |
+| `thoth_skills_list`     | List skill                   |
 
 ## Release flow
 
-- Tag `vX.Y.Z` trên `main`.
-- `.github/workflows/release.yml` build `aarch64-apple-darwin`,
-  `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`,
-  `x86_64-unknown-linux-gnu`, upload tarball + sha256 + plugin bundle
-  vào GitHub Release.
-- `packaging/homebrew/bump.sh vX.Y.Z` dập SHA mới vào formula — copy
-  output vào tap's `Formula/thoth.rb` rồi push.
-- `packaging/npm/publish.sh vX.Y.Z` pack lại tarball thành npm package
-  và publish (có `DRY_RUN=1` tuỳ chọn).
+* Tag `vX.Y.Z`
+* Build multi-platform binary
+* Upload artifact + checksum + plugin
+* Update Homebrew + npm package
 
 ## Dùng như library
 
-Mode::Zero và Mode::Full xem mục ["Embedding as a library" trong bản tiếng Anh](./README.md#embedding-as-a-library)
-— code Rust giống hệt, chỉ khác ngôn ngữ chú thích.
+Xem phần *Embedding as a library* trong README tiếng Anh.
 
 ## Đóng góp
 
-Bug report, feature request, memory-drift report, dịch, và PR đều
-được chào đón. Xem [`CONTRIBUTING.vi.md`](./CONTRIBUTING.vi.md) để biết
-workflow, code style, và template issue.
+Chào đón mọi đóng góp: bug, feature, translation, PR.
+Xem `CONTRIBUTING.vi.md`.
 
 ## Trạng thái
 
-**Alpha.** Thiết kế chốt trong [`DESIGN.md`](./DESIGN.md). Milestone
-M1–M6 (parse + store + graph + retrieve + CLI + MCP + Mode::Full +
-plugin discipline) đã xong.
+**Alpha.** Core design đã ổn định. M1–M6 hoàn thành.
 
 ## License
 
-Dual-licensed: [Apache License 2.0](./LICENSE-APACHE) hoặc
-[MIT](./LICENSE-MIT), tuỳ bạn.
+Dual license: Apache 2.0 hoặc MIT.
 
-Trừ khi bạn nói rõ khác, mọi contribution bạn gửi lên repo được hiểu là
-dual-licensed như trên, không có điều khoản thêm.

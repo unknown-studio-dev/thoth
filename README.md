@@ -5,7 +5,7 @@
 <h1 align="center">Thoth</h1>
 <p align="center"><em>"Thoth, scribe of the gods, keeper of knowledge."</em></p>
 
-<p align="center">Long-term memory for coding agents. Embedded, Rust-native, code-aware.</p>
+<p align="center">Long-term memory for claude coding agents. Embedded, Rust-native, code-aware.</p>
 
 <p align="center"><strong>🇬🇧 English</strong> · <a href="./README.vi.md">🇻🇳 Tiếng Việt</a></p>
 
