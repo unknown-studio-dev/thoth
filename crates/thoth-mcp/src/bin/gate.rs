@@ -138,7 +138,7 @@ fn main() -> ExitCode {
     // it for edit-context extraction — unlike v1 which just dropped it.
     let mut buf = String::new();
     let _ = io::stdin().read_to_string(&mut buf);
-    let input_json: Value = serde_json::from_str(&buf).unwrap_or_else(|_| Value::Null);
+    let input_json: Value = serde_json::from_str(&buf).unwrap_or(Value::Null);
 
     let (verdict, stderr_msg, telemetry) = run(&input_json);
 
@@ -422,7 +422,7 @@ fn insert_token(out: &mut HashSet<String>, tok: &str) {
     if tok.chars().all(|c| c.is_ascii_digit()) {
         return;
     }
-    if STOPWORDS.iter().any(|s| *s == tok) {
+    if STOPWORDS.contains(&tok) {
         return;
     }
     out.insert(tok.to_string());
@@ -924,12 +924,12 @@ struct Policy {
     /// Suggested ranges:
     /// - `0.0`  — disables relevance (time-only, legacy behavior).
     /// - `0.15` — permissive; catches only clear mismatch (recall about X,
-    ///            edit about Y with zero token overlap).
+    ///   edit about Y with zero token overlap).
     /// - `0.30` — balanced (default). Normal edits with a topical recall
-    ///            comfortably pass; ritual `recall("x")` fails.
+    ///   comfortably pass; ritual `recall("x")` fails.
     /// - `0.50` — strict; forces exact token overlap, usable but agent will
-    ///            sometimes need to re-recall for edits that drift within a
-    ///            topic.
+    ///   sometimes need to re-recall for edits that drift within a
+    ///   topic.
     /// - `0.70+` — very strict; expect noticeable friction.
     relevance_threshold: f64,
 }
@@ -1048,7 +1048,7 @@ fn load_config(root: &Path) -> GateConfig {
         // Additive: user prefixes extend the built-in list so nobody
         // loses the obvious wins (cargo test, git status) by customizing.
         for p in extra {
-            if !cfg.bash_readonly_prefixes.iter().any(|x| *x == p) {
+            if !cfg.bash_readonly_prefixes.contains(&p) {
                 cfg.bash_readonly_prefixes.push(p);
             }
         }

@@ -355,6 +355,74 @@ pub fn root() -> i32 { mid() }
 }
 
 #[tokio::test]
+async fn impact_groups_by_file_when_hits_exceed_threshold() {
+    // Lower the threshold to 2 so a small 3-caller fixture trips grouping.
+    // Structured `data.by_depth` is unchanged — grouping is text-only.
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        r#"
+        [output]
+        impact_group_threshold = 2
+        "#,
+    )
+    .await
+    .unwrap();
+    let srv = open(&tmp).await;
+
+    // `leaf` ← {mid, alt, via_root}. Three depth-1 callers in one file.
+    let src = r#"
+pub fn leaf() -> i32 { 1 }
+pub fn mid() -> i32 { leaf() }
+pub fn alt() -> i32 { leaf() }
+pub fn via_root() -> i32 { leaf() }
+"#;
+    let _src_dir = index_rust_fixture(&srv, src).await;
+
+    let resp = srv
+        .handle(req(
+            150,
+            "thoth.call",
+            json!({
+                "name": "thoth_impact",
+                "arguments": { "fqn": "m::leaf", "direction": "up", "depth": 3 }
+            }),
+        ))
+        .await
+        .expect("response");
+    let result = resp.result.unwrap();
+    let text = result["text"].as_str().unwrap_or("").to_string();
+
+    // Text surface shows file-grouped summary.
+    assert!(
+        text.contains("(grouped by file"),
+        "expected grouping header in: {text}"
+    );
+    assert!(
+        text.contains("symbols"),
+        "expected symbol count in grouped row: {text}"
+    );
+
+    // Structured data still exposes every node per depth.
+    let data = result["data"].clone();
+    let by_depth = data["by_depth"].as_array().expect("by_depth array");
+    let mut depth1: Vec<String> = Vec::new();
+    for level in by_depth {
+        if level["depth"].as_u64() == Some(1) {
+            for n in level["nodes"].as_array().unwrap() {
+                depth1.push(n["fqn"].as_str().unwrap().to_string());
+            }
+        }
+    }
+    for expected in ["m::mid", "m::alt", "m::via_root"] {
+        assert!(
+            depth1.iter().any(|f| f == expected),
+            "{expected} missing from depth 1; got {depth1:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn impact_reports_unknown_symbol_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     let srv = open(&tmp).await;

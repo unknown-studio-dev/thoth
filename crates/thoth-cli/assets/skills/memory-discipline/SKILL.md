@@ -9,7 +9,7 @@ description: >
   Trigger phrases: "edit", "refactor", "implement", "fix the bug in",
   "add a feature", "deploy", "why does this do", "how does X work".
 metadata:
-  version: "0.1.0"
+  version: "0.0.1"
 ---
 
 # Memory Discipline

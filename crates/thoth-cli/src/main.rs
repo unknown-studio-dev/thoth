@@ -422,7 +422,9 @@ enum SkillsCmd {
     /// Install skills into `.claude/skills/`.
     ///
     /// With no `PATH`: installs the bundled skills (`memory-discipline`,
-    /// `thoth-reflect`) — this is the primitive `thoth setup` drives.
+    /// `thoth-reflect`, `thoth-guide`, `thoth-exploring`, `thoth-debugging`,
+    /// `thoth-impact-analysis`, `thoth-refactoring`, `thoth-cli`) — this is
+    /// the primitive `thoth setup` drives.
     ///
     /// With a `PATH` pointing at a `<slug>.draft/` directory (produced by
     /// the agent's `thoth_skill_propose` MCP tool): promotes the draft
@@ -815,6 +817,27 @@ const DEFAULT_CONFIG_TOML: &str = r#"# Thoth config. All fields are optional; de
 # [[discipline.policies]]
 # actor = "ci-*"
 # mode = "off"
+
+[output]
+# Recall/impact text-rendering budgets. Structured JSON (`--json` /
+# MCP `data`) is never truncated — only the human-readable text
+# surface honours these caps.
+
+# Maximum body lines rendered per recall chunk. Excess lines become
+# a `[… truncated, M more lines. Read <path>:L<a>-L<b> for full
+# body]` marker. Default: 200. Set to 0 to disable.
+# max_body_lines = 200
+
+# Soft cap on total rendered bytes per recall. A chunk in progress
+# finishes, but no new chunk starts once the budget is crossed.
+# Remaining chunks are elided with a footer. Default: 32768.
+# Set to 0 to disable.
+# max_total_bytes = 32768
+
+# Node count above which `thoth_impact` groups results by file
+# rather than listing every node. Default: 50. Set to 0 to disable
+# grouping (always flat list).
+# impact_group_threshold = 50
 "#;
 
 async fn cmd_index(
@@ -995,7 +1018,11 @@ async fn cmd_query(
         return Ok(());
     }
 
-    print!("{}", out.render());
+    // Honour `[output]` in `<root>/config.toml` for body + total-size
+    // caps. The daemon path above already got this treatment on the
+    // server side, so both routes print the same capped text.
+    let output_cfg = thoth_retrieve::OutputConfig::load_or_default(root).await;
+    print!("{}", out.render_with(&output_cfg.render_options()));
     Ok(())
 }
 

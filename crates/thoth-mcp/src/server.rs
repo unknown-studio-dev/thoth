@@ -302,7 +302,7 @@ impl Server {
             }
         }
 
-        let text = render_retrieval(&out);
+        let text = render_retrieval(&out, &self.inner.root).await;
         // Serialize the full `Retrieval` so CLI `--json` sees the same
         // shape as the direct-store path. Fall back to an empty object on
         // serde failure (shouldn't happen — `Retrieval: Serialize`).
@@ -1032,24 +1032,80 @@ impl Server {
             by_depth.entry(*d).or_default().push(node);
         }
 
+        // Above `impact_group_threshold` nodes, flip to a file-grouped
+        // summary per depth ring. A flat list of 200 FQNs drowns the
+        // useful signal (which files are involved?); grouping counts
+        // nodes per file, ordered by hit density, so the caller sees
+        // the tightly-coupled subsystems at a glance. Structured `data`
+        // (JSON) is unchanged — the cap is text-surface only.
+        let output_cfg =
+            thoth_retrieve::OutputConfig::load_or_default(&self.inner.root).await;
+        let group_by_file = output_cfg.impact_group_threshold > 0
+            && hits.len() > output_cfg.impact_group_threshold;
+
         let mut text = format!(
-            "impact({fqn}, direction={}, depth={depth}) — {} nodes\n",
+            "impact({fqn}, direction={}, depth={depth}) — {} nodes{}\n",
             match dir {
                 thoth_graph::BlastDir::Up => "up",
                 thoth_graph::BlastDir::Down => "down",
                 thoth_graph::BlastDir::Both => "both",
             },
             hits.len(),
+            if group_by_file {
+                " (grouped by file — raise `output.impact_group_threshold` for the flat list)"
+            } else {
+                ""
+            },
         );
         for (d, nodes) in &by_depth {
             text.push_str(&format!("  depth {d}:\n"));
-            for n in nodes {
-                text.push_str(&format!(
-                    "    {}  {}:{}\n",
-                    n.fqn,
-                    n.path.display(),
-                    n.line
-                ));
+            if group_by_file {
+                // Bucket nodes in this ring by their source file, then
+                // sort buckets by descending count so the most
+                // concentrated dependents surface first.
+                let mut by_file: std::collections::BTreeMap<
+                    std::path::PathBuf,
+                    Vec<&thoth_graph::Node>,
+                > = std::collections::BTreeMap::new();
+                for n in nodes {
+                    by_file.entry(n.path.clone()).or_default().push(*n);
+                }
+                let mut ordered: Vec<_> = by_file.into_iter().collect();
+                ordered.sort_by(|(pa, a), (pb, b)| {
+                    b.len().cmp(&a.len()).then_with(|| pa.cmp(pb))
+                });
+                for (path, bucket) in ordered {
+                    // Show up to 3 example FQNs per file so the user
+                    // can drill in; more than that is the same noise
+                    // the grouping was meant to avoid.
+                    let examples: Vec<&str> = bucket
+                        .iter()
+                        .take(3)
+                        .map(|n| n.fqn.as_str())
+                        .collect();
+                    let ellipsis = if bucket.len() > examples.len() {
+                        format!(", … +{} more", bucket.len() - examples.len())
+                    } else {
+                        String::new()
+                    };
+                    text.push_str(&format!(
+                        "    {}  ({} symbol{}): {}{}\n",
+                        path.display(),
+                        bucket.len(),
+                        if bucket.len() == 1 { "" } else { "s" },
+                        examples.join(", "),
+                        ellipsis,
+                    ));
+                }
+            } else {
+                for n in nodes {
+                    text.push_str(&format!(
+                        "    {}  {}:{}\n",
+                        n.fqn,
+                        n.path.display(),
+                        n.line
+                    ));
+                }
             }
         }
         if hits.is_empty() {
@@ -1886,10 +1942,13 @@ fn render_grounding_prompt(args: &serde_json::Map<String, Value>) -> String {
 // Rendering helpers
 // ===========================================================================
 
-fn render_retrieval(r: &thoth_core::Retrieval) -> String {
-    // The rendering lives on `Retrieval::render()` so the CLI and the
-    // MCP-text surface stay byte-for-byte identical.
-    r.render()
+async fn render_retrieval(r: &thoth_core::Retrieval, root: &Path) -> String {
+    // The rendering lives on `Retrieval::render_with()` so the CLI and
+    // the MCP-text surface stay byte-for-byte identical. Budgets come
+    // from `<root>/config.toml [output]` (max_body_lines, max_total_bytes),
+    // so operators can tune the context cost of recall without rebuilding.
+    let cfg = thoth_retrieve::OutputConfig::load_or_default(root).await;
+    r.render_with(&cfg.render_options())
 }
 
 fn first_line(s: &str) -> String {

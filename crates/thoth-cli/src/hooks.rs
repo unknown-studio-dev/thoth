@@ -67,6 +67,30 @@ const BUNDLE_SKILLS: &[(&str, &str)] = &[
         "thoth-reflect",
         include_str!("../assets/skills/thoth-reflect/SKILL.md"),
     ),
+    (
+        "thoth-guide",
+        include_str!("../assets/skills/thoth-guide/SKILL.md"),
+    ),
+    (
+        "thoth-exploring",
+        include_str!("../assets/skills/thoth-exploring/SKILL.md"),
+    ),
+    (
+        "thoth-debugging",
+        include_str!("../assets/skills/thoth-debugging/SKILL.md"),
+    ),
+    (
+        "thoth-impact-analysis",
+        include_str!("../assets/skills/thoth-impact-analysis/SKILL.md"),
+    ),
+    (
+        "thoth-refactoring",
+        include_str!("../assets/skills/thoth-refactoring/SKILL.md"),
+    ),
+    (
+        "thoth-cli",
+        include_str!("../assets/skills/thoth-cli/SKILL.md"),
+    ),
 ];
 
 /// Trip-wire: we always ship at least one skill. Compile-time so dropping
@@ -479,8 +503,8 @@ fn strip_claude_md(existing: &str) -> String {
         return existing.to_string();
     }
     let end = e + CLAUDE_MD_END.len();
-    let before = existing[..s].trim_end_matches(|c: char| c == '\n' || c == ' ' || c == '\t');
-    let after = existing[end..].trim_start_matches(|c: char| c == '\n' || c == ' ' || c == '\t');
+    let before = existing[..s].trim_end_matches(['\n', ' ', '\t']);
+    let after = existing[end..].trim_start_matches(['\n', ' ', '\t']);
     if before.is_empty() && after.is_empty() {
         return String::new();
     }
@@ -603,8 +627,10 @@ pub async fn uninstall(scope: Scope) -> anyhow::Result<()> {
 }
 
 /// `thoth skills install [--scope ...] --root <...>` — installs every
-/// bundled skill (`memory-discipline`, `thoth-reflect`, …) under the
-/// scope's `skills/` directory.
+/// bundled skill (`memory-discipline`, `thoth-reflect`, `thoth-guide`,
+/// `thoth-exploring`, `thoth-debugging`, `thoth-impact-analysis`,
+/// `thoth-refactoring`, `thoth-cli`) under the scope's `skills/`
+/// directory.
 pub async fn skills_install(scope: Scope, root: &Path) -> anyhow::Result<()> {
     let base = scope.skills_dir(root)?;
     for (name, body) in BUNDLE_SKILLS {

@@ -9,7 +9,7 @@ description: >
   Thoth's long-term memory. Also triggers on phrases like "reflect",
   "postmortem", or "retrospective" applied to the current session.
 metadata:
-  version: "0.1.0"
+  version: "0.0.1"
 ---
 
 # Thoth Reflect

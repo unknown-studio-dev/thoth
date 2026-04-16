@@ -63,13 +63,89 @@ impl Default for IndexConfig {
     }
 }
 
-/// TOML file schema — the outer document. We only care about `[index]`;
-/// other tables (e.g. `[memory]`, read by `thoth-memory`) are left to
-/// their owners, so we tolerate them instead of `deny_unknown_fields` here.
+/// Retrieval-output display limits. Mirrors the `[output]` table in
+/// `<root>/config.toml`. Bounds the per-chunk body length and the total
+/// rendered size of a recall, and sets the threshold above which
+/// `thoth_impact` switches from a per-node listing to a file-grouped
+/// summary.
+///
+/// The values here feed [`thoth_core::RenderOptions`] via
+/// [`Self::render_options`]. The underlying [`thoth_core::Retrieval`] is
+/// never truncated — only the text surface honours these caps, so
+/// structured JSON (CLI `--json`, MCP `data`) still sees every chunk.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputConfig {
+    /// Maximum body lines rendered per recall chunk. `0` disables
+    /// truncation. Default: 200.
+    pub max_body_lines: usize,
+    /// Soft cap on total rendered bytes per recall. `0` disables the
+    /// size budget. Default: 32 KiB.
+    pub max_total_bytes: usize,
+    /// Node count above which `thoth_impact` groups results by file
+    /// rather than listing every node. `0` disables grouping. Default: 50.
+    pub impact_group_threshold: usize,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            max_body_lines: 200,
+            max_total_bytes: 32 * 1024,
+            impact_group_threshold: 50,
+        }
+    }
+}
+
+impl OutputConfig {
+    /// Load `<root>/config.toml` if it exists, returning the `[output]`
+    /// table (or [`Self::default`] if the file / table are missing).
+    ///
+    /// A malformed file emits a `warn!` and falls back to defaults —
+    /// a typo in one output key must not turn recall into a broken
+    /// wall of JSON.
+    pub async fn load_or_default(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "output: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        match toml::from_str::<ConfigFile>(&text) {
+            Ok(cf) => cf.output.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "output: config.toml parse error, using defaults");
+                Self::default()
+            }
+        }
+    }
+
+    /// Convert to the render-time options consumed by
+    /// [`thoth_core::Retrieval::render_with`]. The `impact_group_threshold`
+    /// is used directly by `thoth_impact`, not via `RenderOptions`.
+    pub fn render_options(&self) -> thoth_core::RenderOptions {
+        thoth_core::RenderOptions {
+            max_body_lines: self.max_body_lines,
+            max_total_bytes: self.max_total_bytes,
+        }
+    }
+}
+
+/// TOML file schema — the outer document. We only care about `[index]`
+/// and `[output]`; other tables (e.g. `[memory]`, read by
+/// `thoth-memory`) are left to their owners, so we tolerate them instead
+/// of `deny_unknown_fields` here.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
     index: Option<IndexConfig>,
+    #[serde(default)]
+    output: Option<OutputConfig>,
 }
 
 impl IndexConfig {
@@ -165,5 +241,79 @@ mod tests {
         let cfg = IndexConfig::load_or_default(dir.path()).await;
         // Defaults apply — load_or_default must not panic.
         assert!(cfg.ignore.is_empty());
+    }
+
+    #[tokio::test]
+    async fn output_config_defaults() {
+        let dir = tempdir().unwrap();
+        let cfg = OutputConfig::load_or_default(dir.path()).await;
+        assert_eq!(cfg.max_body_lines, 200);
+        assert_eq!(cfg.max_total_bytes, 32 * 1024);
+        assert_eq!(cfg.impact_group_threshold, 50);
+        let opts = cfg.render_options();
+        assert_eq!(opts.max_body_lines, 200);
+        assert_eq!(opts.max_total_bytes, 32 * 1024);
+    }
+
+    #[tokio::test]
+    async fn output_config_parses_all_keys() {
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+            [output]
+            max_body_lines = 100
+            max_total_bytes = 8192
+            impact_group_threshold = 25
+            "#,
+        )
+        .await
+        .unwrap();
+        let cfg = OutputConfig::load_or_default(dir.path()).await;
+        assert_eq!(cfg.max_body_lines, 100);
+        assert_eq!(cfg.max_total_bytes, 8192);
+        assert_eq!(cfg.impact_group_threshold, 25);
+    }
+
+    #[tokio::test]
+    async fn output_config_and_index_config_coexist() {
+        // Both tables in one file — each loader ignores the other's
+        // table, so an `[output]` typo doesn't break indexing and
+        // vice-versa.
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+            [index]
+            ignore = ["dist/"]
+
+            [output]
+            max_body_lines = 64
+            "#,
+        )
+        .await
+        .unwrap();
+        let idx = IndexConfig::load_or_default(dir.path()).await;
+        let out = OutputConfig::load_or_default(dir.path()).await;
+        assert_eq!(idx.ignore, vec!["dist/".to_string()]);
+        assert_eq!(out.max_body_lines, 64);
+        // Defaults preserved for keys the user didn't override.
+        assert_eq!(out.max_total_bytes, 32 * 1024);
+    }
+
+    #[tokio::test]
+    async fn output_config_malformed_falls_back_to_defaults() {
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+            [output]
+            max_body_lines = "not a number"
+            "#,
+        )
+        .await
+        .unwrap();
+        let cfg = OutputConfig::load_or_default(dir.path()).await;
+        assert_eq!(cfg.max_body_lines, 200);
     }
 }

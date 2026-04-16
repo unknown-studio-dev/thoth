@@ -25,7 +25,7 @@ pub mod enrich;
 pub mod indexer;
 pub mod retriever;
 
-pub use config::IndexConfig;
+pub use config::{IndexConfig, OutputConfig};
 pub use enrich::{enrich_chunks, extract_docstring};
 pub use indexer::{IndexProgress, IndexStats, Indexer, chunk_id, read_span};
 pub use retriever::Retriever;
