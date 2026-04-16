@@ -80,9 +80,11 @@ impl Default for MemoryConfig {
 }
 
 /// TOML file schema — mirrors the `[memory]` and `[discipline]` tables in
-/// `<root>/config.toml`.
+/// `<root>/config.toml`. We deliberately do NOT `deny_unknown_fields` at
+/// the top level because the same file also hosts `[index]`,
+/// `[output]`, and other per-crate tables owned by other loaders.
 #[derive(Debug, Default, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct ConfigFile {
     memory: MemoryConfig,
     #[serde(default)]
@@ -105,8 +107,15 @@ struct ConfigFile {
 /// `global_fallback = true` (default) lets the plugin fall back to the
 /// user-level `~/.thoth/` memory when no project-local `.thoth/` exists,
 /// so lessons travel across checkouts of scratch repos.
+// NOTE: no `deny_unknown_fields` here — the project-wide
+// `config.toml` also hosts gate-v2 keys (`gate_window_*`,
+// `gate_relevance_threshold`, `gate_telemetry_enabled`, …) that are
+// owned by `thoth-mcp/bin/gate.rs`'s own `DisciplineFile` struct. If
+// we enforced unknown-field rejection here, every project with a
+// normal config would silently fall back to hard-coded defaults —
+// masking the very thresholds (`reflect_debt_*`) this struct adds.
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct DisciplineConfig {
     /// `"soft"` (warn only) or `"strict"` (deny on violation). Default
     /// `"soft"` — match the principle of "nudge, don't yoke".

@@ -163,56 +163,79 @@ fn path_jsonl(root: &Path, name: &str) -> PathBuf {
     root.join(name)
 }
 
-/// Count `verdict = "pass"` entries in `gate.jsonl` for mutation tools.
+/// Count mutation tool calls that the gate **allowed** in
+/// `gate.jsonl`. A gate verdict of `pass` OR `nudge` both let the
+/// tool run — the only difference is whether a warning was surfaced
+/// — so both are real edits to the codebase and both accrue debt.
+/// `block` verdicts are excluded because the tool never ran.
+///
 /// `Bash` passes are deliberately excluded — many Bash commands are
 /// benign (lint, test, format) and treating them as mutations would
 /// inflate debt on agents that never touched source files.
 async fn count_mutations(root: &Path, since_unix: Option<i64>) -> u32 {
     count_jsonl(&path_jsonl(root, "gate.jsonl"), |line| {
-        let val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let tool = val.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-        let decision = val.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-        let is_mutation = matches!(tool, "Write" | "Edit" | "NotebookEdit");
-        if !is_mutation || decision != "pass" {
-            return false;
-        }
-        if let Some(since) = since_unix {
-            let ts = parse_rfc3339_secs(val.get("ts").and_then(|v| v.as_str()).unwrap_or(""));
-            if let Some(t) = ts {
-                return t >= since;
-            }
-        }
-        true
+        is_counted_mutation(line, since_unix)
     })
     .await
 }
 
-/// Count `op = "append"` entries with `kind` ∈ {`fact`, `lesson`} in
-/// `memory-history.jsonl`. `promote` deliberately doesn't count — it's
-/// a curator action, not a fresh reflection.
+/// Shared predicate — factored out so the sync counterpart stays
+/// byte-identical. Returns `true` for Write/Edit/NotebookEdit entries
+/// whose verdict let the tool run AND whose timestamp falls in the
+/// session window (if one is set).
+fn is_counted_mutation(line: &str, since_unix: Option<i64>) -> bool {
+    let val: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let tool = val.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+    let decision = val.get("decision").and_then(|v| v.as_str()).unwrap_or("");
+    let is_mutation = matches!(tool, "Write" | "Edit" | "NotebookEdit");
+    let allowed = matches!(decision, "pass" | "nudge");
+    if !is_mutation || !allowed {
+        return false;
+    }
+    if let Some(since) = since_unix {
+        let ts_str = val.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        return parse_rfc3339_secs(ts_str)
+            .map(|t| t >= since)
+            .unwrap_or(false);
+    }
+    true
+}
+
+/// Count agent-driven writes to memory in `memory-history.jsonl`:
+/// either a direct `append` (auto mode) or a `stage` (review mode /
+/// `stage: true`). Both represent a real reflection by the agent, so
+/// both pay down debt. `promote` / `reject` / `quarantine` are
+/// curator/user actions downstream of the stage and deliberately
+/// skipped — otherwise a promote would double-count the same
+/// underlying reflection.
 async fn count_remembers(root: &Path, since_unix: Option<i64>) -> u32 {
     count_jsonl(&path_jsonl(root, "memory-history.jsonl"), |line| {
-        let val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let op = val.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        if op != "append" || !matches!(kind, "fact" | "lesson") {
-            return false;
-        }
-        if let Some(since) = since_unix {
-            let at = val.get("at_unix").and_then(|v| v.as_i64());
-            if let Some(t) = at {
-                return t >= since;
-            }
-        }
-        true
+        is_counted_remember(line, since_unix)
     })
     .await
+}
+
+fn is_counted_remember(line: &str, since_unix: Option<i64>) -> bool {
+    let val: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let op = val.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(op, "append" | "stage") || !matches!(kind, "fact" | "lesson") {
+        return false;
+    }
+    if let Some(since) = since_unix {
+        return val
+            .get("at_unix")
+            .and_then(|v| v.as_i64())
+            .map(|t| t >= since)
+            .unwrap_or(false);
+    }
+    true
 }
 
 /// Streamed line counter with a per-line predicate. Streams so we
@@ -263,44 +286,13 @@ fn read_session_start_sync(root: &Path) -> Option<i64> {
 
 fn count_mutations_sync(root: &Path, since_unix: Option<i64>) -> u32 {
     count_jsonl_sync(&path_jsonl(root, "gate.jsonl"), |line| {
-        let val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let tool = val.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-        let decision = val.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-        let is_mutation = matches!(tool, "Write" | "Edit" | "NotebookEdit");
-        if !is_mutation || decision != "pass" {
-            return false;
-        }
-        if let Some(since) = since_unix {
-            let ts = parse_rfc3339_secs(val.get("ts").and_then(|v| v.as_str()).unwrap_or(""));
-            if let Some(t) = ts {
-                return t >= since;
-            }
-        }
-        true
+        is_counted_mutation(line, since_unix)
     })
 }
 
 fn count_remembers_sync(root: &Path, since_unix: Option<i64>) -> u32 {
     count_jsonl_sync(&path_jsonl(root, "memory-history.jsonl"), |line| {
-        let val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let op = val.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        if op != "append" || !matches!(kind, "fact" | "lesson") {
-            return false;
-        }
-        if let Some(since) = since_unix {
-            let at = val.get("at_unix").and_then(|v| v.as_i64());
-            if let Some(t) = at {
-                return t >= since;
-            }
-        }
-        true
+        is_counted_remember(line, since_unix)
     })
 }
 
@@ -359,10 +351,13 @@ mod tests {
                 r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#,
                 r#"{"ts":"2026-04-17T10:01:00Z","tool":"Edit","decision":"pass","reason":""}"#,
                 r#"{"ts":"2026-04-17T10:02:00Z","tool":"NotebookEdit","decision":"pass","reason":""}"#,
+                // Nudge verdict still let the edit run — counts as a
+                // mutation for debt purposes.
+                r#"{"ts":"2026-04-17T10:03:00Z","tool":"Edit","decision":"nudge","reason":""}"#,
                 // Bash is intentionally NOT counted as a mutation.
-                r#"{"ts":"2026-04-17T10:03:00Z","tool":"Bash","decision":"pass","reason":""}"#,
-                // Blocked edits don't count either.
-                r#"{"ts":"2026-04-17T10:04:00Z","tool":"Write","decision":"block","reason":"r"}"#,
+                r#"{"ts":"2026-04-17T10:04:00Z","tool":"Bash","decision":"pass","reason":""}"#,
+                // Blocked edits don't count — the tool never ran.
+                r#"{"ts":"2026-04-17T10:05:00Z","tool":"Write","decision":"block","reason":"r"}"#,
                 // Malformed line is silently skipped.
                 "not json",
             ],
@@ -370,28 +365,34 @@ mod tests {
         .await;
 
         let d = ReflectionDebt::compute(dir.path()).await;
-        assert_eq!(d.mutations, 3);
+        assert_eq!(d.mutations, 4);
         assert_eq!(d.remembers, 0);
     }
 
     #[tokio::test]
-    async fn counts_only_fact_lesson_appends_not_promotes() {
+    async fn counts_fact_lesson_appends_and_stages_not_promotes() {
         let dir = tempdir().unwrap();
         write(
             &dir.path().join("memory-history.jsonl"),
             &[
                 r#"{"at_unix":1000,"at_rfc3339":"","op":"append","kind":"fact","title":"t"}"#,
                 r#"{"at_unix":1001,"at_rfc3339":"","op":"append","kind":"lesson","title":"t"}"#,
-                // Promote is a curator action, not a reflection — skip.
-                r#"{"at_unix":1002,"at_rfc3339":"","op":"promote","kind":"fact","title":"t"}"#,
+                // `stage` is the initial agent write in review mode —
+                // counts as a reflection.
+                r#"{"at_unix":1002,"at_rfc3339":"","op":"stage","kind":"fact","title":"t"}"#,
+                // Promote is a later curator action on an already-counted
+                // stage — don't double-count.
+                r#"{"at_unix":1003,"at_rfc3339":"","op":"promote","kind":"fact","title":"t"}"#,
+                // Reject / quarantine are removal; never count.
+                r#"{"at_unix":1004,"at_rfc3339":"","op":"reject","kind":"fact","title":"t"}"#,
                 // Skill proposals don't count either.
-                r#"{"at_unix":1003,"at_rfc3339":"","op":"append","kind":"skill","title":"t"}"#,
+                r#"{"at_unix":1005,"at_rfc3339":"","op":"append","kind":"skill","title":"t"}"#,
             ],
         )
         .await;
 
         let d = ReflectionDebt::compute(dir.path()).await;
-        assert_eq!(d.remembers, 2);
+        assert_eq!(d.remembers, 3);
     }
 
     #[tokio::test]
