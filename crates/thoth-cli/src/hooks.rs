@@ -1038,6 +1038,11 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
 /// Inlined equivalent of `thoth curate --quiet` used by the
 /// SessionStart hook. Keeps the hook self-contained (no re-exec) and
 /// never fails the hook — errors degrade to a trace line.
+///
+/// "Quiet" semantics: only flag items that actually need attention.
+/// A forget pass that dropped zero episodes isn't a finding — surfacing
+/// it every session would pollute the banner and teach the agent to
+/// ignore the whole "Curator findings" block.
 async fn curate_quiet(root: &Path) -> anyhow::Result<()> {
     let mut findings: Vec<String> = Vec::new();
 
@@ -1045,9 +1050,15 @@ async fn curate_quiet(root: &Path) -> anyhow::Result<()> {
     // direct-store path needs an exclusive redb lock that the MCP
     // daemon typically holds at session start. Losing this run only
     // delays the GC by one session.
+    //
+    // Suppress the finding when the structured `data` shows no
+    // drops — the tool itself also elides text on a no-op now, but
+    // we defend client-side too in case a stale daemon binary is
+    // still running with the older always-non-empty format.
     if let Some(mut d) = crate::daemon::DaemonClient::try_connect(root).await
         && let Ok(res) = d.call("thoth_memory_forget", serde_json::json!({})).await
         && !crate::daemon::tool_is_error(&res)
+        && forget_has_drops(&crate::daemon::tool_data(&res))
     {
         let t = crate::daemon::tool_text(&res).trim().to_string();
         if !t.is_empty() {
@@ -1072,6 +1083,7 @@ async fn curate_quiet(root: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
 
 async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
     if !root.exists() {
@@ -1288,6 +1300,20 @@ async fn run_stop(root: &Path, _payload: &Value) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `true` if the `thoth_memory_forget` response's `data` shows at
+/// least one counter > 0. Used both in hook banner suppression and
+/// by `cmd_curate` so a no-op forget pass doesn't surface every time.
+pub(crate) fn forget_has_drops(data: &Value) -> bool {
+    [
+        "episodes_ttl",
+        "episodes_cap",
+        "lessons_dropped",
+        "lessons_quarantined",
+    ]
+    .iter()
+    .any(|k| data.get(*k).and_then(Value::as_u64).unwrap_or(0) > 0)
 }
 
 /// Collapse a multi-line preview to the first non-empty line, capped at

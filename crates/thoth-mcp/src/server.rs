@@ -722,13 +722,27 @@ impl Server {
     async fn tool_memory_forget(&self) -> anyhow::Result<ToolOutput> {
         let mm = MemoryManager::open(&self.inner.root).await?;
         let report = mm.forget_pass().await?;
-        let text = format!(
-            "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={} lessons_quarantined={}",
-            report.episodes_ttl,
-            report.episodes_cap,
-            report.lessons_dropped,
-            report.lessons_quarantined
-        );
+        let did_work = report.episodes_ttl > 0
+            || report.episodes_cap > 0
+            || report.lessons_dropped > 0
+            || report.lessons_quarantined > 0;
+        // Return an empty text surface when the pass was a no-op so
+        // hook-driven callers (SessionStart curator, Stop cleanup)
+        // don't flood the agent banner with "forget pass: 0 0 0 0"
+        // on every healthy session. The structured `data` still
+        // carries every counter so scripted callers can distinguish
+        // "didn't run" from "ran with zero drops".
+        let text = if did_work {
+            format!(
+                "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={} lessons_quarantined={}",
+                report.episodes_ttl,
+                report.episodes_cap,
+                report.lessons_dropped,
+                report.lessons_quarantined
+            )
+        } else {
+            String::new()
+        };
         let data = json!({
             "episodes_ttl": report.episodes_ttl,
             "episodes_cap": report.episodes_cap,

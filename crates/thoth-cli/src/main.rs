@@ -1994,7 +1994,16 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
     // store directly.
     let forget_report = if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
         match d.call("thoth_memory_forget", serde_json::json!({})).await {
-            Ok(res) if !daemon::tool_is_error(&res) => Some(daemon::tool_text(&res).to_string()),
+            Ok(res) if !daemon::tool_is_error(&res) => {
+                // Suppress no-op passes — a stale daemon binary may still
+                // send the legacy always-non-empty text, so we check the
+                // structured `data` counters instead of the text.
+                if hooks::forget_has_drops(&daemon::tool_data(&res)) {
+                    Some(daemon::tool_text(&res).to_string())
+                } else {
+                    None
+                }
+            }
             Ok(res) => {
                 findings.push(format!("forget failed: {}", daemon::tool_text(&res)));
                 None
@@ -2011,9 +2020,19 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
         match thoth_memory::MemoryManager::open(root).await {
             Ok(m) => match m.forget_pass().await {
                 Ok(r) => {
-                    let total = r.episodes_ttl + r.episodes_cap;
+                    // Include every counter — a quarantine that didn't
+                    // touch any episode is still a finding worth
+                    // surfacing. Suppress entirely when all four are
+                    // zero to match the daemon path's no-op silence.
+                    let total = r.episodes_ttl
+                        + r.episodes_cap
+                        + r.lessons_dropped
+                        + r.lessons_quarantined;
                     if total > 0 {
-                        Some(format!("forgot {total} stale episode(s)"))
+                        Some(format!(
+                            "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={} lessons_quarantined={}",
+                            r.episodes_ttl, r.episodes_cap, r.lessons_dropped, r.lessons_quarantined
+                        ))
                     } else {
                         None
                     }
