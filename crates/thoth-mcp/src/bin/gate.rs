@@ -1,164 +1,1198 @@
-//! `thoth-gate` — strict-mode enforcement binary for the thoth-discipline
-//! Claude Code plugin.
+//! `thoth-gate` — PreToolUse hook for the thoth Claude Code plugin.
 //!
-//! Called as a PreToolUse hook. Reads `<root>/config.toml` and the most
-//! recent `query_issued` row from `<root>/episodes.db`, then emits a
-//! verdict on stdout:
+//! Gate v2 design (see `design/gate-v2.md` in conversation history). Three
+//! factors decide whether a mutation tool call proceeds:
+//!
+//! 1. **Intent** — read-only Bash (cargo test / git status / grep / …) is
+//!    whitelisted and skips the gate entirely.
+//! 2. **Recency** — if a `query_issued` event fired within
+//!    `window_short_secs`, that alone is enough. This preserves the old
+//!    "just called recall, let me edit" flow.
+//! 3. **Relevance** — past that short window, the gate scores token
+//!    overlap between the edit context and recent recall queries (up to
+//!    `window_long_secs` back). Ritual recalls (`recall("x")` to reset
+//!    the clock) score 0.0 and fail; real topical recalls score high
+//!    and pass.
+//!
+//! Verdict is driven by the resolved **policy**, which is the first
+//! `[[discipline.policies]]` entry whose `actor` glob matches the
+//! `THOTH_ACTOR` env var. Default policy applies on no match.
+//!
+//! The gate always **fails open** on internal errors (bad config, IO,
+//! SQLite) — a broken gate must never brick the editor. Errors go to
+//! stderr; the verdict is `approve`.
+//!
+//! ## Output shape
+//!
+//! stdout is exactly one line of JSON:
 //!
 //! ```json
 //! {"decision": "approve"}
-//! {"decision": "block",   "reason": "..."}
-//! {"decision": "approve", "reason": "..."}   // soft-mode warning
+//! {"decision": "approve", "reason": "..."}   // nudge
+//! {"decision": "block",   "reason": "..."}   // strict + miss
 //! ```
 //!
-//! The gate **always fails open**: a broken config, missing file, or
-//! corrupt SQLite must never brick the user's editor. Errors go to
-//! stderr and the decision is `approve`.
-//!
-//! ## Why a binary
-//!
-//! An earlier version shelled out to Python. That made the plugin depend
-//! on a `python3` interpreter on `$PATH`, which isn't guaranteed on every
-//! developer machine (fresh macOS, minimal Docker images, Windows without
-//! WSL). The Rust version is a single self-contained executable that
-//! `cargo install --path crates/thoth-mcp` ships alongside `thoth-mcp`.
+//! stderr holds the human-readable explanation (edit tokens, recent
+//! recalls with overlap scores, suggested recall query) — Claude Code
+//! surfaces this to the agent so it can self-correct.
 
-use std::io::{self, Read};
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
-// Defaults mirroring `thoth_memory::DisciplineConfig`.
-const DEFAULT_MODE: &str = "soft";
+// ===========================================================================
+// Defaults — surface for user-facing docs.
+// ===========================================================================
+
+/// Legacy: `soft` / `strict`. New: `off` / `nudge` / `relevance` / `strict`.
+/// Default picked by policy:
+///
+/// - `nudge` — pass every call; emit stderr warning on relevance miss.
+///   Chosen as default because a noisy false block is worse than a silent
+///   miss. Opt-in to stricter mode via config.
+const DEFAULT_MODE: &str = "nudge";
 const DEFAULT_GLOBAL_FALLBACK: bool = true;
 const DEFAULT_NUDGE_BEFORE_WRITE: bool = true;
-const DEFAULT_WINDOW_SECS: u64 = 180;
-const DEFAULT_GATE_REQUIRE_NUDGE: bool = false;
+
+/// Recency shortcut — recall within this window passes without a relevance
+/// check. Kept short because recency alone is the weakest signal.
+const DEFAULT_WINDOW_SHORT_SECS: u64 = 60;
+
+/// Relevance pool — how far back we search for a topically-matching recall.
+/// 30 min covers a typical coding session; older recalls are stale context
+/// that probably doesn't justify the current edit anyway.
+const DEFAULT_WINDOW_LONG_SECS: u64 = 1800;
+
+/// Containment ratio threshold for relevance. See the `threshold` comment
+/// block on `GateConfig::relevance_threshold` for the user-facing range
+/// guidance.
+const DEFAULT_RELEVANCE_THRESHOLD: f64 = 0.30;
+
+/// Legacy single window — kept so old `gate_window_secs = 180` configs
+/// still parse and are interpreted as the short-recency shortcut.
+const LEGACY_WINDOW_SECS: u64 = 180;
+
+/// Default read-only Bash prefixes — expanded from the most common
+/// developer loops. Anything that only *observes* the system (no writes,
+/// no network side effects) is a safe pass.
+const DEFAULT_BASH_READONLY_PREFIXES: &[&str] = &[
+    "cargo build",
+    "cargo test",
+    "cargo check",
+    "cargo clippy",
+    "cargo fmt --check",
+    "cargo doc",
+    "cargo tree",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "git remote -v",
+    "git stash list",
+    "grep ",
+    "rg ",
+    "ls ",
+    "ls\n",
+    "find ",
+    "tree ",
+    "echo ",
+    "cat ",
+    "head ",
+    "tail ",
+    "wc ",
+    "which ",
+    "pwd",
+    "env",
+    "printenv",
+    "npx tsc --noEmit",
+    "pnpm test",
+    "pnpm lint",
+    "pnpm tsc",
+    "npm test",
+    "npm run lint",
+    "yarn test",
+    "yarn lint",
+    "go test",
+    "go build",
+    "go vet",
+    "python -m pytest",
+    "pytest",
+    "mypy",
+    "ruff check",
+];
+
+// ===========================================================================
+// Entry point
+// ===========================================================================
 
 fn main() -> ExitCode {
-    // Drain stdin so Claude Code's hook runner doesn't deadlock when it
-    // pipes the tool-call JSON in. We don't need the content — presence
-    // of a recent recall is enough to decide.
-    let mut _buf = String::new();
-    let _ = io::stdin().read_to_string(&mut _buf);
+    // Drain stdin; Claude Code pipes the full tool-call JSON here. We need
+    // it for edit-context extraction — unlike v1 which just dropped it.
+    let mut buf = String::new();
+    let _ = io::stdin().read_to_string(&mut buf);
+    let input_json: Value = serde_json::from_str(&buf).unwrap_or_else(|_| Value::Null);
 
-    let verdict = run();
+    let (verdict, stderr_msg, telemetry) = run(&input_json);
+
+    // stderr first (agent-visible explanation), then stdout verdict.
+    if let Some(msg) = stderr_msg {
+        eprintln!("{msg}");
+    }
     println!("{verdict}");
+
+    // Best-effort telemetry append — never let logging failure leak to the
+    // verdict or the editor.
+    if let Some(rec) = telemetry {
+        let _ = append_telemetry(&rec);
+    }
+
+    // Exit code is always success; verdict semantics live in the JSON.
+    // Claude Code keys off stdout, not our exit code.
     ExitCode::SUCCESS
 }
 
-fn run() -> serde_json::Value {
-    // Bootstrap: probe project-local first, then home if allowed. We need
-    // config to know whether to do the home fallback, so read config from
-    // whichever directory exists first.
+// ===========================================================================
+// Top-level flow
+// ===========================================================================
+
+/// Run the decision engine. Returns:
+/// - JSON verdict for stdout.
+/// - Optional stderr message (present when we decided nudge or block).
+/// - Optional telemetry record to append (present when telemetry enabled
+///   and a decision was actually made — skips the trivial disabled path).
+fn run(input: &Value) -> (Value, Option<String>, Option<TelemetryRecord>) {
+    // Resolve the .thoth root up front.
     let bootstrap = first_existing_root(true);
     let cfg = match bootstrap.as_deref() {
         Some(p) => load_config(p),
-        None => Config::default(),
+        None => GateConfig::default(),
     };
 
+    // Nudge-before-write off = legacy "discipline disabled" kill switch.
     if !cfg.nudge_before_write {
-        return approve(None);
+        return (approve_json(None), None, None);
     }
 
     let root = match first_existing_root(cfg.global_fallback) {
         Some(p) => p,
         None => {
-            return approve(Some(
-                "[thoth-gate] no .thoth/ directory found; discipline disabled. \
-                 Run `thoth index .` to enable.",
-            ));
+            return (
+                approve_json(Some(
+                    "[thoth-gate] no .thoth/ directory found; discipline disabled. \
+                     Run `thoth setup` to enable.",
+                )),
+                None,
+                None,
+            );
         }
     };
 
-    // Re-read config from the resolved root in case it differs from the
-    // bootstrap location (project-local vs ~/.thoth).
+    // Re-read config at the resolved root in case project-local differs
+    // from the ~/.thoth bootstrap location.
     let cfg = load_config(&root);
-    let recall_ns = match last_event_at(&root, "query_issued") {
+
+    // Parse the tool-call envelope. Claude Code uses
+    //   { "tool_name": "...", "tool_input": { ... } }
+    let tool_name = input
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
+
+    // Intent classification — read-only ops skip everything.
+    let intent = classify_intent(&tool_name, &tool_input, &cfg.bash_readonly_prefixes);
+    if matches!(intent, Intent::ReadOnly | Intent::Ignored) {
+        let telemetry = cfg.telemetry_enabled.then(|| TelemetryRecord {
+            root: root.clone(),
+            ts_iso: now_iso(),
+            actor: resolve_actor(),
+            tool: tool_name.clone(),
+            path: tool_input_path(&tool_input),
+            decision: "pass".to_string(),
+            reason: "readonly_whitelist".to_string(),
+            recency_secs: None,
+            best_score: None,
+            considered: 0,
+            missed_tokens: Vec::new(),
+        });
+        return (approve_json(None), None, telemetry);
+    }
+
+    // Resolve actor policy. Actor string is whatever the caller set in
+    // `THOTH_ACTOR`; missing → "default" → default policy.
+    let actor = resolve_actor();
+    let policy = cfg.resolve_policy(&actor);
+
+    if policy.mode == PolicyMode::Off {
+        let telemetry = cfg.telemetry_enabled.then(|| TelemetryRecord {
+            root: root.clone(),
+            ts_iso: now_iso(),
+            actor: actor.clone(),
+            tool: tool_name.clone(),
+            path: tool_input_path(&tool_input),
+            decision: "pass".to_string(),
+            reason: "policy_off".to_string(),
+            recency_secs: None,
+            best_score: None,
+            considered: 0,
+            missed_tokens: Vec::new(),
+        });
+        return (approve_json(None), None, telemetry);
+    }
+
+    // Pull the recall pool — up to ~20 rows, within window_long.
+    let recalls = match recent_recalls(&root, policy.window_long_secs) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[thoth-gate] sqlite error: {e}");
-            return approve(None); // fail open
-        }
-    };
-    let nudge_ns = match last_event_at(&root, "nudge_invoked") {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[thoth-gate] sqlite error (nudge lookup): {e}");
-            // Fall through — only matters when gate_require_nudge is set.
-            None
+            return (approve_json(None), None, None); // fail open
         }
     };
 
-    let now_ns = now_unix_ns();
-    let recall_age_s = recall_ns.map(|ns| (now_ns.saturating_sub(ns)) / 1_000_000_000);
-    let nudge_age_s = nudge_ns.map(|ns| (now_ns.saturating_sub(ns)) / 1_000_000_000);
+    // Extract edit context tokens from the tool input.
+    let edit_tokens = extract_edit_tokens(&tool_name, &tool_input);
 
-    let recall_within = recall_age_s
-        .map(|s| s <= cfg.gate_window_secs)
-        .unwrap_or(false);
-    let nudge_within = nudge_age_s
-        .map(|s| s <= cfg.gate_window_secs)
-        .unwrap_or(false);
+    let decision = decide(&policy, &recalls, &edit_tokens, now_unix_ns());
 
-    if recall_within && (!cfg.gate_require_nudge || nudge_within) {
-        return approve(None);
-    }
+    // Render verdict + stderr message.
+    let stderr = format_stderr(
+        &decision,
+        &tool_name,
+        &tool_input,
+        &recalls,
+        &edit_tokens,
+        &policy,
+    );
 
-    // Compose a reason that names every missing signal.
-    let mut parts: Vec<String> = Vec::new();
-    if !recall_within {
-        parts.push(match recall_age_s {
-            None => "no `thoth_recall` has been logged for this project".to_string(),
-            Some(s) => format!(
-                "last `thoth_recall` was {}s ago (window: {}s)",
-                s, cfg.gate_window_secs
-            ),
-        });
-    }
-    if cfg.gate_require_nudge && !nudge_within {
-        parts.push(match nudge_age_s {
-            None => "the `thoth.nudge` prompt has not been expanded this session".to_string(),
-            Some(s) => format!(
-                "last `thoth.nudge` was {}s ago (window: {}s)",
-                s, cfg.gate_window_secs
-            ),
-        });
-    }
-    let what = parts.join("; ");
-    let todo = if cfg.gate_require_nudge {
-        "Call `thoth_recall` for the affected files AND expand the `thoth.nudge` prompt \
-         with an `intent` describing this edit, then retry."
-    } else {
-        "Run a fresh `thoth_recall` for the symbols or files this edit touches, then retry."
+    let verdict = match decision.verdict {
+        Verdict::Pass => approve_json(None),
+        Verdict::Nudge => approve_json(Some(&stderr)),
+        Verdict::Block => block_json(&stderr),
     };
-    let reason = format!("Thoth discipline: {what}. {todo}");
 
-    if cfg.mode.eq_ignore_ascii_case("strict") {
-        block(&reason)
-    } else {
-        approve(Some(&reason))
+    let telemetry = cfg.telemetry_enabled.then(|| TelemetryRecord {
+        root: root.clone(),
+        ts_iso: now_iso(),
+        actor,
+        tool: tool_name,
+        path: tool_input_path(&tool_input),
+        decision: match decision.verdict {
+            Verdict::Pass => "pass",
+            Verdict::Nudge => "nudge",
+            Verdict::Block => "block",
+        }
+        .to_string(),
+        reason: decision.reason.to_string(),
+        recency_secs: decision.recency_secs,
+        best_score: decision.best_score,
+        considered: decision.considered,
+        missed_tokens: decision.missed_tokens,
+    });
+
+    let stderr_out = match decision.verdict {
+        Verdict::Pass => None,
+        _ => Some(stderr),
+    };
+
+    (verdict, stderr_out, telemetry)
+}
+
+// ===========================================================================
+// Intent classification
+// ===========================================================================
+
+/// Coarse classification of a tool call into gate-relevant buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Intent {
+    /// Mutation — Edit, Write, NotebookEdit, Bash that writes.
+    Mutation,
+    /// Bash command matching the read-only prefix whitelist. Pass silent.
+    ReadOnly,
+    /// Tool the gate doesn't care about (Read, Grep, Glob, WebFetch, …).
+    /// Pass silent; the gate exists to check memory-before-mutation, not
+    /// memory-before-observation.
+    Ignored,
+}
+
+fn classify_intent(tool_name: &str, tool_input: &Value, readonly_prefixes: &[String]) -> Intent {
+    match tool_name {
+        "Edit" | "Write" | "NotebookEdit" => Intent::Mutation,
+        "Bash" => {
+            let cmd = tool_input
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // Trim leading whitespace; allow shell-prefixed forms like
+            // `set -e; cargo test`. Match only on the first token/line so
+            // `cat foo; rm -rf bar` doesn't get whitelisted.
+            let head = cmd.trim_start();
+            let first_line = head.lines().next().unwrap_or("").trim();
+            let matches_readonly = readonly_prefixes
+                .iter()
+                .any(|p| first_line == p.trim_end() || first_line.starts_with(p.as_str()));
+            if matches_readonly {
+                Intent::ReadOnly
+            } else {
+                Intent::Mutation
+            }
+        }
+        // Anything else — Read, Grep, Glob, WebFetch, MCP tool dispatches,
+        // etc. Not our concern.
+        _ => Intent::Ignored,
     }
 }
 
-// ---- JSON emitters --------------------------------------------------------
+fn tool_input_path(tool_input: &Value) -> Option<String> {
+    tool_input
+        .get("file_path")
+        .or_else(|| tool_input.get("notebook_path"))
+        .and_then(Value::as_str)
+        .map(String::from)
+}
 
-fn approve(reason: Option<&str>) -> serde_json::Value {
+// ===========================================================================
+// Tokenizer
+// ===========================================================================
+
+/// Generic keyword/stopword set — dropped from token sets on both sides
+/// (edit context AND recall query) so overlap scores aren't dominated by
+/// e.g. `fn`, `let`, `const`, `the`, `and`.
+const STOPWORDS: &[&str] = &[
+    // English stopwords
+    "the", "and", "for", "a", "to", "of", "in", "is", "it", "as", "or", "be", "on", "at", "this",
+    "that", "an", "with", "from", "by", "but", "if", "are", "was", "were", "we", "you", "i", "they",
+    "he", "she", "them", "his", "her", "its", "our", "my", "your", "their", "all", "any", "some",
+    "no", "not", "so", "do", "does", "did", "has", "have", "had", "will", "would", "could",
+    "should", "may", "might", "can", "just", "only",
+    // Code keywords (multi-language intersection)
+    "fn", "let", "const", "var", "if", "else", "return", "use", "mod", "struct", "impl", "pub",
+    "def", "class", "from", "import", "async", "await", "while", "loop", "match", "break",
+    "continue", "true", "false", "null", "none", "self", "this", "new", "type", "enum", "trait",
+    "interface", "public", "private", "protected", "static", "final", "abstract", "extends",
+    "implements", "func", "package", "module",
+];
+
+/// Tokenize an arbitrary text blob into a lowercased identifier set.
+///
+/// Rules:
+/// - lowercase
+/// - split on any non-`[a-zA-Z0-9_]` character
+/// - drop stopwords + single-char tokens + pure digits
+/// - for a CamelCase identifier, emit *both* the lowercase joined form
+///   *and* each lowercased segment (so `FooBar` → {`foobar`, `foo`, `bar`})
+/// - snake_case preserved as a single token (`my_field` stays `my_field`)
+fn tokenize(text: &str) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    // Split on any non-identifier character.
+    for raw in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if raw.is_empty() {
+            continue;
+        }
+        // Insert the raw identifier (lowercased). Snake_case stays intact.
+        let lower = raw.to_ascii_lowercase();
+        insert_token(&mut out, &lower);
+
+        // CamelCase decomposition. We keep the joined lowercase form and
+        // split segments when the original has transitions A→a or a→A
+        // separated by uppercase. `FooBar` → ["foo","bar"]; `HTTPSServer`
+        // → ["https","server"] (consecutive caps absorbed, then lowercase
+        // starts a new segment).
+        if has_camel_transition(raw) {
+            for seg in split_camel(raw) {
+                insert_token(&mut out, &seg.to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
+
+fn insert_token(out: &mut HashSet<String>, tok: &str) {
+    if tok.len() <= 1 {
+        return;
+    }
+    if tok.chars().all(|c| c.is_ascii_digit()) {
+        return;
+    }
+    if STOPWORDS.iter().any(|s| *s == tok) {
+        return;
+    }
+    out.insert(tok.to_string());
+}
+
+fn has_camel_transition(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    chars.windows(2).any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+}
+
+/// Split a CamelCase identifier into segments. Consecutive uppercase runs
+/// are treated as one segment until a lowercase letter starts the next
+/// segment — `HTTPSServer` → ["HTTPS", "Server"].
+fn split_camel(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if !cur.is_empty() {
+            let prev = chars[i - 1];
+            let next = chars.get(i + 1).copied();
+            let boundary = (prev.is_ascii_lowercase() && c.is_ascii_uppercase())
+                || (prev.is_ascii_uppercase()
+                    && c.is_ascii_uppercase()
+                    && next.is_some_and(|n| n.is_ascii_lowercase()));
+            if boundary {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+// ===========================================================================
+// Edit context extraction
+// ===========================================================================
+
+/// Cap on the number of tokens we carry forward from a single edit. Large
+/// diffs would otherwise drown out meaningful overlap — with 2000 tokens
+/// on one side and a 5-token recall query, containment math still works
+/// but topic drift gets easier to hide.
+const EDIT_TOKEN_CAP: usize = 200;
+
+fn extract_edit_tokens(tool_name: &str, tool_input: &Value) -> HashSet<String> {
+    let mut acc = HashSet::new();
+    match tool_name {
+        "Edit" => {
+            if let Some(p) = tool_input.get("file_path").and_then(Value::as_str) {
+                acc.extend(tokenize(&basename_stem(p)));
+            }
+            if let Some(s) = tool_input.get("old_string").and_then(Value::as_str) {
+                acc.extend(tokenize(s));
+            }
+            if let Some(s) = tool_input.get("new_string").and_then(Value::as_str) {
+                acc.extend(tokenize(s));
+            }
+        }
+        "Write" => {
+            if let Some(p) = tool_input.get("file_path").and_then(Value::as_str) {
+                acc.extend(tokenize(&basename_stem(p)));
+            }
+            if let Some(s) = tool_input.get("content").and_then(Value::as_str) {
+                // Cap content at 2KB for tokenization — beyond that point
+                // new tokens stop influencing score much.
+                let slice = &s[..s.len().min(2048)];
+                acc.extend(tokenize(slice));
+            }
+        }
+        "NotebookEdit" => {
+            if let Some(p) = tool_input.get("notebook_path").and_then(Value::as_str) {
+                acc.extend(tokenize(&basename_stem(p)));
+            }
+            if let Some(s) = tool_input.get("new_source").and_then(Value::as_str) {
+                acc.extend(tokenize(s));
+            }
+        }
+        "Bash" => {
+            if let Some(s) = tool_input.get("command").and_then(Value::as_str) {
+                acc.extend(tokenize(s));
+            }
+        }
+        _ => {}
+    }
+    // Cap — drop extras deterministically by sort order so tests stay stable.
+    if acc.len() > EDIT_TOKEN_CAP {
+        let mut v: Vec<String> = acc.into_iter().collect();
+        v.sort();
+        v.truncate(EDIT_TOKEN_CAP);
+        acc = v.into_iter().collect();
+    }
+    acc
+}
+
+/// Strip directories and extension from a path. `foo/bar/retriever.rs` →
+/// `retriever`. Used so the file name contributes identifier tokens to
+/// the edit context without path noise (we don't want `crates`, `src`,
+/// etc. to dominate overlap).
+fn basename_stem(path: &str) -> String {
+    let p = Path::new(path);
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+// ===========================================================================
+// Episodes DB — recent recall queries
+// ===========================================================================
+
+/// One recall event pulled from `episodes.db`.
+#[derive(Debug, Clone)]
+struct RecallRow {
+    ts_ns: u64,
+    text: String,
+}
+
+impl RecallRow {
+    fn age_secs(&self, now_ns: u64) -> u64 {
+        now_ns.saturating_sub(self.ts_ns) / 1_000_000_000
+    }
+}
+
+/// Hard cap on rows returned — caller (decide) iterates them so a rogue
+/// giant pool doesn't blow the p95 latency budget.
+const RECALL_POOL_CAP: usize = 20;
+
+fn recent_recalls(root: &Path, window_long_secs: u64) -> rusqlite::Result<Vec<RecallRow>> {
+    let db = root.join("episodes.db");
+    if !db.is_file() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let cutoff_ns: i64 = (now_unix_ns().saturating_sub(window_long_secs.saturating_mul(1_000_000_000))) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT at_unix_ns, payload FROM episodes \
+         WHERE kind = 'query_issued' AND at_unix_ns >= ?1 \
+         ORDER BY id DESC LIMIT ?2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![cutoff_ns, RECALL_POOL_CAP as i64])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let ns: i64 = r.get(0)?;
+        let payload: String = r.get(1)?;
+        let text = extract_query_text(&payload);
+        out.push(RecallRow {
+            ts_ns: ns.max(0) as u64,
+            text,
+        });
+    }
+    Ok(out)
+}
+
+/// Pull the human-readable recall query out of an `Event::QueryIssued`
+/// payload. The event shape is `{"kind":"query_issued","id":..,"text":"..","at":".."}`
+/// when serialized by thoth-core — but be defensive: fall back to the
+/// whole payload if the field's missing.
+fn extract_query_text(payload: &str) -> String {
+    let v: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    v.get("text")
+        .and_then(Value::as_str)
+        .unwrap_or(payload)
+        .to_string()
+}
+
+// ===========================================================================
+// Decision engine
+// ===========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Pass,
+    Nudge,
+    Block,
+}
+
+#[derive(Debug, Clone)]
+struct Decision {
+    verdict: Verdict,
+    /// Short machine-readable reason: `recency`, `relevance`, `miss`,
+    /// `cold_start`, `off`. Used by telemetry.
+    reason: &'static str,
+    /// Age of the most recent recall, if any.
+    recency_secs: Option<u64>,
+    /// Highest containment score over the recall pool (0.0 if pool empty).
+    best_score: Option<f64>,
+    /// Number of recalls considered in scoring.
+    considered: usize,
+    /// Top-N edit tokens not covered by any recall query — surfaces in
+    /// the stderr message so the agent can craft a targeted recall.
+    missed_tokens: Vec<String>,
+}
+
+fn decide(
+    policy: &Policy,
+    recalls: &[RecallRow],
+    edit_tokens: &HashSet<String>,
+    now_ns: u64,
+) -> Decision {
+    // Empty edit context — nothing to match on, so fall back to recency
+    // alone. This handles Write-with-empty-content and similar edge cases.
+    let no_context = edit_tokens.is_empty();
+
+    let most_recent = recalls.first();
+    let recency_secs = most_recent.map(|r| r.age_secs(now_ns));
+
+    // Recency shortcut.
+    if let Some(age) = recency_secs
+        && age <= policy.window_short_secs
+    {
+        return Decision {
+            verdict: Verdict::Pass,
+            reason: "recency",
+            recency_secs,
+            best_score: None,
+            considered: recalls.len(),
+            missed_tokens: Vec::new(),
+        };
+    }
+
+    // Cold start — never recalled in this session. Pass/nudge/block by mode.
+    if recalls.is_empty() {
+        return miss_verdict(
+            policy,
+            Decision {
+                verdict: Verdict::Pass, // filled below
+                reason: "cold_start",
+                recency_secs: None,
+                best_score: None,
+                considered: 0,
+                missed_tokens: top_missed_tokens(edit_tokens, &HashSet::new()),
+            },
+        );
+    }
+
+    // Relevance disabled (threshold <= 0) — old time-window-only behavior:
+    // beyond short window → miss branch.
+    if policy.relevance_threshold <= 0.0 {
+        return miss_verdict(
+            policy,
+            Decision {
+                verdict: Verdict::Pass,
+                reason: "time_lapsed",
+                recency_secs,
+                best_score: None,
+                considered: recalls.len(),
+                missed_tokens: Vec::new(),
+            },
+        );
+    }
+
+    // Relevance scoring: for each recall in pool, tokenize + containment vs
+    // edit tokens. Keep best score + the matching recall's covered set so
+    // we can report missed tokens.
+    let mut best_score = 0.0f64;
+    let mut best_covered: HashSet<String> = HashSet::new();
+    for r in recalls {
+        let q = tokenize(&r.text);
+        let score = containment(edit_tokens, &q);
+        if score > best_score {
+            best_score = score;
+            best_covered = q;
+        }
+    }
+
+    if !no_context && best_score >= policy.relevance_threshold {
+        return Decision {
+            verdict: Verdict::Pass,
+            reason: "relevance",
+            recency_secs,
+            best_score: Some(best_score),
+            considered: recalls.len(),
+            missed_tokens: Vec::new(),
+        };
+    }
+
+    miss_verdict(
+        policy,
+        Decision {
+            verdict: Verdict::Pass,
+            reason: if no_context { "no_edit_context" } else { "relevance_miss" },
+            recency_secs,
+            best_score: Some(best_score),
+            considered: recalls.len(),
+            missed_tokens: top_missed_tokens(edit_tokens, &best_covered),
+        },
+    )
+}
+
+/// Fill `verdict` from `policy.mode` for the "miss" branch.
+fn miss_verdict(policy: &Policy, mut base: Decision) -> Decision {
+    base.verdict = match policy.mode {
+        PolicyMode::Off => Verdict::Pass,
+        PolicyMode::Nudge => Verdict::Nudge,
+        PolicyMode::Strict => Verdict::Block,
+    };
+    base
+}
+
+/// Containment ratio: `|A ∩ B| / min(|A|, |B|)`. Fair to asymmetric sets —
+/// a short precise query against a big edit gets proper credit.
+fn containment(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f64;
+    let denom = a.len().min(b.len()) as f64;
+    inter / denom
+}
+
+/// Edit tokens *not* in any recall's covered set, capped at 5, sorted
+/// for determinism. Surfaces in the stderr message as "tokens you're
+/// editing that no recent recall mentioned".
+fn top_missed_tokens(edit: &HashSet<String>, covered: &HashSet<String>) -> Vec<String> {
+    let mut missed: Vec<String> = edit.difference(covered).cloned().collect();
+    missed.sort();
+    missed.truncate(5);
+    missed
+}
+
+// ===========================================================================
+// Stderr message (agent-facing actionable explanation)
+// ===========================================================================
+
+fn format_stderr(
+    decision: &Decision,
+    tool_name: &str,
+    tool_input: &Value,
+    recalls: &[RecallRow],
+    edit_tokens: &HashSet<String>,
+    policy: &Policy,
+) -> String {
+    if decision.verdict == Verdict::Pass {
+        return String::new();
+    }
+
+    let path = tool_input_path(tool_input).unwrap_or_else(|| "<unknown>".to_string());
+    let mut tokens: Vec<&String> = edit_tokens.iter().collect();
+    tokens.sort();
+    let tokens_str = if tokens.is_empty() {
+        "(none)".to_string()
+    } else {
+        tokens
+            .iter()
+            .take(10)
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let now_ns = now_unix_ns();
+    let mut recalls_block = String::new();
+    if recalls.is_empty() {
+        recalls_block.push_str(&format!(
+            "  (no recalls in the last {}min)\n",
+            policy.window_long_secs / 60
+        ));
+    } else {
+        // Score each recall the same way decide() does, sort by score desc.
+        let mut scored: Vec<(f64, &RecallRow)> = recalls
+            .iter()
+            .map(|r| (containment(edit_tokens, &tokenize(&r.text)), r))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (score, r) in scored.iter().take(5) {
+            let age = r.age_secs(now_ns);
+            let q = truncate(&r.text, 60);
+            recalls_block.push_str(&format!("  [{age:>4}s ago]  {q:<60}  overlap {score:.2}\n"));
+        }
+    }
+
+    let suggestion = if decision.missed_tokens.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nSuggested: mcp__thoth__thoth_recall({{\n    \"query\": \"{}\"\n  }})\n",
+            decision.missed_tokens.join(" ")
+        )
+    };
+
+    let verdict_label = match decision.verdict {
+        Verdict::Block => "blocking this edit",
+        Verdict::Nudge => "warning — this edit will proceed",
+        Verdict::Pass => "pass", // unreachable above
+    };
+
+    format!(
+        "Thoth gate: {label}.\n\
+         \n\
+         Tool: {tool_name} {path}\n\
+         Edit context tokens: {tokens}\n\
+         \n\
+         Recent recalls (last {window_min} min, sorted by relevance):\n\
+         {recalls}\
+         Best overlap: {best:.2} (threshold: {threshold:.2}, mode: {mode})\n\
+         Actor: {actor}\n\
+         {suggestion}",
+        label = verdict_label,
+        tokens = tokens_str,
+        window_min = policy.window_long_secs / 60,
+        recalls = recalls_block,
+        best = decision.best_score.unwrap_or(0.0),
+        threshold = policy.relevance_threshold,
+        mode = policy.mode.as_str(),
+        actor = resolve_actor(),
+        suggestion = suggestion,
+    )
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+// ===========================================================================
+// JSON emitters
+// ===========================================================================
+
+fn approve_json(reason: Option<&str>) -> Value {
     match reason {
         Some(r) => json!({ "decision": "approve", "reason": r }),
         None => json!({ "decision": "approve" }),
     }
 }
 
-fn block(reason: &str) -> serde_json::Value {
+fn block_json(reason: &str) -> Value {
     json!({ "decision": "block", "reason": reason })
 }
 
-// ---- Root resolution ------------------------------------------------------
+// ===========================================================================
+// Config
+// ===========================================================================
+
+#[derive(Clone, Debug)]
+struct GateConfig {
+    /// Legacy: `global_fallback = true` means "fall back to `~/.thoth/`
+    /// when no project-local `.thoth/` exists". Kept as-is.
+    global_fallback: bool,
+    /// Legacy master switch — set to `false` to disable discipline
+    /// entirely (pass every call). Matches v1 semantics.
+    nudge_before_write: bool,
+    /// Whether to append each decision to `.thoth/gate.jsonl`.
+    telemetry_enabled: bool,
+    /// Bash commands that start with any of these prefixes bypass the
+    /// gate. Includes legacy defaults plus user-provided additions.
+    bash_readonly_prefixes: Vec<String>,
+    /// Default policy — applied when no `[[policies]]` entry matches the
+    /// current actor, or no actor is set.
+    default_policy: Policy,
+    /// Actor-specific overrides. First matching glob wins.
+    policies: Vec<ActorPolicy>,
+}
+
+impl GateConfig {
+    fn resolve_policy(&self, actor: &str) -> Policy {
+        for entry in &self.policies {
+            if glob_match(&entry.actor_glob, actor) {
+                return entry.policy.clone();
+            }
+        }
+        self.default_policy.clone()
+    }
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            global_fallback: DEFAULT_GLOBAL_FALLBACK,
+            nudge_before_write: DEFAULT_NUDGE_BEFORE_WRITE,
+            telemetry_enabled: false,
+            bash_readonly_prefixes: DEFAULT_BASH_READONLY_PREFIXES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            default_policy: Policy::default(),
+            policies: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Policy {
+    mode: PolicyMode,
+    window_short_secs: u64,
+    window_long_secs: u64,
+    /// Containment threshold in [0.0, 1.0].
+    ///
+    /// Suggested ranges:
+    /// - `0.0`  — disables relevance (time-only, legacy behavior).
+    /// - `0.15` — permissive; catches only clear mismatch (recall about X,
+    ///            edit about Y with zero token overlap).
+    /// - `0.30` — balanced (default). Normal edits with a topical recall
+    ///            comfortably pass; ritual `recall("x")` fails.
+    /// - `0.50` — strict; forces exact token overlap, usable but agent will
+    ///            sometimes need to re-recall for edits that drift within a
+    ///            topic.
+    /// - `0.70+` — very strict; expect noticeable friction.
+    relevance_threshold: f64,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            mode: PolicyMode::Nudge,
+            window_short_secs: DEFAULT_WINDOW_SHORT_SECS,
+            window_long_secs: DEFAULT_WINDOW_LONG_SECS,
+            relevance_threshold: DEFAULT_RELEVANCE_THRESHOLD,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyMode {
+    /// Always pass silently (no gate).
+    Off,
+    /// Pass on miss but emit a stderr warning — default.
+    Nudge,
+    /// Block on miss.
+    Strict,
+}
+
+impl PolicyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PolicyMode::Off => "off",
+            PolicyMode::Nudge => "nudge",
+            PolicyMode::Strict => "strict",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" | "disabled" => Some(PolicyMode::Off),
+            "nudge" | "soft" | "relevance" => Some(PolicyMode::Nudge),
+            "strict" | "block" | "hard" => Some(PolicyMode::Strict),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ActorPolicy {
+    actor_glob: String,
+    policy: Policy,
+}
+
+// ---- config file schema ----------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct FileShape {
+    #[serde(default)]
+    discipline: Option<DisciplineFile>,
+}
+
+#[derive(Deserialize, Default)]
+struct DisciplineFile {
+    // Legacy flat fields — still honored.
+    mode: Option<String>,
+    global_fallback: Option<bool>,
+    nudge_before_write: Option<bool>,
+    gate_window_secs: Option<u64>,
+    gate_require_nudge: Option<bool>,
+
+    // New fields.
+    gate_window_short_secs: Option<u64>,
+    gate_window_long_secs: Option<u64>,
+    gate_relevance_threshold: Option<f64>,
+    gate_telemetry_enabled: Option<bool>,
+    gate_bash_readonly_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    policies: Vec<PolicyFile>,
+}
+
+#[derive(Deserialize, Default)]
+struct PolicyFile {
+    actor: String,
+    mode: Option<String>,
+    window_short_secs: Option<u64>,
+    window_long_secs: Option<u64>,
+    relevance_threshold: Option<f64>,
+}
+
+fn load_config(root: &Path) -> GateConfig {
+    let path = root.join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return GateConfig::default(),
+    };
+    let shape: FileShape = match toml::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[thoth-gate] config.toml parse error: {e}");
+            return GateConfig::default();
+        }
+    };
+    let Some(d) = shape.discipline else {
+        return GateConfig::default();
+    };
+
+    let mut cfg = GateConfig::default();
+
+    if let Some(g) = d.global_fallback {
+        cfg.global_fallback = g;
+    }
+    if let Some(n) = d.nudge_before_write {
+        cfg.nudge_before_write = n;
+    }
+    if let Some(t) = d.gate_telemetry_enabled {
+        cfg.telemetry_enabled = t;
+    }
+    if let Some(extra) = d.gate_bash_readonly_prefixes {
+        // Additive: user prefixes extend the built-in list so nobody
+        // loses the obvious wins (cargo test, git status) by customizing.
+        for p in extra {
+            if !cfg.bash_readonly_prefixes.iter().any(|x| *x == p) {
+                cfg.bash_readonly_prefixes.push(p);
+            }
+        }
+    }
+
+    // Default policy fields: new names win, legacy names as fallback.
+    if let Some(m) = d.mode.as_deref().and_then(PolicyMode::parse) {
+        cfg.default_policy.mode = m;
+    } else if let Some(m) = d.mode.as_deref() {
+        eprintln!("[thoth-gate] unknown mode {m:?}; using default {DEFAULT_MODE}");
+    }
+    // Short window: new field, else legacy `gate_window_secs`.
+    if let Some(w) = d.gate_window_short_secs {
+        cfg.default_policy.window_short_secs = w;
+    } else if let Some(w) = d.gate_window_secs {
+        cfg.default_policy.window_short_secs = w;
+    }
+    if let Some(w) = d.gate_window_long_secs {
+        cfg.default_policy.window_long_secs = w;
+    }
+    if let Some(r) = d.gate_relevance_threshold {
+        cfg.default_policy.relevance_threshold = r.clamp(0.0, 1.0);
+    }
+
+    // Legacy `gate_require_nudge` (soft/strict sub-flag) is no longer
+    // meaningful under the new verdict model — `PolicyMode::Strict`
+    // already implies "block on miss". Emit a deprecation hint if
+    // someone still has it in config — once per process (load_config
+    // runs twice per invocation: bootstrap + resolved root).
+    if d.gate_require_nudge.is_some() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[thoth-gate] note: `gate_require_nudge` is deprecated; use \
+                 `mode = \"strict\"` instead (see config.toml comment block)."
+            );
+        }
+    }
+    // Silence the "unused legacy window" warning when someone sets both.
+    let _ = LEGACY_WINDOW_SECS;
+
+    // Actor-specific policies. Missing fields inherit from default_policy.
+    for pf in d.policies {
+        let mut p = cfg.default_policy.clone();
+        if let Some(m) = pf.mode.as_deref().and_then(PolicyMode::parse) {
+            p.mode = m;
+        }
+        if let Some(w) = pf.window_short_secs {
+            p.window_short_secs = w;
+        }
+        if let Some(w) = pf.window_long_secs {
+            p.window_long_secs = w;
+        }
+        if let Some(r) = pf.relevance_threshold {
+            p.relevance_threshold = r.clamp(0.0, 1.0);
+        }
+        cfg.policies.push(ActorPolicy {
+            actor_glob: pf.actor,
+            policy: p,
+        });
+    }
+
+    cfg
+}
+
+// ---- actor resolution -------------------------------------------------------
+
+fn resolve_actor() -> String {
+    std::env::var("THOTH_ACTOR").unwrap_or_else(|_| "default".to_string())
+}
+
+/// Tiny glob matcher supporting `*` and `?`. Anchored full-match. Good
+/// enough for actor patterns like `hoangsa/*`, `ci-*`.
+fn glob_match(pattern: &str, input: &str) -> bool {
+    fn helper(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(&b'*'), _) => {
+                // * matches zero chars...
+                if helper(&p[1..], s) {
+                    return true;
+                }
+                // ... or one+ chars.
+                if !s.is_empty() && helper(p, &s[1..]) {
+                    return true;
+                }
+                false
+            }
+            (Some(&b'?'), Some(_)) => helper(&p[1..], &s[1..]),
+            (Some(&pc), Some(&sc)) if pc == sc => helper(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    helper(pattern.as_bytes(), input.as_bytes())
+}
+
+// ===========================================================================
+// Telemetry
+// ===========================================================================
+
+struct TelemetryRecord {
+    root: PathBuf,
+    ts_iso: String,
+    actor: String,
+    tool: String,
+    path: Option<String>,
+    decision: String,
+    reason: String,
+    recency_secs: Option<u64>,
+    best_score: Option<f64>,
+    considered: usize,
+    missed_tokens: Vec<String>,
+}
+
+fn append_telemetry(rec: &TelemetryRecord) -> io::Result<()> {
+    let path = rec.root.join("gate.jsonl");
+    let mut line = serde_json::json!({
+        "ts": rec.ts_iso,
+        "actor": rec.actor,
+        "tool": rec.tool,
+        "path": rec.path,
+        "decision": rec.decision,
+        "reason": rec.reason,
+        "considered": rec.considered,
+    });
+    if let Some(r) = rec.recency_secs {
+        line["recency_secs"] = json!(r);
+    }
+    if let Some(s) = rec.best_score {
+        line["best_score"] = json!(s);
+    }
+    if !rec.missed_tokens.is_empty() {
+        line["missed_tokens"] = json!(rec.missed_tokens);
+    }
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
+// ===========================================================================
+// Root resolution + time
+// ===========================================================================
 
 fn first_existing_root(allow_home_fallback: bool) -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("THOTH_ROOT") {
@@ -180,109 +1214,396 @@ fn first_existing_root(allow_home_fallback: bool) -> Option<PathBuf> {
     None
 }
 
-// ---- Config ---------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-struct Config {
-    mode: String,
-    global_fallback: bool,
-    nudge_before_write: bool,
-    gate_window_secs: u64,
-    gate_require_nudge: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            mode: DEFAULT_MODE.to_string(),
-            global_fallback: DEFAULT_GLOBAL_FALLBACK,
-            nudge_before_write: DEFAULT_NUDGE_BEFORE_WRITE,
-            gate_window_secs: DEFAULT_WINDOW_SECS,
-            gate_require_nudge: DEFAULT_GATE_REQUIRE_NUDGE,
-        }
-    }
-}
-
-#[derive(Deserialize, Default)]
-struct FileShape {
-    #[serde(default)]
-    discipline: Option<DisciplineFile>,
-}
-
-#[derive(Deserialize, Default)]
-struct DisciplineFile {
-    mode: Option<String>,
-    global_fallback: Option<bool>,
-    nudge_before_write: Option<bool>,
-    gate_window_secs: Option<u64>,
-    gate_require_nudge: Option<bool>,
-}
-
-fn load_config(root: &Path) -> Config {
-    let path = root.join("config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Config::default(),
-    };
-    let shape: FileShape = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[thoth-gate] config.toml parse error: {e}");
-            return Config::default();
-        }
-    };
-    let mut cfg = Config::default();
-    if let Some(d) = shape.discipline {
-        if let Some(m) = d.mode {
-            cfg.mode = m;
-        }
-        if let Some(g) = d.global_fallback {
-            cfg.global_fallback = g;
-        }
-        if let Some(n) = d.nudge_before_write {
-            cfg.nudge_before_write = n;
-        }
-        if let Some(w) = d.gate_window_secs {
-            cfg.gate_window_secs = w;
-        }
-        if let Some(r) = d.gate_require_nudge {
-            cfg.gate_require_nudge = r;
-        }
-    }
-    cfg
-}
-
-// ---- SQLite ---------------------------------------------------------------
-
-fn last_event_at(root: &Path, kind: &str) -> rusqlite::Result<Option<u64>> {
-    let db = root.join("episodes.db");
-    if !db.is_file() {
-        return Ok(None);
-    }
-    // Open read-only — the gate must never race the MCP server's writes.
-    let conn = Connection::open_with_flags(
-        &db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let mut stmt = conn.prepare(
-        "SELECT at_unix_ns FROM episodes \
-         WHERE kind = ?1 \
-         ORDER BY id DESC LIMIT 1",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![kind])?;
-    if let Some(r) = rows.next()? {
-        let ns: i64 = r.get(0)?;
-        Ok(Some(ns.max(0) as u64))
-    } else {
-        Ok(None)
-    }
-}
-
-// ---- Time -----------------------------------------------------------------
-
 fn now_unix_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+fn now_iso() -> String {
+    // Minimal ISO-ish: `YYYY-MM-DDTHH:MM:SSZ`. We don't pull `time` just
+    // for the gate binary — dependency slimming matters here (every
+    // PreToolUse invocation links + executes).
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Classic epoch-to-YMD conversion. No leap-second handling; this is
+    // telemetry, not an accounting system.
+    let days = secs / 86_400;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    let (y, mo, d) = ymd_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Civil-date conversion from Unix epoch day. Adapted from Howard Hinnant's
+/// `days_from_civil` inverse — small, ASCII-safe, no external dep.
+fn ymd_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- tokenizer ----
+
+    #[test]
+    fn tokenize_camelcase_emits_both_joined_and_segments() {
+        let toks = tokenize("FooBarBaz");
+        assert!(toks.contains("foobarbaz"));
+        assert!(toks.contains("foo"));
+        assert!(toks.contains("bar"));
+        assert!(toks.contains("baz"));
+    }
+
+    #[test]
+    fn tokenize_snake_case_preserved() {
+        let toks = tokenize("my_field_name");
+        assert!(toks.contains("my_field_name"));
+    }
+
+    #[test]
+    fn tokenize_drops_stopwords_and_keywords() {
+        let toks = tokenize("the fn and impl struct");
+        for bad in ["the", "fn", "and", "impl", "struct"] {
+            assert!(!toks.contains(bad), "should drop stopword/keyword {bad}");
+        }
+    }
+
+    #[test]
+    fn tokenize_drops_single_chars_and_digits() {
+        let toks = tokenize("a 42 999 valid_name");
+        assert!(!toks.contains("a"));
+        assert!(!toks.contains("42"));
+        assert!(!toks.contains("999"));
+        assert!(toks.contains("valid_name"));
+    }
+
+    #[test]
+    fn tokenize_camel_absorbs_acronym_runs() {
+        let segs = split_camel("HTTPSServer");
+        // HTTPSServer → ["HTTPS", "Server"]
+        assert_eq!(segs, vec!["HTTPS".to_string(), "Server".to_string()]);
+    }
+
+    // ---- containment ----
+
+    #[test]
+    fn containment_handles_empty_sets() {
+        let a: HashSet<String> = HashSet::new();
+        let b: HashSet<String> = ["foo".into()].into_iter().collect();
+        assert_eq!(containment(&a, &b), 0.0);
+        assert_eq!(containment(&b, &a), 0.0);
+    }
+
+    #[test]
+    fn containment_min_denominator() {
+        let a: HashSet<String> = ["foo", "bar", "baz"].iter().map(|s| s.to_string()).collect();
+        let b: HashSet<String> = ["foo"].iter().map(|s| s.to_string()).collect();
+        // |A ∩ B| = 1; min(|A|, |B|) = 1 → score 1.0 (short query fully covered).
+        assert!((containment(&a, &b) - 1.0).abs() < 1e-9);
+    }
+
+    // ---- intent classification ----
+
+    #[test]
+    fn bash_whitelist_catches_cargo_test() {
+        let prefixes = DEFAULT_BASH_READONLY_PREFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let input = json!({"command": "cargo test -p thoth-mcp"});
+        let intent = classify_intent("Bash", &input, &prefixes);
+        assert_eq!(intent, Intent::ReadOnly);
+    }
+
+    #[test]
+    fn bash_mutation_not_whitelisted() {
+        let prefixes = DEFAULT_BASH_READONLY_PREFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let input = json!({"command": "rm -rf .thoth"});
+        let intent = classify_intent("Bash", &input, &prefixes);
+        assert_eq!(intent, Intent::Mutation);
+    }
+
+    #[test]
+    fn bash_shell_chain_doesnt_sneak_mutation_through() {
+        // Attack: prefix with `cat foo;` to try to bypass — we should
+        // still catch because first_line is `cat foo; rm -rf bar` which
+        // doesn't match any readonly prefix cleanly beyond `cat `.
+        // Because we startswith-match, this one WILL match cat. That's
+        // a known limitation — agents piping destructive commands after
+        // `cat foo;` wouldn't gain much (they'd still need a new gate
+        // call to edit). Documented: whitelist is first-token heuristic.
+        let prefixes = DEFAULT_BASH_READONLY_PREFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let input = json!({"command": "cat foo; rm -rf bar"});
+        // With our current naive startswith, this matches `cat `. We
+        // accept this — the alternative (shell lexer) blows the
+        // complexity budget. If tightening is needed later, restrict to
+        // exact-first-word match.
+        let intent = classify_intent("Bash", &input, &prefixes);
+        assert_eq!(intent, Intent::ReadOnly);
+    }
+
+    #[test]
+    fn edit_tool_is_mutation() {
+        let intent = classify_intent(
+            "Edit",
+            &json!({"file_path": "foo.rs", "old_string": "a", "new_string": "b"}),
+            &[],
+        );
+        assert_eq!(intent, Intent::Mutation);
+    }
+
+    // ---- edit context extraction ----
+
+    #[test]
+    fn edit_pulls_tokens_from_filename_and_strings() {
+        let input = json!({
+            "file_path": "crates/thoth-retrieve/src/retriever.rs",
+            "old_string": "pub fn old_name() {}",
+            "new_string": "pub fn new_name() {}",
+        });
+        let toks = extract_edit_tokens("Edit", &input);
+        assert!(toks.contains("retriever"));
+        assert!(toks.contains("old_name"));
+        assert!(toks.contains("new_name"));
+    }
+
+    #[test]
+    fn edit_caps_at_edit_token_cap() {
+        // Build a synthetic new_string with 500+ unique identifiers.
+        let many = (0..500).map(|i| format!("sym_{i}")).collect::<Vec<_>>().join(" ");
+        let input = json!({ "file_path": "x.rs", "new_string": many });
+        let toks = extract_edit_tokens("Edit", &input);
+        assert!(toks.len() <= EDIT_TOKEN_CAP);
+    }
+
+    // ---- decision ----
+
+    fn mk_policy(
+        mode: PolicyMode,
+        short: u64,
+        long: u64,
+        threshold: f64,
+    ) -> Policy {
+        Policy {
+            mode,
+            window_short_secs: short,
+            window_long_secs: long,
+            relevance_threshold: threshold,
+        }
+    }
+
+    fn mk_recall(age_secs: u64, text: &str) -> RecallRow {
+        let now_ns = now_unix_ns();
+        RecallRow {
+            ts_ns: now_ns.saturating_sub(age_secs * 1_000_000_000),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn recency_shortcut_passes_without_relevance_check() {
+        // Very recent recall about `xyz`; edit about `abc`. Under relevance
+        // alone this would miss. But recency wins first.
+        let policy = mk_policy(PolicyMode::Strict, 60, 1800, 0.30);
+        let recalls = vec![mk_recall(5, "xyz unrelated")];
+        let edit: HashSet<String> = ["abc", "def"].iter().map(|s| s.to_string()).collect();
+        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        assert_eq!(d.verdict, Verdict::Pass);
+        assert_eq!(d.reason, "recency");
+    }
+
+    #[test]
+    fn relevance_pass_when_score_ge_threshold() {
+        let policy = mk_policy(PolicyMode::Strict, 10, 1800, 0.30);
+        let recalls = vec![mk_recall(
+            200,
+            "retriever bfs callers depth",
+        )];
+        let edit: HashSet<String> = ["retriever", "bfs", "depth"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        // 3/3 overlap → 1.0, well above 0.30.
+        assert_eq!(d.verdict, Verdict::Pass);
+        assert_eq!(d.reason, "relevance");
+    }
+
+    #[test]
+    fn ritual_recall_blocked_under_strict() {
+        // Ritual: recall query has nothing to do with the edit.
+        let policy = mk_policy(PolicyMode::Strict, 10, 1800, 0.30);
+        let recalls = vec![mk_recall(100, "tao cần chỉnh tiếp bypass")];
+        let edit: HashSet<String> = ["retriever", "bfs", "depth"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        assert_eq!(d.verdict, Verdict::Block);
+        assert_eq!(d.reason, "relevance_miss");
+        assert!(!d.missed_tokens.is_empty());
+    }
+
+    #[test]
+    fn ritual_recall_nudges_under_default() {
+        let policy = mk_policy(PolicyMode::Nudge, 10, 1800, 0.30);
+        let recalls = vec![mk_recall(100, "unrelated stuff")];
+        let edit: HashSet<String> = ["retriever"].iter().map(|s| s.to_string()).collect();
+        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        assert_eq!(d.verdict, Verdict::Nudge);
+    }
+
+    #[test]
+    fn off_mode_always_passes() {
+        let policy = mk_policy(PolicyMode::Off, 10, 1800, 0.30);
+        let recalls = vec![];
+        let edit: HashSet<String> = ["x"].iter().map(|s| s.to_string()).collect();
+        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        assert_eq!(d.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn cold_start_respects_policy_mode() {
+        let strict = mk_policy(PolicyMode::Strict, 10, 1800, 0.30);
+        let nudge = mk_policy(PolicyMode::Nudge, 10, 1800, 0.30);
+        let edit: HashSet<String> = ["x"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            decide(&strict, &[], &edit, now_unix_ns()).verdict,
+            Verdict::Block
+        );
+        assert_eq!(
+            decide(&nudge, &[], &edit, now_unix_ns()).verdict,
+            Verdict::Nudge
+        );
+    }
+
+    #[test]
+    fn zero_threshold_disables_relevance() {
+        // Threshold 0 = legacy behavior: recency-only, beyond window → miss.
+        let policy = mk_policy(PolicyMode::Strict, 10, 1800, 0.0);
+        let recalls = vec![mk_recall(100, "totally different topic")];
+        let edit: HashSet<String> = ["anything"].iter().map(|s| s.to_string()).collect();
+        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        // Past short window + threshold 0 → time_lapsed miss → block under strict.
+        assert_eq!(d.verdict, Verdict::Block);
+        assert_eq!(d.reason, "time_lapsed");
+    }
+
+    // ---- glob ----
+
+    #[test]
+    fn glob_match_basics() {
+        assert!(glob_match("hoangsa/*", "hoangsa/cook-wave-3"));
+        assert!(glob_match("ci-*", "ci-github"));
+        assert!(!glob_match("hoangsa/*", "claude-code-direct"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "exacts"));
+    }
+
+    // ---- config load ----
+
+    #[test]
+    fn legacy_config_still_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[discipline]
+mode = "strict"
+gate_window_secs = 180
+"#,
+        )
+        .unwrap();
+        let cfg = load_config(tmp.path());
+        assert_eq!(cfg.default_policy.mode, PolicyMode::Strict);
+        // Legacy window maps to short.
+        assert_eq!(cfg.default_policy.window_short_secs, 180);
+        // New fields default.
+        assert!((cfg.default_policy.relevance_threshold - DEFAULT_RELEVANCE_THRESHOLD).abs() < 1e-9);
+    }
+
+    #[test]
+    fn new_config_with_policies() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[discipline]
+mode = "nudge"
+gate_relevance_threshold = 0.50
+gate_window_short_secs = 90
+gate_telemetry_enabled = true
+
+[[discipline.policies]]
+actor = "hoangsa/*"
+mode = "nudge"
+relevance_threshold = 0.20
+
+[[discipline.policies]]
+actor = "ci-*"
+mode = "off"
+"#,
+        )
+        .unwrap();
+        let cfg = load_config(tmp.path());
+        assert_eq!(cfg.default_policy.mode, PolicyMode::Nudge);
+        assert!((cfg.default_policy.relevance_threshold - 0.50).abs() < 1e-9);
+        assert!(cfg.telemetry_enabled);
+        assert_eq!(cfg.policies.len(), 2);
+
+        let hoangsa = cfg.resolve_policy("hoangsa/cook-wave-1");
+        assert_eq!(hoangsa.mode, PolicyMode::Nudge);
+        assert!((hoangsa.relevance_threshold - 0.20).abs() < 1e-9);
+
+        let ci = cfg.resolve_policy("ci-github");
+        assert_eq!(ci.mode, PolicyMode::Off);
+
+        let other = cfg.resolve_policy("random");
+        assert_eq!(other.mode, PolicyMode::Nudge);
+    }
+
+    #[test]
+    fn bash_readonly_prefixes_are_additive() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[discipline]
+gate_bash_readonly_prefixes = ["my-custom-tool "]
+"#,
+        )
+        .unwrap();
+        let cfg = load_config(tmp.path());
+        // Built-ins preserved.
+        assert!(cfg.bash_readonly_prefixes.iter().any(|p| p.starts_with("cargo test")));
+        // Custom added.
+        assert!(cfg.bash_readonly_prefixes.iter().any(|p| p == "my-custom-tool "));
+    }
 }

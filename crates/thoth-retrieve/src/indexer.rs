@@ -406,10 +406,35 @@ impl Indexer {
             self.write_symbol(sym).await?;
             s.symbols += 1;
         }
-        self.write_call_edges(&table, path).await?;
+        // Build the file-local resolution map. Two ingredients, in
+        // priority order:
+        //   1. Import aliases (`use foo::Bar as Baz`) — the local name
+        //      the source will use maps to the fully qualified target.
+        //   2. Symbols declared in this file — for every call to a
+        //      same-file function (`foo()` inside module `m`) we want
+        //      the edge to land on `m::foo` instead of the bare leaf,
+        //      so BFS over `Calls` actually connects.
+        // #2 fills in gaps #1 misses. When both produce a binding we
+        // prefer the alias (explicit > implicit).
+        let mut resolution: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for sym in &table.symbols {
+            if let Some(leaf) = sym.fqn.rsplit("::").next() {
+                resolution
+                    .entry(leaf.to_string())
+                    .or_insert_with(|| sym.fqn.clone());
+            }
+        }
+        for (local, target) in &table.aliases {
+            resolution.insert(local.clone(), target.clone());
+        }
+        self.write_call_edges(&table, &resolution).await?;
         s.calls += table.calls.len();
-        self.write_import_edges(&table, path).await?;
+        let alias_only: std::collections::HashMap<String, String> =
+            table.aliases.iter().cloned().collect();
+        self.write_import_edges(&table, path, &alias_only).await?;
         s.imports += table.imports.len();
+        self.write_extends_edges(&table, &resolution).await?;
 
         // Record the new content hash *after* all the writes succeeded — if
         // we crash mid-write, next run will see a hash miss and retry.
@@ -483,12 +508,22 @@ impl Indexer {
             .await
     }
 
-    async fn write_call_edges(&self, table: &SymbolTable, _path: &Path) -> Result<()> {
+    async fn write_call_edges(
+        &self,
+        table: &SymbolTable,
+        aliases: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
         for (caller, callee) in &table.calls {
+            // Callee names come out of the parser as a bare leaf
+            // identifier (`foo()` → `"foo"`; `x.bar()` → `"bar"`). If
+            // the file's import-alias map has a binding for that name
+            // we route the edge to the resolved FQN so cross-module
+            // call chains connect through the graph.
+            let resolved = aliases.get(callee).cloned().unwrap_or_else(|| callee.clone());
             self.graph
                 .upsert_edge(Edge {
                     from: caller.clone(),
-                    to: callee.clone(),
+                    to: resolved,
                     kind: EdgeKind::Calls,
                 })
                 .await?;
@@ -496,8 +531,38 @@ impl Indexer {
         Ok(())
     }
 
-    async fn write_import_edges(&self, table: &SymbolTable, path: &Path) -> Result<()> {
+    async fn write_import_edges(
+        &self,
+        table: &SymbolTable,
+        path: &Path,
+        aliases: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
         let module = module_fqn(path);
+
+        // Prefer parsed aliases — each one is a real (local_name,
+        // resolved_target) pair, so writing an Imports edge to the
+        // resolved side gives a clean module→symbol graph without
+        // dragging raw statement text like "use std::sync::Arc;" into
+        // the graph.
+        if !aliases.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for target in aliases.values() {
+                if seen.insert(target.clone()) {
+                    self.graph
+                        .upsert_edge(Edge {
+                            from: module.clone(),
+                            to: target.clone(),
+                            kind: EdgeKind::Imports,
+                        })
+                        .await?;
+                }
+            }
+            return Ok(());
+        }
+
+        // Fallback: no alias info (unsupported language, malformed
+        // source). Store the raw statement text so the graph at least
+        // remembers *something* about the file's dependencies.
         for imp in &table.imports {
             let target = imp.trim().to_string();
             if target.is_empty() {
@@ -508,6 +573,34 @@ impl Indexer {
                     from: module.clone(),
                     to: target,
                     kind: EdgeKind::Imports,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn write_extends_edges(
+        &self,
+        table: &SymbolTable,
+        aliases: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        for (child, parent) in &table.extends {
+            // Parent name is whatever the source wrote: a bare name, a
+            // local alias, or a qualified path. Run it through the
+            // alias map first (so `class X extends Foo` after
+            // `import { Foo } from 'lib'` routes to `lib::Foo`); fall
+            // back to the raw text otherwise. Unknown parents still
+            // show up in the graph — downstream readers can tell they
+            // are unresolved because `Graph::get(&to)` returns None.
+            let resolved = aliases.get(parent).cloned().unwrap_or_else(|| parent.clone());
+            if resolved.is_empty() {
+                continue;
+            }
+            self.graph
+                .upsert_edge(Edge {
+                    from: child.clone(),
+                    to: resolved,
+                    kind: EdgeKind::Extends,
                 })
                 .await?;
         }
@@ -532,12 +625,20 @@ fn symbol_kind_tag(k: SymbolKind) -> &'static str {
     }
 }
 
+/// Bump whenever the indexer's output schema changes (new edge kinds,
+/// new alias-resolution rules, renamed FQN scheme, ...). The version
+/// baked into the hash meta key invalidates every previously-stored
+/// hash sentinel in one go, so the next indexer run re-parses every
+/// file even when its bytes haven't changed.
+const PARSER_SCHEMA_VERSION: u32 = 2;
+
 /// Meta key under which we store the blake3 hash of the last-indexed bytes
 /// of `path`. Kept private to the indexer — callers shouldn't need to read
-/// it. The `hash:` prefix leaves room for future per-path sentinels (e.g.
-/// `mtime:`) without colliding.
+/// it. The `hashVER:` prefix carries both the schema version (so a parser
+/// upgrade invalidates every sentinel at once) and leaves room for future
+/// per-path sentinels (e.g. `mtime:`) without colliding.
 fn hash_meta_key(path: &Path) -> String {
-    format!("hash:{}", path.display())
+    format!("hash{PARSER_SCHEMA_VERSION}:{}", path.display())
 }
 
 fn module_fqn(path: &Path) -> String {

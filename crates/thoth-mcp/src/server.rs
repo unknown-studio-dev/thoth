@@ -44,6 +44,7 @@ pub(crate) struct Inner {
     store: StoreRoot,
     indexer: Indexer,
     retriever: Retriever,
+    graph: thoth_graph::Graph,
 }
 
 impl Server {
@@ -53,12 +54,14 @@ impl Server {
         let store = StoreRoot::open(&root).await?;
         let indexer = Indexer::new(store.clone(), LanguageRegistry::new());
         let retriever = Retriever::new(store.clone());
+        let graph = thoth_graph::Graph::new(store.kv.clone());
         Ok(Self {
             inner: Arc::new(Inner {
                 root,
                 store,
                 indexer,
                 retriever,
+                graph,
             }),
         })
     }
@@ -180,6 +183,9 @@ impl Server {
             "thoth_memory_history" => self.tool_memory_history(arguments).await,
             "thoth_request_review" => self.tool_request_review(arguments).await,
             "thoth_skill_propose" => self.tool_skill_propose(arguments).await,
+            "thoth_impact" => self.tool_impact(arguments).await,
+            "thoth_symbol_context" => self.tool_symbol_context(arguments).await,
+            "thoth_detect_changes" => self.tool_detect_changes(arguments).await,
             other => {
                 return Err(RpcError::new(
                     error_codes::METHOD_NOT_FOUND,
@@ -254,8 +260,26 @@ impl Server {
             query: String,
             #[serde(default)]
             top_k: Option<usize>,
+            /// Whether to persist this recall as a `QueryIssued` event.
+            ///
+            /// Default `true` — agent-initiated recalls (MCP tool calls from
+            /// Claude) must log, because that's the signal `thoth-gate` keys
+            /// off to prove the agent consulted memory before mutating.
+            ///
+            /// The `UserPromptSubmit` hook passes `false`: its recall is
+            /// context injection, not deliberate memory consultation.
+            /// Letting the hook's ceremonial recall satisfy the gate would
+            /// make the discipline vacuous — every prompt would pre-approve
+            /// every subsequent Write/Edit/Bash regardless of whether the
+            /// agent actually looked at the chunks.
+            #[serde(default)]
+            log_event: Option<bool>,
         }
-        let Args { query, top_k } = serde_json::from_value(args)?;
+        let Args {
+            query,
+            top_k,
+            log_event,
+        } = serde_json::from_value(args)?;
         let q = Query {
             text: query.clone(),
             top_k: top_k.unwrap_or(8).max(1),
@@ -267,13 +291,15 @@ impl Server {
         // agent actually consulted memory before mutating files. Failure
         // here is non-fatal — recall still returns the chunks — but we warn
         // because a missing log entry will defeat the gate.
-        let ev = Event::QueryIssued {
-            id: Uuid::new_v4(),
-            text: query,
-            at: OffsetDateTime::now_utc(),
-        };
-        if let Err(e) = self.inner.store.episodes.append(&ev).await {
-            warn!(error = %e, "failed to log QueryIssued event");
+        if log_event.unwrap_or(true) {
+            let ev = Event::QueryIssued {
+                id: Uuid::new_v4(),
+                text: query,
+                at: OffsetDateTime::now_utc(),
+            };
+            if let Err(e) = self.inner.store.episodes.append(&ev).await {
+                warn!(error = %e, "failed to log QueryIssued event");
+            }
         }
 
         let text = render_retrieval(&out);
@@ -953,6 +979,479 @@ impl Server {
         serde_json::to_value(result)
             .map_err(|e| RpcError::new(error_codes::INTERNAL_ERROR, e.to_string()))
     }
+
+    // ---- graph tools -----------------------------------------------------
+
+    /// Blast-radius analysis: BFS from an FQN, grouped by distance.
+    ///
+    /// With `direction = "up"` this answers "what breaks if I change X?";
+    /// `"down"` answers "what does X depend on?"; `"both"` is the union.
+    /// The edge kinds followed depend on direction — see
+    /// [`thoth_graph::Graph::impact`].
+    async fn tool_impact(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            fqn: String,
+            #[serde(default)]
+            direction: Option<String>,
+            #[serde(default)]
+            depth: Option<usize>,
+        }
+        let Args {
+            fqn,
+            direction,
+            depth,
+        } = serde_json::from_value(args)?;
+        let depth = depth.unwrap_or(3).clamp(1, 8);
+        let dir = match direction.as_deref().unwrap_or("up") {
+            "up" | "callers" | "incoming" => thoth_graph::BlastDir::Up,
+            "down" | "callees" | "outgoing" => thoth_graph::BlastDir::Down,
+            "both" => thoth_graph::BlastDir::Both,
+            other => anyhow::bail!(
+                "invalid direction {other:?}; expected one of: up | down | both"
+            ),
+        };
+
+        // Confirm the symbol exists so the caller gets a clear error
+        // instead of an empty result on typos.
+        if self.inner.graph.get(&fqn).await?.is_none() {
+            let text = format!(
+                "symbol not found: {fqn}\n(try `thoth_recall` first to look up the \
+                 correct FQN — graph keys are module::name)"
+            );
+            return Ok(ToolOutput::error(text));
+        }
+
+        let hits = self.inner.graph.impact(&fqn, dir, depth).await?;
+
+        // Group by depth for a stable, readable rendering. `BTreeMap`
+        // keeps the keys in ascending order without an extra sort.
+        let mut by_depth: std::collections::BTreeMap<usize, Vec<&thoth_graph::Node>> =
+            std::collections::BTreeMap::new();
+        for (node, d) in &hits {
+            by_depth.entry(*d).or_default().push(node);
+        }
+
+        let mut text = format!(
+            "impact({fqn}, direction={}, depth={depth}) — {} nodes\n",
+            match dir {
+                thoth_graph::BlastDir::Up => "up",
+                thoth_graph::BlastDir::Down => "down",
+                thoth_graph::BlastDir::Both => "both",
+            },
+            hits.len(),
+        );
+        for (d, nodes) in &by_depth {
+            text.push_str(&format!("  depth {d}:\n"));
+            for n in nodes {
+                text.push_str(&format!(
+                    "    {}  {}:{}\n",
+                    n.fqn,
+                    n.path.display(),
+                    n.line
+                ));
+            }
+        }
+        if hits.is_empty() {
+            text.push_str("  (no reachable symbols at the requested depth)\n");
+        }
+
+        let data = json!({
+            "fqn": fqn,
+            "direction": match dir {
+                thoth_graph::BlastDir::Up => "up",
+                thoth_graph::BlastDir::Down => "down",
+                thoth_graph::BlastDir::Both => "both",
+            },
+            "depth": depth,
+            "total": hits.len(),
+            "by_depth": by_depth.iter().map(|(d, nodes)| {
+                json!({
+                    "depth": d,
+                    "nodes": nodes.iter().map(|n| json!({
+                        "fqn": n.fqn,
+                        "kind": n.kind,
+                        "path": n.path.to_string_lossy(),
+                        "line": n.line,
+                    })).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// 360-degree view of a symbol: callers, callees, parent types,
+    /// subtypes, imports-to-this-symbol, and siblings in the same file.
+    ///
+    /// Unlike `thoth_recall` this is a pure graph lookup keyed on the
+    /// exact FQN — use it when the agent already knows the symbol it
+    /// wants to understand (e.g. after a recall returned a chunk).
+    async fn tool_symbol_context(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            fqn: String,
+            #[serde(default)]
+            limit: Option<usize>,
+        }
+        let Args { fqn, limit } = serde_json::from_value(args)?;
+        let limit = limit.unwrap_or(32).clamp(1, 128);
+
+        let g = &self.inner.graph;
+        let Some(self_node) = g.get(&fqn).await? else {
+            return Ok(ToolOutput::error(format!(
+                "symbol not found: {fqn}\n(graph keys are `module::name`; use `thoth_recall` \
+                 to look up the right FQN first)"
+            )));
+        };
+
+        let mut callers = g.in_neighbors(&fqn, thoth_graph::EdgeKind::Calls).await?;
+        let mut callees = g.out_neighbors(&fqn, thoth_graph::EdgeKind::Calls).await?;
+        let mut extends = g
+            .out_neighbors(&fqn, thoth_graph::EdgeKind::Extends)
+            .await?;
+        let mut extended_by = g
+            .in_neighbors(&fqn, thoth_graph::EdgeKind::Extends)
+            .await?;
+        let mut references = g
+            .in_neighbors(&fqn, thoth_graph::EdgeKind::References)
+            .await?;
+        let unresolved_imports = g
+            .out_unresolved(&fqn, thoth_graph::EdgeKind::Imports)
+            .await?;
+
+        for v in [
+            &mut callers,
+            &mut callees,
+            &mut extends,
+            &mut extended_by,
+            &mut references,
+        ] {
+            v.truncate(limit);
+        }
+
+        // Siblings — declared in the same file, excluding self.
+        let mut siblings = g.symbols_in_file(&self_node.path).await?;
+        siblings.retain(|n| n.fqn != fqn);
+        siblings.truncate(limit);
+
+        let node_to_json = |n: &thoth_graph::Node| {
+            json!({
+                "fqn": n.fqn,
+                "kind": n.kind,
+                "path": n.path.to_string_lossy(),
+                "line": n.line,
+            })
+        };
+        let data = json!({
+            "fqn": fqn,
+            "kind": self_node.kind,
+            "path": self_node.path.to_string_lossy(),
+            "line": self_node.line,
+            "callers": callers.iter().map(node_to_json).collect::<Vec<_>>(),
+            "callees": callees.iter().map(node_to_json).collect::<Vec<_>>(),
+            "extends": extends.iter().map(node_to_json).collect::<Vec<_>>(),
+            "extended_by": extended_by.iter().map(node_to_json).collect::<Vec<_>>(),
+            "references": references.iter().map(node_to_json).collect::<Vec<_>>(),
+            "imports_unresolved": unresolved_imports,
+            "siblings": siblings.iter().map(node_to_json).collect::<Vec<_>>(),
+        });
+
+        let mut text = format!(
+            "{} [{}]  {}:{}\n",
+            self_node.fqn,
+            self_node.kind,
+            self_node.path.display(),
+            self_node.line,
+        );
+        let section = |label: &str, nodes: &[thoth_graph::Node], buf: &mut String| {
+            if nodes.is_empty() {
+                return;
+            }
+            buf.push_str(&format!("  {label}:\n"));
+            for n in nodes {
+                buf.push_str(&format!(
+                    "    {}  ({}) {}:{}\n",
+                    n.fqn,
+                    n.kind,
+                    n.path.display(),
+                    n.line
+                ));
+            }
+        };
+        section("callers", &callers, &mut text);
+        section("callees", &callees, &mut text);
+        section("extends", &extends, &mut text);
+        section("extended_by", &extended_by, &mut text);
+        section("references", &references, &mut text);
+        section("siblings", &siblings, &mut text);
+        if !unresolved_imports.is_empty() {
+            text.push_str("  imports (external):\n");
+            for i in &unresolved_imports {
+                text.push_str(&format!("    {i}\n"));
+            }
+        }
+
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// Given a unified diff, return the symbols the edit touches plus
+    /// their upstream blast radius (who calls / references / inherits
+    /// from them). Handy as a PR pre-check: "these 7 functions need
+    /// re-testing because you modified X".
+    ///
+    /// Input is a diff text blob (what `git diff` produces). Hunks
+    /// that touch files not in the graph are silently ignored.
+    async fn tool_detect_changes(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            diff: String,
+            #[serde(default)]
+            depth: Option<usize>,
+        }
+        let Args { diff, depth } = serde_json::from_value(args)?;
+        let depth = depth.unwrap_or(2).clamp(1, 6);
+
+        let hunks = parse_unified_diff(&diff);
+        if hunks.is_empty() {
+            return Ok(ToolOutput::error(
+                "diff contained no parseable hunks; expected `git diff` output".to_string(),
+            ));
+        }
+
+        // Collect touched symbols: for every hunk, intersect its post-
+        // image line range with the declaration spans of symbols in
+        // the file. We use `symbols_in_file` on the post-image path
+        // because that's the identity after the edit.
+        let g = &self.inner.graph;
+        let store = &self.inner.store;
+        let mut touched: std::collections::BTreeMap<String, thoth_graph::Node> =
+            std::collections::BTreeMap::new();
+        let mut file_hits: Vec<serde_json::Value> = Vec::new();
+
+        for DiffHunk { path, ranges } in &hunks {
+            // Look up all symbol rows for this file (which carry the
+            // `(start, end)` line span we need to test hunk overlap). Then
+            // fetch the matching graph Nodes for rendering via a second
+            // round trip — nodes and rows key on the same FQN but live in
+            // different tables.
+            let path_buf = std::path::PathBuf::from(path);
+            let sym_rows = match store.kv.symbols_for_path(&path_buf).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if sym_rows.is_empty() {
+                continue;
+            }
+            let nodes = g.symbols_in_file(&path_buf).await?;
+            let by_fqn: std::collections::HashMap<&str, &thoth_graph::Node> =
+                nodes.iter().map(|n| (n.fqn.as_str(), n)).collect();
+
+            let mut hit_in_file: Vec<String> = Vec::new();
+            for row in &sym_rows {
+                let (s, e) = (row.start_line, row.end_line);
+                if ranges.iter().any(|(a, b)| !(s > *b || e < *a))
+                    && let Some(n) = by_fqn.get(row.fqn.as_str())
+                {
+                    touched.insert(n.fqn.clone(), (*n).clone());
+                    hit_in_file.push(n.fqn.clone());
+                }
+            }
+            if !hit_in_file.is_empty() {
+                file_hits.push(json!({
+                    "path": path,
+                    "hunks": ranges.len(),
+                    "touched": hit_in_file,
+                }));
+            }
+        }
+
+        if touched.is_empty() {
+            let text = format!(
+                "diff touched {} file(s) but no indexed symbols overlapped any hunk",
+                hunks.len()
+            );
+            return Ok(ToolOutput::new(
+                json!({ "touched": [], "impact": [], "hunks": hunks.len() }),
+                text,
+            ));
+        }
+
+        // Blast radius: for every touched symbol, upstream impact. Union
+        // into a single de-duped set so cross-symbol overlap (common on
+        // real PRs) is naturally collapsed.
+        let mut impact_seen: std::collections::HashMap<String, (thoth_graph::Node, usize)> =
+            std::collections::HashMap::new();
+        for node in touched.values() {
+            let radius = g
+                .impact(&node.fqn, thoth_graph::BlastDir::Up, depth)
+                .await?;
+            for (n, d) in radius {
+                // Keep the *shortest* distance seen across all roots so
+                // a symbol reached both directly and transitively is
+                // rendered at its true minimum depth.
+                impact_seen
+                    .entry(n.fqn.clone())
+                    .and_modify(|existing| {
+                        if d < existing.1 {
+                            existing.1 = d;
+                        }
+                    })
+                    .or_insert((n, d));
+            }
+        }
+        // Don't double-list the touched symbols themselves as part of
+        // their own blast radius.
+        for fqn in touched.keys() {
+            impact_seen.remove(fqn);
+        }
+
+        let mut impact_vec: Vec<(thoth_graph::Node, usize)> =
+            impact_seen.into_values().collect();
+        impact_vec.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.fqn.cmp(&b.0.fqn)));
+
+        let node_json = |n: &thoth_graph::Node| {
+            json!({
+                "fqn": n.fqn,
+                "kind": n.kind,
+                "path": n.path.to_string_lossy(),
+                "line": n.line,
+            })
+        };
+        let data = json!({
+            "hunks": hunks.len(),
+            "files": file_hits,
+            "touched": touched.values().map(node_json).collect::<Vec<_>>(),
+            "impact": impact_vec.iter().map(|(n, d)| {
+                let mut v = node_json(n);
+                v["depth"] = json!(d);
+                v
+            }).collect::<Vec<_>>(),
+            "depth": depth,
+        });
+
+        let mut text = format!(
+            "diff touched {} symbol(s) across {} file(s); upstream blast radius (depth {depth}): {} node(s)\n",
+            touched.len(),
+            file_hits.len(),
+            impact_vec.len(),
+        );
+        text.push_str("touched:\n");
+        for n in touched.values() {
+            text.push_str(&format!(
+                "  {}  {}:{}\n",
+                n.fqn,
+                n.path.display(),
+                n.line
+            ));
+        }
+        if !impact_vec.is_empty() {
+            text.push_str("impact (depth / fqn / location):\n");
+            for (n, d) in &impact_vec {
+                text.push_str(&format!(
+                    "  @{d}  {}  {}:{}\n",
+                    n.fqn,
+                    n.path.display(),
+                    n.line
+                ));
+            }
+        }
+
+        Ok(ToolOutput::new(data, text))
+    }
+}
+
+/// One parsed hunk: a file path + every post-image line range the diff
+/// touches inside that file. Pure value, Display-free — the caller joins
+/// with the graph to get symbol-level resolution.
+#[derive(Debug)]
+struct DiffHunk {
+    path: String,
+    /// `(start, end)` inclusive line ranges, 1-based. A pure-deletion
+    /// hunk at post-image line N is represented as `(N, N)` so it still
+    /// overlaps any symbol whose declaration spans N.
+    ranges: Vec<(u32, u32)>,
+}
+
+/// Parse a git unified diff into per-file line-range hunks.
+///
+/// Accepts the output of `git diff` / `git diff --staged` as well as
+/// rustfmt-style patches. Binary / rename-only entries are skipped.
+/// Paths are taken from the `+++ b/...` header (falling back to `--- a/...`
+/// for pure deletions where the `+++` is `/dev/null`).
+fn parse_unified_diff(diff: &str) -> Vec<DiffHunk> {
+    let mut out: Vec<DiffHunk> = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_ranges: Vec<(u32, u32)> = Vec::new();
+
+    fn flush(
+        out: &mut Vec<DiffHunk>,
+        path: &mut Option<String>,
+        ranges: &mut Vec<(u32, u32)>,
+    ) {
+        if let Some(p) = path.take() {
+            if !ranges.is_empty() {
+                out.push(DiffHunk {
+                    path: p,
+                    ranges: std::mem::take(ranges),
+                });
+            } else {
+                // Pure rename / binary — drop silently.
+                ranges.clear();
+            }
+        }
+    }
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            flush(&mut out, &mut current_path, &mut current_ranges);
+            // `+++ b/path` or `+++ /dev/null` — tolerate both.
+            let raw = rest.trim();
+            let path = raw.strip_prefix("b/").unwrap_or(raw);
+            if path != "/dev/null" {
+                current_path = Some(path.to_string());
+            }
+        } else if line.starts_with("--- ") {
+            // Handle the fallback where the post-image is /dev/null
+            // (pure deletion) — we still want to emit a "file touched"
+            // record so the caller sees it, but we have no post-image
+            // lines. Record the pre-image path against an empty range
+            // list; `flush` will drop it cleanly because `ranges` stays
+            // empty.
+            if current_path.is_none()
+                && let Some(rest) = line.strip_prefix("--- ")
+            {
+                let raw = rest.trim();
+                let path = raw.strip_prefix("a/").unwrap_or(raw);
+                if path != "/dev/null" {
+                    current_path = Some(path.to_string());
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("@@ ") {
+            // `@@ -a,b +c,d @@ ...` — we only care about the `+c,d` half.
+            // `d` defaults to `1` if omitted (per unified-diff spec).
+            if let Some(end) = rest.find(" @@")
+                && let Some((start, count)) = parse_post_image_range(&rest[..end])
+                && count > 0
+                && current_path.is_some()
+            {
+                current_ranges.push((start, start + count - 1));
+            }
+        }
+    }
+    flush(&mut out, &mut current_path, &mut current_ranges);
+    out
+}
+
+/// Parse the `+c,d` half of a `@@ -a,b +c,d @@` hunk header. `d` is
+/// optional and defaults to `1` per the unified-diff spec.
+fn parse_post_image_range(header: &str) -> Option<(u32, u32)> {
+    let plus = header.split_whitespace().find(|p| p.starts_with('+'))?;
+    let body = plus.trim_start_matches('+');
+    let (start_str, count_str) = match body.split_once(',') {
+        Some((s, c)) => (s, c),
+        None => (body, "1"),
+    };
+    Some((start_str.parse().ok()?, count_str.parse().ok()?))
 }
 
 // ===========================================================================
@@ -970,7 +1469,17 @@ fn tools_catalog() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language or keyword query." },
-                    "top_k": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 }
+                    "top_k": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 },
+                    "log_event": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Whether to persist this call as a `query_issued` event in \
+                                        episodes.db. Agent-initiated recalls (default true) MUST log \
+                                        — that's how `thoth-gate` proves the agent consulted memory \
+                                        before mutating. Automated hooks that auto-recall for context \
+                                        injection (e.g. UserPromptSubmit) pass `false` so their \
+                                        ceremonial recall doesn't satisfy the gate on the agent's behalf."
+                    }
                 },
                 "required": ["query"]
             }),
@@ -1139,6 +1648,77 @@ fn tools_catalog() -> Vec<Tool> {
                     "reason": { "type": "string" }
                 },
                 "required": ["kind", "title"]
+            }),
+        },
+        Tool {
+            name: "thoth_impact".to_string(),
+            description: "Blast-radius analysis over the code graph. Given a symbol FQN, \
+                          returns every reachable symbol grouped by distance. Use \
+                          `direction=\"up\"` (default) to answer \"what breaks if I change \
+                          this?\" (callers / references / subtypes); `\"down\"` for \
+                          \"what does this depend on?\" (callees / parent types)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fqn": { "type": "string", "description": "Fully qualified name (module::symbol)." },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down", "both"],
+                        "default": "up"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "default": 3
+                    }
+                },
+                "required": ["fqn"]
+            }),
+        },
+        Tool {
+            name: "thoth_symbol_context".to_string(),
+            description: "360-degree view of a single symbol: callers, callees, parent types, \
+                          subtypes, references, siblings, and unresolved imports. Use this \
+                          when you already know the FQN of a symbol and want structured context \
+                          around it (post-`thoth_recall` drill-down)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "fqn": { "type": "string", "description": "Fully qualified name (module::symbol)." },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 128,
+                        "default": 32,
+                        "description": "Per-section cap on the returned neighbours."
+                    }
+                },
+                "required": ["fqn"]
+            }),
+        },
+        Tool {
+            name: "thoth_detect_changes".to_string(),
+            description: "Parse a unified diff (e.g. `git diff`), find every indexed symbol \
+                          whose declaration span overlaps a changed hunk, and return their \
+                          upstream blast radius. Ideal as a PR pre-check — answers \"which \
+                          code is downstream of my edit and should be re-tested?\"."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "diff":  { "type": "string", "description": "Unified diff text (`git diff` output)." },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 6,
+                        "default": 2,
+                        "description": "Blast-radius depth (BFS levels of callers / references / subtypes)."
+                    }
+                },
+                "required": ["diff"]
             }),
         },
         Tool {

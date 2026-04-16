@@ -52,9 +52,7 @@ fn contains_jwt(s: &str) -> bool {
     // Rough JWT shape: three base64url segments separated by dots, first
     // segment starts with `eyJ` (the `{"` of a JWT header).
     s.split_whitespace().any(|tok| {
-        tok.starts_with("eyJ")
-            && tok.chars().filter(|c| *c == '.').count() == 2
-            && tok.len() >= 20
+        tok.starts_with("eyJ") && tok.chars().filter(|c| *c == '.').count() == 2 && tok.len() >= 20
     })
 }
 

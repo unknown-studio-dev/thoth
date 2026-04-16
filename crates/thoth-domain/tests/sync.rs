@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use thoth_domain::{
-    IngestFilter, SnapshotStore, file::FileIngestor, snapshot::parse, sync_source,
-};
+use thoth_domain::{IngestFilter, SnapshotStore, file::FileIngestor, snapshot::parse, sync_source};
 
 #[tokio::test]
 async fn full_sync_round_trip() {

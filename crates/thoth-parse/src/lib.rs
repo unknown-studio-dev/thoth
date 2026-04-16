@@ -92,6 +92,20 @@ pub struct SymbolTable {
     pub calls: Vec<(String, String)>,
     /// Raw import specifiers (`use foo::bar`, `from x import y`, ...).
     pub imports: Vec<String>,
+    /// `(local_name, resolved_target)` pairs extracted from import
+    /// statements. The local name is what shows up at call sites; the
+    /// resolved target is the fully qualified symbol or module path it
+    /// refers to. Consumed by the indexer to rewrite `calls` targets so
+    /// `foo.bar()` after `import { bar as foo } from 'lib'` routes to
+    /// `lib::bar` rather than the bare name `foo`.
+    #[serde(default)]
+    pub aliases: Vec<(String, String)>,
+    /// `(child_fqn, parent_name)` inheritance / implementation relations.
+    /// The parent name is unresolved at parse time (may be a bare name,
+    /// a local alias, or a qualified path); the indexer resolves it
+    /// through `aliases` before writing [`EdgeKind::Extends`].
+    #[serde(default)]
+    pub extends: Vec<(String, String)>,
 }
 
 /// Parse a single file and produce chunks + a symbol table.
@@ -243,6 +257,15 @@ fn walk_ast(
             });
         }
 
+        // Inheritance / implementation. Each parent name is recorded
+        // unresolved; the indexer maps it through `aliases` before writing
+        // the graph edge. Types nested inside a function body still
+        // record their extends — it's rare but valid (Rust `impl` blocks
+        // inside functions, TS class-in-closure).
+        for parent in lang.extract_extends(node, source) {
+            table.extends.push((fqn.clone(), parent));
+        }
+
         stack.push((fqn, sym_kind));
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -256,6 +279,9 @@ fn walk_ast(
     if lang.is_import_node(kind_str) {
         if let Ok(text) = node.utf8_text(source) {
             table.imports.push(text.to_string());
+            // Best-effort alias extraction — language-specific. Never
+            // errors; languages that can't resolve simply emit nothing.
+            lang.extract_import_aliases(text, &mut table.aliases);
         }
         return;
     }

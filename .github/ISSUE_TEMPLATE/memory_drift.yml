@@ -15,7 +15,7 @@ body:
     id: version
     attributes:
       label: Thoth version
-      placeholder: thoth 0.2.0
+      placeholder: thoth 0.0.1
     validations:
       required: true
 

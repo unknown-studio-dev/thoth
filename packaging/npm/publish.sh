@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish @unknownstudio/thoth-cc + platform subpackages to npm.
+# Publish @unknownstudio/thoth + platform subpackages to npm.
 #
 # Run after a GitHub release is published. Downloads the release tarballs,
 # re-packs them as npm packages, and publishes all four platform subpackages
@@ -10,9 +10,9 @@
 # jq, tar.
 #
 # Usage:
-#   ./packaging/npm/publish.sh v0.2.0
-#   NPM_TAG=latest ./packaging/npm/publish.sh v0.2.0         # default
-#   DRY_RUN=1      ./packaging/npm/publish.sh v0.2.0         # no publish
+#   ./packaging/npm/publish.sh v0.0.1
+#   NPM_TAG=latest ./packaging/npm/publish.sh v0.0.1         # default
+#   DRY_RUN=1      ./packaging/npm/publish.sh v0.0.1         # no publish
 set -euo pipefail
 
 TAG="${1:?usage: publish.sh vX.Y.Z}"
@@ -50,8 +50,8 @@ for entry in "${platforms[@]}"; do
   IFS=: read -r plat triple os cpu <<<"$entry"
   # Directory name uses a flat form so mktemp/path lookups stay simple;
   # the package's true name (set via template substitution below) is the
-  # scoped `@unknownstudio/thoth-cc-<plat>`.
-  pkg="thoth-cc-${plat}"
+  # scoped `@unknownstudio/thoth-<plat>`.
+  pkg="thoth-${plat}"
   out="$WORKDIR/$pkg"
   mkdir -p "$out/bin"
 
@@ -69,7 +69,7 @@ for entry in "${platforms[@]}"; do
     -e "s|{OS}|${os}|g" \
     -e "s|{CPU}|${cpu}|g" \
     platform-stubs/template/package.json > "$out/package.json"
-  # bump version to match TAG (template hardcodes 0.2.0 — override).
+  # bump version to match TAG (template hardcodes 0.0.1 — override).
   jq --arg v "$VERSION" '.version = $v' "$out/package.json" > "$out/package.json.tmp"
   mv "$out/package.json.tmp" "$out/package.json"
 
@@ -77,8 +77,8 @@ for entry in "${platforms[@]}"; do
 done
 
 # 2. Main wrapper package — update version and publish.
-wrapper="$WORKDIR/thoth-cc"
-cp -R thoth-cc "$wrapper"
+wrapper="$WORKDIR/thoth"
+cp -R thoth "$wrapper"
 jq --arg v "$VERSION" '
   .version = $v
   | .optionalDependencies |= (to_entries | map(.value = $v) | from_entries)
@@ -87,4 +87,4 @@ mv "$wrapper/package.json.tmp" "$wrapper/package.json"
 
 publish "$wrapper"
 
-echo "✓ published @unknownstudio/thoth-cc@${VERSION} + 4 platform packages" >&2
+echo "✓ published @unknownstudio/thoth@${VERSION} + 4 platform packages" >&2

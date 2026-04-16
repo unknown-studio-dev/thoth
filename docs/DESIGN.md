@@ -46,11 +46,13 @@ Thoth is the substrate for that — a single embedded library, not a service.
 | Storage (full-text / BM25) | [tantivy](https://github.com/quickwit-oss/tantivy) |
 | Storage (episodic log) | SQLite + FTS5 (through `rusqlite`) |
 | Memory source-of-truth | **Markdown files on disk** (`MEMORY.md`, `LESSONS.md`, `skills/*/SKILL.md`). Indexes are derived. |
-| Parser | [tree-sitter](https://tree-sitter.github.io) with dynamic grammar loading (`libloading`) |
+| Parser | [tree-sitter](https://tree-sitter.github.io) with statically-linked grammars (Rust, Python, TS, JS, Go); dynamic grammar loading is deferred (§12) |
+| Code graph | redb KV-backed; edges: `Calls`, `Imports`, `Extends`, `References`, `DeclaredIn`. Indexer resolves call / extends targets through file-local alias maps (import aliases + same-file symbols) before writing. |
+| Discipline | `thoth-gate` (PreToolUse hook) enforces memory consultation via a 3-factor decision: intent (read-only Bash bypasses), recency (recall within `window_short_secs` passes), relevance (token-overlap containment ≥ `relevance_threshold` against the last ~20 recalls). Actor-aware policy map, optional JSONL telemetry. |
 | File watcher | [notify](https://github.com/notify-rs/notify), internal only |
 | Embedding | `Embedder` trait; adapters: Voyage, OpenAI, Cohere (feature-gated) |
 | Synthesis | `Synthesizer` trait; adapters: Anthropic (feature-gated) |
-| Domain ingest | `DomainIngestor` trait; adapters: `file` (always on), `notion`, `asana`, `notebooklm` (feature-gated). Snapshots to markdown — no live remote calls on the recall path. See [ADR 0001](docs/adr/0001-domain-memory.md). |
+| Domain ingest | `DomainIngestor` trait; adapters: `file` (always on), `notion`, `asana`, `notebooklm` (feature-gated). Snapshots to markdown — no live remote calls on the recall path. See [ADR 0001](adr/0001-domain-memory.md). |
 | Skills format | Compatible with [agentskills.io](https://agentskills.io) standard |
 | Delivery | (1) `thoth-core` library, (2) `thoth` CLI, (3) `thoth-mcp` server |
 
@@ -112,6 +114,18 @@ Thoth is the substrate for that — a single embedded library, not a service.
                  │ return chunks │             │ LLM synth +   │
                  │ + citations   │             │ lesson inject │
                  └───────────────┘             └───────────────┘
+
+   ┌── DISCIPLINE (PreToolUse hook, out-of-band) ─────────────────────┐
+   │  thoth-gate  ←── reads episodes.db (query_issued rows)           │
+   │                                                                   │
+   │  decide(tool_name, tool_input, actor) →                           │
+   │    Intent    (read-only Bash whitelist → pass silent)             │
+   │    Recency   (recall within short window → pass)                  │
+   │    Relevance (containment(edit tokens, recall pool) ≥ threshold)  │
+   │                                                                   │
+   │  → verdict: off | nudge | strict  (policy-driven)                 │
+   │  → optional telemetry to .thoth/gate.jsonl                        │
+   └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## 5. Six Memory Types
@@ -125,7 +139,7 @@ Thoth is the substrate for that — a single embedded library, not a service.
 | **Reflective** | Lessons from mistakes | `LESSONS.md` on disk | Confidence-gated |
 | **Domain** | Business rules, invariants, workflows, glossary | `domain/<context>/DOMAIN.md` + `_remote/<source>/*.md` | Proposed → Accepted via PR; rebuildable from remote |
 
-Semantic answers *"what calls X?"*. Domain answers *"why does X enforce a $500 refund limit?"*. The two together let the agent reason about both the code *and* the business rules it embodies. See [ADR 0001](docs/adr/0001-domain-memory.md) for the full decision record.
+Semantic answers *"what calls X?"*. Domain answers *"why does X enforce a $500 refund limit?"*. The two together let the agent reason about both the code *and* the business rules it embodies. See [ADR 0001](adr/0001-domain-memory.md) for the full decision record.
 
 ### 5a. Domain memory layout and lifecycle
 
@@ -197,14 +211,50 @@ which optional component is plugged in.
 A user may run Mode::Full with only an `Embedder` (semantic search, no synth) or
 only a `Synthesizer` — each component is independently optional.
 
+### 6a. Graph-centric retrieval
+
+`recall()` is the hybrid "search for a topic" path. Once the agent
+knows *which* symbol it wants to understand, three graph-native tools
+answer more structured questions without a BM25 / vector round trip:
+
+| Question                                                   | Tool                     | Graph access |
+|------------------------------------------------------------|--------------------------|-------------|
+| What breaks if I change `fqn`? (callers / references / subtypes) | `thoth_impact`           | BFS up, depth-grouped  |
+| What does `fqn` depend on? (callees / parent types)        | `thoth_impact` `down`    | BFS down, depth-grouped |
+| Full 360° view of a single symbol                          | `thoth_symbol_context`   | depth-1 neighbours per edge kind |
+| Which symbols does this PR actually touch + their blast radius? | `thoth_detect_changes`   | diff ↔ declaration span → impact |
+
+These sit on top of five edge kinds (`Calls`, `Imports`, `Extends`,
+`References`, `DeclaredIn`). Two indexer invariants make them useful:
+
+- **Call resolution.** During indexing, every `(caller_fqn,
+  callee_leaf_name)` pair is rewritten through a file-local map built
+  from (a) import aliases extracted by the language-specific parser and
+  (b) same-file symbol FQNs. `foo()` called inside `m::bar` writes the
+  edge as `m::bar → m::foo` instead of the unresolved bare leaf,
+  so BFS over `Calls` actually connects inside a module.
+- **Inheritance edges.** `impl Trait for Type` (Rust), `class X extends Y
+  implements Z` (TS/JS), `class X(Y, Z)` (Python) and `trait Sub:
+  Super1 + Super2` (Rust) all emit `Extends` edges with parent names
+  resolved through the same file-local map.
+
+Parser schema changes bump a `PARSER_SCHEMA_VERSION` constant baked
+into the per-file hash sentinel, so a version bump invalidates every
+cached hash in one go and the next indexer run re-parses all files.
+
 ## 7. On-disk Layout
 
 ```
 <project>/
 └── .thoth/
-    ├── config.toml           ← user config (mode, providers, TTL, domain sources)
+    ├── config.toml           ← user config (mode, gate v2 knobs, TTL, domain sources)
     ├── MEMORY.md             ← project-level facts (human/LLM curated)
     ├── LESSONS.md            ← reflective memory, confidence-scored
+    ├── MEMORY.pending.md     ← staged entries (`memory_mode = "review"`)
+    ├── LESSONS.pending.md    ← staged entries (`memory_mode = "review"`)
+    ├── LESSONS.quarantined.md ← lessons auto-demoted by the forget pass
+    ├── memory-history.jsonl  ← versioned audit trail (stage/promote/reject)
+    ├── gate.jsonl            ← decision telemetry (when enabled)
     ├── domain/
     │   ├── index.md          ← optional glossary + bounded-context map
     │   └── <context>/
@@ -215,10 +265,11 @@ only a `Synthesizer` — each component is independently optional.
     │   └── <slug>/
     │       ├── SKILL.md      ← agentskills.io compatible
     │       └── …             ← scripts, resources
-    ├── episodes.db           ← SQLite + FTS5
-    ├── graph.redb            ← symbol + call graph
+    ├── episodes.db           ← SQLite + FTS5 (event log: query_issued, …)
+    ├── graph.redb            ← symbol graph (Calls, Imports, Extends, …)
     ├── fts.tantivy/          ← BM25 index
-    └── chunks.lance/         ← vector index (Mode::Full only)
+    ├── vectors.db            ← flat-cosine vector index (Mode::Full, default)
+    └── chunks.lance/         ← LanceDB vector index (Mode::Full + `lance`)
 ```
 
 All markdown files are **first-class source of truth** — indexes are rebuildable.
@@ -326,6 +377,60 @@ println!("{report}"); // created / updated / unchanged / redacted / unmapped
   in `LESSONS.md`. The forget pass drops any lesson whose ratio is below
   `lesson_floor` once it has reached `lesson_min_attempts` retrievals.
 
+### Discipline (consult-before-mutate)
+
+Memory is only useful if the agent actually consults it before acting.
+`thoth-gate` is a tiny native PreToolUse hook that makes consultation
+observable by reading `episodes.db` directly — no MCP round trip.
+
+Decision is a 3-factor pipeline:
+
+1. **Intent.** Classify the tool call. Read-only Bash (`cargo test`,
+   `git status`, `grep`, `rg`, `ls`, `cat`, …) and non-mutation tools
+   (`Read`, `Glob`) bypass silently. `Edit`, `Write`, `NotebookEdit`,
+   and mutating `Bash` continue.
+2. **Recency.** If a `query_issued` event landed within
+   `gate_window_short_secs` (default 60s), the call passes. The short
+   default intentionally kills "recall once, edit forever" patterns
+   without forcing a relevance check on every rapid edit.
+3. **Relevance.** Past the short window, tokenise the edit context
+   (file basename, old/new strings, diff body) and the recall pool
+   (`query_issued` events within `gate_window_long_secs`, default 30
+   min, capped at ~20 rows). Score = `containment(edit ∩ recall) /
+   min(|edit|, |recall|)`. Score ≥ `gate_relevance_threshold` passes;
+   miss is handled by the policy `mode`:
+
+   - `off` — pass silent (fully disabled).
+   - `nudge` — pass with a stderr warning listing the edit tokens,
+     ranked recent recalls with overlap scores, and a suggested
+     `thoth_recall` query built from the missed tokens.
+   - `strict` — emit `{"decision":"block"}`.
+
+Tokenizer: lowercase, split non-identifier characters, drop stopwords
+and language keywords, single-char tokens, and pure digits; preserve
+snake_case as a single token; split CamelCase into segments **and** the
+joined form (`FooBar` → `{foo, bar, foobar}`). Capped at 200 tokens per
+side.
+
+**Actor-aware policies** let the same gate binary behave differently
+per caller. `THOTH_ACTOR` selects a policy via first-matching glob in
+`[[discipline.policies]]`; default policy applies otherwise. Useful for
+treating an orchestrated wave worker (`hoangsa/*`, nudge-only, long
+window) differently from an interactive editing session
+(`claude-code-direct`, strict + low threshold) without spawning
+separate daemons.
+
+**Telemetry** is opt-in (`gate_telemetry_enabled = true`). When on, each
+decision appends one JSON line to `.thoth/gate.jsonl` with actor, tool,
+decision, reason code (`readonly_whitelist` / `recency` / `relevance` /
+`relevance_miss` / `cold_start` / `time_lapsed`), scores and missed
+tokens. Users calibrate `relevance_threshold` against real logs rather
+than guesses.
+
+**Fail-open invariant.** Any internal error (missing DB, unreadable
+config, SQLite corruption) reverts to pass+stderr so a broken gate
+never bricks the editor.
+
 ## 10. Influences
 
 The design borrows deliberately and acknowledges sources.
@@ -345,21 +450,25 @@ The design borrows deliberately and acknowledges sources.
   sharding unit for `domain/<context>/` layout.
 - **Ebbinghaus** — exponential forgetting curve.
 - **Sourcegraph / Cody / Aider / Cursor** — code-intelligence + repo-map patterns.
+- **GitNexus** — graph-centric MCP tools (impact / context / detect_changes) that informed §6a; Thoth intentionally omits the gimmicks (clustering, process tracing, Cypher surface) and keeps multi-repo out of scope.
 - **agentskills.io** — procedural memory format compatibility.
 
 ## 11. Roadmap
 
-| Milestone | Content |
-|---|---|
-| **M0 — Scaffold** | Workspace, crates, traits, `cargo check` green |
-| **M1 — Parser + watcher** | tree-sitter wrapper, dynamic grammar load, file events |
-| **M2 — Storage** | redb + tantivy + SQLite schema + markdown writer |
-| **M3 — Mode::Zero retrieval** | symbol lookup + graph traversal + BM25 hybrid |
-| **M4 — CLI** | `thoth init`, `index`, `query`, `watch`, `memory`, `skills` |
-| **M5 — MCP server** | `thoth-mcp` stdio, tool catalog, resource exposure |
-| **M6 — Mode::Full** | `Embedder` + `Synthesizer` adapters, LanceDB, nudge flow |
-| **M7 — Domain memory** | `thoth-domain` crate, `DomainIngestor` trait, file/Notion/Asana adapters, `thoth domain sync` CLI, suggest-only merge |
-| **M8 — Hardening** | Eval harness, benchmarks, docs, examples |
+| Milestone | Status | Content |
+|---|---|---|
+| **M0 — Scaffold** | ✅ | Workspace, crates, traits, `cargo check` green |
+| **M1 — Parser + watcher** | ✅ | tree-sitter wrapper (static grammars), file events; dynamic loading deferred (§12) |
+| **M2 — Storage** | ✅ | redb + tantivy + SQLite schema + markdown writer |
+| **M3 — Mode::Zero retrieval** | ✅ | symbol lookup + graph traversal + BM25 hybrid, RRF fusion |
+| **M4 — CLI** | ✅ | `thoth init`, `index`, `query`, `watch`, `memory`, `skills`, `impact`, `context`, `changes`, `eval` |
+| **M5 — MCP server** | ✅ | `thoth-mcp` stdio, tool catalog, resource exposure |
+| **M6 — Mode::Full** | ✅ | `Embedder` + `Synthesizer` adapters, SQLite flat-cosine default, LanceDB feature-gated, nudge flow |
+| **M7 — Domain memory** | ✅ | `thoth-domain` crate, `DomainIngestor` trait, file/Notion/Asana adapters, `thoth domain sync` CLI, suggest-only merge |
+| **M8 — Discipline v2** | ✅ | `thoth-gate` 3-factor decision (intent / recency / relevance), actor-aware policies, optional JSONL telemetry |
+| **M9 — Graph-centric tools** | ✅ | `thoth_impact`, `thoth_symbol_context`, `thoth_detect_changes` (MCP + CLI); import-alias resolution + `Extends` edges in the indexer |
+| **M10 — Eval hardening** | ✅ | `thoth eval` reports P@k, MRR, latency p50/p95; `--mode zero|full|both` ablation |
+| **M11 — Hardening** | 🚧 | Benchmarks, more language extractors, documented recipes |
 
 ## 12. Open Questions (explicitly deferred)
 

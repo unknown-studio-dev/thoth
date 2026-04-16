@@ -1,9 +1,10 @@
 //! The `thoth` command-line interface.
 //!
+//! Primary surface — what a user actually runs:
+//!
 //! ```text
-//! thoth init                        # create .thoth/ in the current directory
-//! thoth setup                       # interactive config wizard (config.toml)
-//! thoth setup --show                # print current config, no writes
+//! thoth setup                       # one-shot bootstrap (config + install)
+//! thoth setup --status              # show what's already configured
 //! thoth index [PATH]                # walk + parse + index (optionally embed)
 //! thoth query <TEXT>                # hybrid recall (Mode::Zero by default)
 //! thoth watch [PATH]                # stay resident, reindex on change
@@ -12,16 +13,22 @@
 //! thoth memory fact <TEXT>          # append a fact
 //! thoth memory lesson <WHEN> <DO>   # append a lesson
 //! thoth memory forget               # run TTL + capacity eviction pass
-//! thoth memory nudge                # Mode::Full: synth-driven lesson proposals
-//! thoth skills list
-//! thoth skills install [--scope project|user]
-//! thoth hooks install [--scope project|user]
-//! thoth hooks uninstall [--scope project|user]
-//! thoth hooks exec <event>              # runtime dispatcher (Claude Code)
-//! thoth mcp install [--scope project|user]
-//! thoth mcp uninstall [--scope project|user]
-//! thoth install [--scope project|user]  # skill + hooks + mcp in one shot
-//! thoth uninstall [--scope project|user]
+//! thoth memory pending              # list staged facts/lessons
+//! thoth memory promote <kind> <ix>  # promote a staged entry
+//! thoth memory reject  <kind> <ix>  # drop a staged entry
+//! thoth memory log                  # tail memory-history.jsonl
+//! thoth skills list                 # list installed skills
+//! thoth uninstall                   # remove the Claude Code integration
+//! ```
+//!
+//! Primitives (hidden from `--help`; `thoth setup` drives them for you):
+//!
+//! ```text
+//! thoth init                        # just create .thoth/ + seed markdown
+//! thoth install                     # just wire the integration
+//! thoth hooks  {install|uninstall|exec}
+//! thoth mcp    {install|uninstall}
+//! thoth skills install
 //! ```
 //!
 //! Mode::Full flags (enabled by the matching Cargo feature):
@@ -33,7 +40,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -95,23 +102,42 @@ enum SynthKind {
     Anthropic,
 }
 
+/// Which retrieval mode(s) `thoth eval` should exercise. `both` runs the
+/// same gold set under Mode::Zero and Mode::Full so the ablation between
+/// lexical-only and vector/synth-augmented recall is directly comparable.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum EvalMode {
+    /// Lexical-only recall (BM25 + symbol + graph + markdown, RRF-fused).
+    #[default]
+    Zero,
+    /// Full recall: also runs the vector stage and (if `--synth` is set) the
+    /// synthesizer. Requires `--embedder` and/or `--synth`.
+    Full,
+    /// Run the gold set under both modes and print a side-by-side report.
+    Both,
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Initialize a new `.thoth/` directory.
-    Init,
-
-    /// Interactive setup wizard — writes `<root>/config.toml`.
-    ///
-    /// In CI or other non-TTY contexts it falls back to defaults without
-    /// prompting. Use `--show` to print the current config without writing.
+    /// One-shot bootstrap — run this first. Walks a short wizard, writes
+    /// `<root>/config.toml`, seeds MEMORY.md + LESSONS.md, and installs
+    /// hooks + skills + MCP into `.claude/settings.json`. Re-run any time
+    /// to reconfigure or self-heal the install.
     Setup {
-        /// Print current config and exit. Does not modify anything.
+        /// Show the detected install state and exit. Does not modify
+        /// anything.
         #[arg(long)]
-        show: bool,
-        /// Skip prompts and write defaults (useful for CI / bootstrap).
-        #[arg(long)]
-        accept_defaults: bool,
+        status: bool,
+        /// Skip prompts and write defaults (for CI / scripted bootstrap).
+        #[arg(long, alias = "accept-defaults")]
+        yes: bool,
     },
+
+    /// Initialize a bare `.thoth/` directory (seed `MEMORY.md`,
+    /// `LESSONS.md`, default `config.toml`). Prefer `thoth setup` for
+    /// interactive users; this is kept as a primitive for scripts.
+    #[command(hide = true)]
+    Init,
 
     /// Parse + index a source tree. With `--embedder` set, also writes
     /// semantic vectors into `<root>/vectors.db`.
@@ -156,32 +182,42 @@ enum Cmd {
         cmd: SkillsCmd,
     },
 
-    /// Install, remove, or dispatch Claude Code hooks.
+    /// Install, remove, or dispatch Claude Code hooks. Hidden primitive —
+    /// prefer `thoth setup` / `thoth uninstall`.
+    #[command(hide = true)]
     Hooks {
         #[command(subcommand)]
         cmd: HooksCmd,
     },
 
-    /// Register the Thoth MCP server in `settings.json`.
+    /// Register the Thoth MCP server in `settings.json`. Hidden
+    /// primitive — prefer `thoth setup` / `thoth uninstall`.
+    #[command(hide = true)]
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
     },
 
-    /// One-shot: install skill + hooks + MCP server (the whole integration).
-    /// Idempotent — safe to re-run.
+    /// Install skill + hooks + MCP server in one go. Hidden primitive —
+    /// `thoth setup` already does this as part of the bootstrap.
+    #[command(hide = true)]
     Install {
         #[arg(long, value_enum, default_value = "project")]
         scope: hooks::Scope,
     },
 
-    /// One-shot: remove skill + hooks + MCP server.
+    /// Remove skill + hooks + MCP server from `settings.json`.
     Uninstall {
         #[arg(long, value_enum, default_value = "project")]
         scope: hooks::Scope,
     },
 
     /// Run a precision@k evaluation over a gold query set (TOML).
+    ///
+    /// Reports P@k, MRR, and per-query latency (p50 / p95). With
+    /// `--mode both` the same gold set runs through Mode::Zero and
+    /// Mode::Full side-by-side so you can see what the vector / synth
+    /// stages buy you.
     ///
     /// See `eval/gold.toml` for the expected schema.
     Eval {
@@ -192,6 +228,12 @@ enum Cmd {
         /// Top-k considered "answered correctly" if any expected hit lands.
         #[arg(short = 'k', long, default_value_t = 8)]
         top_k: usize,
+
+        /// Which retrieval mode(s) to evaluate. `full` and `both` require
+        /// `--embedder` and/or `--synth` (and a clean redb lock — stop the
+        /// daemon first).
+        #[arg(long, value_enum, default_value_t = EvalMode::Zero)]
+        mode: EvalMode,
     },
 
     /// Domain memory: ingest business rules from remote sources.
@@ -199,6 +241,76 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DomainCmd,
     },
+
+    /// Blast-radius analysis. Given an FQN, walk the graph to find every
+    /// symbol reachable within `--depth` steps. Use this to answer
+    /// "what breaks if I change X?" (default, `--direction up`) or
+    /// "what does X depend on?" (`--direction down`).
+    Impact {
+        /// Fully qualified name (`module::symbol`). Match the exact FQN
+        /// that appears in `thoth_recall` output.
+        #[arg(required = true)]
+        fqn: String,
+
+        /// BFS direction. `up` = callers / references / subtypes;
+        /// `down` = callees / parent types; `both` = union.
+        #[arg(long, value_enum, default_value_t = ImpactDir::Up)]
+        direction: ImpactDir,
+
+        /// Maximum BFS depth. Clamped to `[1, 8]` server-side.
+        #[arg(short = 'd', long, default_value_t = 3)]
+        depth: usize,
+    },
+
+    /// 360-degree context for a single symbol: callers, callees, extends,
+    /// extended_by, references, siblings, and unresolved imports. Use
+    /// after a `thoth_recall` once you've picked a specific FQN to drill
+    /// into.
+    Context {
+        /// Fully qualified name (`module::symbol`).
+        #[arg(required = true)]
+        fqn: String,
+
+        /// Per-section cap on returned neighbours.
+        #[arg(long, default_value_t = 32)]
+        limit: usize,
+    },
+
+    /// Change-impact analysis over a unified diff. Reads the diff from
+    /// `--from` (file or `-` for stdin) or runs `git diff` in the
+    /// working tree.
+    Changes {
+        /// Path to a diff file, or `-` for stdin. Omit to run
+        /// `git diff HEAD` inside the current working tree.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Blast-radius depth for the upstream walk.
+        #[arg(short = 'd', long, default_value_t = 2)]
+        depth: usize,
+    },
+}
+
+/// CLI-facing subset of [`thoth_graph::BlastDir`] so clap can derive
+/// ValueEnum without leaking the dependency across crate boundaries.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ImpactDir {
+    /// Reverse edges — who depends on this symbol.
+    Up,
+    /// Forward edges — what this symbol depends on.
+    Down,
+    /// Union of both directions.
+    Both,
+}
+
+impl ImpactDir {
+    fn as_str(self) -> &'static str {
+        match self {
+            ImpactDir::Up => "up",
+            ImpactDir::Down => "down",
+            ImpactDir::Both => "both",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -307,10 +419,19 @@ enum MemoryCmd {
 enum SkillsCmd {
     /// List installed skills.
     List,
-    /// Install the bundled `thoth` skill so Claude Code can discover it.
+    /// Install skills into `.claude/skills/`.
+    ///
+    /// With no `PATH`: installs the bundled skills (`memory-discipline`,
+    /// `thoth-reflect`) — this is the primitive `thoth setup` drives.
+    ///
+    /// With a `PATH` pointing at a `<slug>.draft/` directory (produced by
+    /// the agent's `thoth_skill_propose` MCP tool): promotes the draft
+    /// into a live skill Claude Code will load on the next session, then
+    /// removes the draft.
     Install {
-        /// Where to install. `project` drops it into `./.claude/skills/thoth/`,
-        /// `user` drops it into `~/.claude/skills/thoth/`.
+        /// Path to a `<slug>.draft/` skill directory to promote. If
+        /// omitted, the bundled skills are installed instead.
+        path: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "project")]
         scope: hooks::Scope,
     },
@@ -335,19 +456,17 @@ enum McpCmd {
 enum HooksCmd {
     /// Install Thoth's Claude Code hook block into `settings.json`.
     Install {
-        /// `project` writes to `./.claude/settings.json`; `user` to
-        /// `~/.claude/settings.json`.
         #[arg(long, value_enum, default_value = "project")]
         scope: hooks::Scope,
     },
-    /// Remove every hook whose command invokes `thoth hooks exec`.
-    /// Leaves user-owned hooks untouched.
+    /// Remove thoth-managed hooks from `settings.json`. Leaves user-owned
+    /// hooks untouched.
     Uninstall {
         #[arg(long, value_enum, default_value = "project")]
         scope: hooks::Scope,
     },
-    /// Runtime dispatcher — called by Claude Code itself with a JSON payload
-    /// on stdin. Not intended for interactive use.
+    /// Runtime dispatcher — called by Claude Code itself with a JSON
+    /// payload on stdin. Not intended for interactive use.
     Exec {
         #[arg(value_enum)]
         event: hooks::HookEvent,
@@ -387,10 +506,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Init => cmd_init(&cli.root).await?,
-        Cmd::Setup {
-            show,
-            accept_defaults,
-        } => setup::run(&cli.root, show, accept_defaults).await?,
+        Cmd::Setup { status, yes } => setup::run(&cli.root, status, yes).await?,
         Cmd::Index { path } => cmd_index(&cli.root, &path, cli.embedder).await?,
         Cmd::Query { text, top_k } => {
             cmd_query(
@@ -438,10 +554,13 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Skills { cmd } => match cmd {
             SkillsCmd::List => cmd_skills_list(&cli.root, cli.json).await?,
-            SkillsCmd::Install { scope } => hooks::skills_install(scope, &cli.root).await?,
+            SkillsCmd::Install { path, scope } => match path {
+                Some(p) => hooks::promote_skill_draft(scope, &cli.root, &p).await?,
+                None => hooks::skills_install(scope, &cli.root).await?,
+            },
         },
         Cmd::Hooks { cmd } => match cmd {
-            HooksCmd::Install { scope } => hooks::install(scope).await?,
+            HooksCmd::Install { scope } => hooks::install(scope, &cli.root).await?,
             HooksCmd::Uninstall { scope } => hooks::uninstall(scope).await?,
             HooksCmd::Exec { event } => hooks::exec(event, &cli.root).await?,
         },
@@ -451,7 +570,31 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Install { scope } => hooks::install_all(scope, &cli.root).await?,
         Cmd::Uninstall { scope } => hooks::uninstall_all(scope, &cli.root).await?,
-        Cmd::Eval { gold, top_k } => cmd_eval(&cli.root, &gold, top_k, cli.json).await?,
+        Cmd::Eval {
+            gold,
+            top_k,
+            mode,
+        } => {
+            cmd_eval(
+                &cli.root,
+                &gold,
+                top_k,
+                mode,
+                cli.embedder,
+                cli.synth,
+                cli.json,
+            )
+            .await?
+        }
+        Cmd::Impact {
+            fqn,
+            direction,
+            depth,
+        } => cmd_impact(&cli.root, &fqn, direction, depth, cli.json).await?,
+        Cmd::Context { fqn, limit } => cmd_context(&cli.root, &fqn, limit, cli.json).await?,
+        Cmd::Changes { from, depth } => {
+            cmd_changes(&cli.root, from.as_deref(), depth, cli.json).await?
+        }
         Cmd::Domain { cmd } => match cmd {
             DomainCmd::Sync {
                 source,
@@ -625,6 +768,53 @@ const DEFAULT_CONFIG_TOML: &str = r#"# Thoth config. All fields are optional; de
 
 # Whether to run the LLM nudge at session end (Mode::Full only).
 # enable_nudge = true
+
+[discipline]
+# Gate master switch — set `false` to disable discipline entirely.
+# nudge_before_write = true
+
+# Gate verdict on a miss:
+#   "off"    — disable the gate (pass silently).
+#   "nudge"  — pass + stderr warning. [default]
+#   "strict" — block.
+# mode = "nudge"
+
+# Recency shortcut — recall within this window passes without a relevance
+# check. Keep short; long windows enable ritual recall.
+# gate_window_short_secs = 60
+
+# Relevance pool — how far back the gate looks for a topical recall.
+# gate_window_long_secs = 1800
+
+# Relevance threshold [0.0, 1.0] — containment score of edit tokens vs
+# the best-matching recent recall. Guidance:
+#   0.0  — disable relevance (time-only legacy behavior).
+#   0.15 — permissive; catches only clear mismatch.
+#   0.30 — balanced. [default]
+#   0.50 — strict; forces strong token overlap.
+#   0.70+ — very strict; expect friction.
+# gate_relevance_threshold = 0.30
+
+# Append decisions to `.thoth/gate.jsonl` for calibration.
+# gate_telemetry_enabled = false
+
+# Additional Bash prefixes that bypass the gate (additive with built-ins
+# like `cargo test`, `git status`, `grep`).
+# gate_bash_readonly_prefixes = ["pnpm lint", "just check"]
+
+# Actor-specific policy overrides. `THOTH_ACTOR` env var selects the
+# policy; first matching glob wins. Omit `[[discipline.policies]]`
+# entirely to apply the default policy to every actor.
+#
+# [[discipline.policies]]
+# actor = "hoangsa/*"
+# mode = "nudge"
+# window_short_secs = 300
+# relevance_threshold = 0.20
+#
+# [[discipline.policies]]
+# actor = "ci-*"
+# mode = "off"
 "#;
 
 async fn cmd_index(
@@ -761,6 +951,11 @@ async fn cmd_query(
     }
 
     let store = StoreRoot::open(root).await?;
+    // Keep a handle to the episode log before `store` is moved into the
+    // retriever — we use it below to log `QueryIssued` so the CLI query
+    // pre-satisfies `thoth-gate`, matching the daemon path (which logs
+    // implicitly because MCP's `tool_recall` defaults `log_event: true`).
+    let episodes = store.episodes.clone();
 
     let embedder = build_embedder(embedder_kind)?;
     let synth = build_synth(synth_kind)?;
@@ -779,7 +974,7 @@ async fn cmd_query(
     };
 
     let q = Query {
-        text,
+        text: text.clone(),
         top_k,
         ..Query::text("")
     };
@@ -788,6 +983,12 @@ async fn cmd_query(
     } else {
         r.recall(&q).await?
     };
+
+    // Best-effort: a missing log entry would defeat the gate, but a broken
+    // log shouldn't block the user from seeing their results.
+    if let Err(e) = episodes.log_query_issued(text).await {
+        warn!(error = %e, "failed to log QueryIssued event");
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -1279,10 +1480,94 @@ struct GoldQuery {
     expect_text: Vec<String>,
 }
 
+/// Per-query, per-mode measurement. `rank` is 1-indexed; `0` means no
+/// chunk in the top-k matched any of the gold's `expect_*` clauses.
+struct QueryRun {
+    rank: usize,
+    returned: usize,
+    elapsed_us: u128,
+}
+
+impl QueryRun {
+    fn hit(&self) -> bool {
+        self.rank > 0
+    }
+}
+
+/// Aggregate metrics for one mode over the whole gold set. Computed
+/// lazily from the per-query `runs` so the raw data is also serializable.
+struct ModeReport {
+    label: &'static str,
+    runs: Vec<QueryRun>,
+}
+
+impl ModeReport {
+    fn hits(&self) -> usize {
+        self.runs.iter().filter(|r| r.hit()).count()
+    }
+
+    fn precision_at_k(&self) -> f64 {
+        if self.runs.is_empty() {
+            0.0
+        } else {
+            self.hits() as f64 / self.runs.len() as f64
+        }
+    }
+
+    /// Mean reciprocal rank. Misses contribute `0`, which matches the
+    /// standard definition and makes MRR comparable across runs even
+    /// when hit rates differ.
+    fn mrr(&self) -> f64 {
+        if self.runs.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self
+            .runs
+            .iter()
+            .map(|r| if r.hit() { 1.0 / r.rank as f64 } else { 0.0 })
+            .sum();
+        sum / self.runs.len() as f64
+    }
+
+    /// `p` in `[0.0, 1.0]`. Uses the nearest-rank method (ceil), which
+    /// is deterministic for small N and avoids the interpolation
+    /// ambiguity in percentile definitions.
+    fn latency_percentile_us(&self, p: f64) -> u128 {
+        if self.runs.is_empty() {
+            return 0;
+        }
+        let mut v: Vec<u128> = self.runs.iter().map(|r| r.elapsed_us).collect();
+        v.sort_unstable();
+        let idx = ((v.len() as f64 * p).ceil().max(1.0) as usize - 1).min(v.len() - 1);
+        v[idx]
+    }
+}
+
+/// 1-indexed rank of the first chunk that satisfies the gold clause, or
+/// `0` if none do. Matching rules mirror the original implementation:
+/// `expect_path` substring-matches the chunk path, `expect_text`
+/// substring-matches `preview + body`; a chunk qualifies if *either*
+/// non-empty bucket matches (any-of).
+fn match_rank(gold: &GoldQuery, out: &thoth_core::Retrieval) -> usize {
+    for (i, c) in out.chunks.iter().enumerate() {
+        let p = c.path.to_string_lossy().to_lowercase();
+        let body = format!("{} {}", c.preview, c.body).to_lowercase();
+        let path_ok = gold.expect_path.iter().any(|s| p.contains(&s.to_lowercase()));
+        let text_ok = gold.expect_text.iter().any(|s| body.contains(&s.to_lowercase()));
+        if (!gold.expect_path.is_empty() && path_ok) || (!gold.expect_text.is_empty() && text_ok) {
+            return i + 1;
+        }
+    }
+    0
+}
+
 async fn cmd_eval(
     root: &std::path::Path,
     gold_path: &std::path::Path,
     top_k: usize,
+    mode: EvalMode,
+    embedder_kind: Option<EmbedderKind>,
+    synth_kind: Option<SynthKind>,
     json: bool,
 ) -> anyhow::Result<()> {
     let raw = tokio::fs::read_to_string(gold_path).await?;
@@ -1291,97 +1576,219 @@ async fn cmd_eval(
         anyhow::bail!("gold set is empty");
     }
 
-    // Prefer the running daemon so `thoth eval` works while Claude Code
-    // holds the redb lock. Each gold query becomes one `thoth_recall`
-    // call; the structured `data` half of `ToolOutput` is the same
-    // `Retrieval` shape we'd get from the direct path below.
-    let daemon_client = daemon::DaemonClient::try_connect(root).await;
-    let direct = if daemon_client.is_some() {
-        None
+    let want_zero = matches!(mode, EvalMode::Zero | EvalMode::Both);
+    let want_full = matches!(mode, EvalMode::Full | EvalMode::Both);
+
+    if want_full && embedder_kind.is_none() && synth_kind.is_none() {
+        anyhow::bail!(
+            "--mode {} requires --embedder and/or --synth (Mode::Full needs at least one provider)",
+            if mode == EvalMode::Full { "full" } else { "both" }
+        );
+    }
+
+    // For pure-Zero runs we prefer the running daemon so `thoth eval` works
+    // even when Claude Code is holding the redb lock. Any Full mode needs
+    // direct store access (the daemon is Mode::Zero only), so if the daemon
+    // is up we bail with a clear message instead of fighting for the lock.
+    let daemon_for_zero = if want_zero && !want_full {
+        daemon::DaemonClient::try_connect(root).await
     } else {
-        let store = StoreRoot::open(root).await?;
-        Some(Retriever::new(store))
+        None
     };
 
-    let mut hits = 0usize;
-    let total = gold.query.len();
-    let mut per_query = Vec::with_capacity(total);
+    if want_full && daemon::DaemonClient::try_connect(root).await.is_some() {
+        anyhow::bail!(
+            "thoth-mcp daemon is running; stop it before running `thoth eval --mode {}` \
+             (Mode::Full would fight for the redb exclusive lock)",
+            if mode == EvalMode::Full { "full" } else { "both" }
+        );
+    }
 
-    // One shared client across the loop — cheap, and reusing the
-    // connection avoids a connect-per-query round trip.
-    let mut client = daemon_client;
+    // Open the store once and clone `StoreRoot` into each retriever (it's
+    // cheap — the inner handles are Arc'd).
+    let store = if want_full || daemon_for_zero.is_none() {
+        Some(StoreRoot::open(root).await?)
+    } else {
+        None
+    };
+
+    let zero_retriever = if want_zero && daemon_for_zero.is_none() {
+        Some(Retriever::new(store.as_ref().unwrap().clone()))
+    } else {
+        None
+    };
+
+    let full_retriever = if want_full {
+        let embedder = build_embedder(embedder_kind)?;
+        let synth = build_synth(synth_kind)?;
+        let vectors = if embedder.is_some() {
+            Some(open_vectors(store.as_ref().unwrap()).await?)
+        } else {
+            None
+        };
+        Some(Retriever::with_full(
+            store.as_ref().unwrap().clone(),
+            vectors,
+            embedder,
+            synth,
+        ))
+    } else {
+        None
+    };
+
+    let mut daemon_client = daemon_for_zero;
+    let mut zero_runs: Vec<QueryRun> = Vec::new();
+    let mut full_runs: Vec<QueryRun> = Vec::new();
 
     for gq in &gold.query {
-        let out: thoth_core::Retrieval = if let Some(c) = client.as_mut() {
-            let result = c
-                .call(
-                    "thoth_recall",
-                    serde_json::json!({ "query": gq.q, "top_k": top_k }),
-                )
-                .await?;
-            if daemon::tool_is_error(&result) {
-                anyhow::bail!("{}", daemon::tool_text(&result));
-            }
-            serde_json::from_value(daemon::tool_data(&result))?
-        } else {
-            direct
-                .as_ref()
-                .unwrap()
-                .recall(&Query {
+        if want_zero {
+            let (out, elapsed_us) = if let Some(c) = daemon_client.as_mut() {
+                let start = Instant::now();
+                let result = c
+                    .call(
+                        "thoth_recall",
+                        serde_json::json!({ "query": gq.q, "top_k": top_k }),
+                    )
+                    .await?;
+                let elapsed_us = start.elapsed().as_micros();
+                if daemon::tool_is_error(&result) {
+                    anyhow::bail!("{}", daemon::tool_text(&result));
+                }
+                let out: thoth_core::Retrieval =
+                    serde_json::from_value(daemon::tool_data(&result))?;
+                (out, elapsed_us)
+            } else {
+                let r = zero_retriever.as_ref().unwrap();
+                let start = Instant::now();
+                let out = r
+                    .recall(&Query {
+                        text: gq.q.clone(),
+                        top_k,
+                        ..Query::text("")
+                    })
+                    .await?;
+                (out, start.elapsed().as_micros())
+            };
+            zero_runs.push(QueryRun {
+                rank: match_rank(gq, &out),
+                returned: out.chunks.len(),
+                elapsed_us,
+            });
+        }
+
+        if want_full {
+            let r = full_retriever.as_ref().unwrap();
+            let start = Instant::now();
+            let out = r
+                .recall_full(&Query {
                     text: gq.q.clone(),
                     top_k,
                     ..Query::text("")
                 })
-                .await?
-        };
-
-        let got = out.chunks.iter().any(|c| {
-            let p = c.path.to_string_lossy().to_lowercase();
-            // Match against the full body too — previews are just a few
-            // lines, which is often too narrow for a keyword probe.
-            let body = format!("{} {}", c.preview, c.body).to_lowercase();
-            let path_ok = gq.expect_path.is_empty()
-                || gq.expect_path.iter().any(|s| p.contains(&s.to_lowercase()));
-            let text_ok = gq.expect_text.is_empty()
-                || gq
-                    .expect_text
-                    .iter()
-                    .any(|s| body.contains(&s.to_lowercase()));
-            // Any-of semantics across the two expect_* buckets — if *either*
-            // bucket matches we count the query as answered.
-            (!gq.expect_path.is_empty() && path_ok) || (!gq.expect_text.is_empty() && text_ok)
-        });
-
-        if got {
-            hits += 1;
+                .await?;
+            let elapsed_us = start.elapsed().as_micros();
+            full_runs.push(QueryRun {
+                rank: match_rank(gq, &out),
+                returned: out.chunks.len(),
+                elapsed_us,
+            });
         }
-        per_query.push((gq.q.clone(), got, out.chunks.len()));
     }
 
-    let p_at_k = hits as f64 / total as f64;
+    let mut reports: Vec<ModeReport> = Vec::new();
+    if want_zero {
+        reports.push(ModeReport {
+            label: "zero",
+            runs: zero_runs,
+        });
+    }
+    if want_full {
+        reports.push(ModeReport {
+            label: "full",
+            runs: full_runs,
+        });
+    }
 
     if json {
+        let modes_json: Vec<_> = reports
+            .iter()
+            .map(|rep| {
+                serde_json::json!({
+                    "mode": rep.label,
+                    "total": rep.runs.len(),
+                    "hits": rep.hits(),
+                    "precision_at_k": rep.precision_at_k(),
+                    "mrr": rep.mrr(),
+                    "latency_us": {
+                        "p50": rep.latency_percentile_us(0.50),
+                        "p95": rep.latency_percentile_us(0.95),
+                    },
+                    "queries": gold.query.iter().zip(rep.runs.iter()).map(|(gq, r)| {
+                        serde_json::json!({
+                            "q": gq.q,
+                            "hit": r.hit(),
+                            "rank": r.rank,
+                            "returned": r.returned,
+                            "elapsed_us": r.elapsed_us,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
         let v = serde_json::json!({
             "top_k": top_k,
-            "total": total,
-            "hits": hits,
-            "precision_at_k": p_at_k,
-            "queries": per_query
-                .iter()
-                .map(|(q, ok, n)| serde_json::json!({"q": q, "hit": ok, "returned": n}))
-                .collect::<Vec<_>>(),
+            "modes": modes_json,
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
+    } else {
+        // Per-query line. In both-mode we prefix with `Z:` / `F:` marks so
+        // wins/losses are visually aligned; in single-mode we drop the
+        // prefix to stay close to the original terse format.
+        let show_prefix = want_zero && want_full;
+        let zero_runs = reports.iter().find(|r| r.label == "zero");
+        let full_runs = reports.iter().find(|r| r.label == "full");
+        for (i, gq) in gold.query.iter().enumerate() {
+            let parts: Vec<String> = [("Z", zero_runs), ("F", full_runs)]
+                .iter()
+                .filter_map(|(tag, rep)| rep.map(|rep| (*tag, &rep.runs[i])))
+                .map(|(tag, run)| {
+                    let mark = if run.hit() {
+                        format!("✓@{}", run.rank)
+                    } else {
+                        "✗   ".to_string()
+                    };
+                    if show_prefix {
+                        format!("{tag}:{mark}")
+                    } else {
+                        format!("{mark}  [{:>2}]", run.returned)
+                    }
+                })
+                .collect();
+            println!("{}  {}", parts.join(" "), gq.q);
+        }
+        println!();
+        for rep in &reports {
+            println!(
+                "[{label}] P@{top_k}={hits}/{total}={p:.3}  MRR={mrr:.3}  \
+                 latency p50={p50}µs p95={p95}µs",
+                label = rep.label,
+                hits = rep.hits(),
+                total = rep.runs.len(),
+                p = rep.precision_at_k(),
+                mrr = rep.mrr(),
+                p50 = rep.latency_percentile_us(0.50),
+                p95 = rep.latency_percentile_us(0.95),
+            );
+        }
     }
 
-    for (q, ok, n) in &per_query {
-        let mark = if *ok { "✓" } else { "✗" };
-        println!("{mark}  [{n:>2}]  {q}");
-    }
-    println!("\nprecision@{} = {}/{} = {:.3}", top_k, hits, total, p_at_k);
-    if hits < total {
-        // Non-zero exit so CI can gate on eval regressions.
+    // Non-zero exit if any active mode missed a query, so CI can gate on
+    // eval regressions just like before — now across whichever mode(s)
+    // were requested.
+    let any_miss = reports
+        .iter()
+        .any(|rep| rep.runs.iter().any(|r| !r.hit()));
+    if any_miss {
         std::process::exit(1);
     }
     Ok(())
@@ -1424,6 +1831,165 @@ async fn cmd_skills_list(root: &std::path::Path, json: bool) -> anyhow::Result<(
     Ok(())
 }
 
+// -------------------------------------------------------- graph subcommands
+
+/// `thoth impact <fqn>` — forwards to the `thoth_impact` MCP tool.
+///
+/// The daemon path is preferred (keeps us working when Claude Code is
+/// holding the redb lock); if unavailable we fall back to opening the
+/// store directly and calling the graph API in-process. Exit code is
+/// non-zero when the graph can't find the symbol, so shell pipelines
+/// can gate on missing FQNs.
+async fn cmd_impact(
+    root: &std::path::Path,
+    fqn: &str,
+    direction: ImpactDir,
+    depth: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let args = serde_json::json!({
+        "fqn": fqn,
+        "direction": direction.as_str(),
+        "depth": depth,
+    });
+    let (text, data, is_error) = call_mcp_tool(root, "thoth_impact", args).await?;
+    emit_output(text, data, is_error, json)
+}
+
+/// `thoth context <fqn>` — forwards to the `thoth_symbol_context` tool.
+async fn cmd_context(
+    root: &std::path::Path,
+    fqn: &str,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let args = serde_json::json!({ "fqn": fqn, "limit": limit });
+    let (text, data, is_error) = call_mcp_tool(root, "thoth_symbol_context", args).await?;
+    emit_output(text, data, is_error, json)
+}
+
+/// `thoth changes` — feed a unified diff through the `thoth_detect_changes`
+/// tool. Diff source order of preference: `--from <file>` > `--from -`
+/// (stdin) > `git diff HEAD`.
+async fn cmd_changes(
+    root: &std::path::Path,
+    from: Option<&str>,
+    depth: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let diff = match from {
+        Some("-") => {
+            use tokio::io::AsyncReadExt;
+            let mut buf = String::new();
+            tokio::io::stdin().read_to_string(&mut buf).await?;
+            buf
+        }
+        Some(path) => tokio::fs::read_to_string(path).await?,
+        None => {
+            // Default: diff of the current working tree against HEAD.
+            // `git diff HEAD` includes both staged and unstaged changes,
+            // which matches the "what am I about to commit?" intuition.
+            let output = tokio::process::Command::new("git")
+                .args(["diff", "HEAD"])
+                .output()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to run git diff: {e}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "`git diff HEAD` exited non-zero: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|e| anyhow::anyhow!("git diff output not UTF-8: {e}"))?
+        }
+    };
+    if diff.trim().is_empty() {
+        println!("(no diff — working tree matches HEAD)");
+        return Ok(());
+    }
+    let args = serde_json::json!({ "diff": diff, "depth": depth });
+    let (text, data, is_error) = call_mcp_tool(root, "thoth_detect_changes", args).await?;
+    emit_output(text, data, is_error, json)
+}
+
+/// Invoke an MCP tool over the daemon socket when one is running; else
+/// spin up an in-process server and dispatch through it. Returns
+/// `(text, data, is_error)` so the caller can pick which to surface
+/// based on `--json`.
+async fn call_mcp_tool(
+    root: &std::path::Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> anyhow::Result<(String, serde_json::Value, bool)> {
+    if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        let result = d.call(tool, arguments).await?;
+        let is_error = daemon::tool_is_error(&result);
+        let text = daemon::tool_text(&result).to_string();
+        let data = daemon::tool_data(&result);
+        return Ok((text, data, is_error));
+    }
+    // In-process: reuse the Server so we don't duplicate tool bodies.
+    // This also means the CLI and daemon paths share test coverage.
+    let server = thoth_mcp::Server::open(root).await?;
+    let params = serde_json::json!({
+        "name": tool,
+        "arguments": arguments,
+    });
+    let msg = thoth_mcp::proto::RpcIncoming {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::Value::Number(1.into())),
+        method: "thoth.call".to_string(),
+        params,
+    };
+    let resp = server.handle(msg).await;
+    let Some(response) = resp else {
+        anyhow::bail!("server returned no response for {tool}");
+    };
+    if let Some(err) = response.error {
+        anyhow::bail!("{}: {}", err.code, err.message);
+    }
+    // `ToolOutput` is Serialize-only (the server never deserialises its
+    // own output), so pull fields from the raw JSON instead of
+    // round-tripping through from_value.
+    let result = response.result.unwrap_or_default();
+    let text = result
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let is_error = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let data = result.get("data").cloned().unwrap_or_default();
+    Ok((text, data, is_error))
+}
+
+/// Emit either the rendered text or a pretty-printed JSON dump of the
+/// structured `data` half. When `is_error` is set the process exits
+/// non-zero so shell pipelines can gate on missing FQNs / malformed
+/// diffs.
+fn emit_output(
+    text: String,
+    data: serde_json::Value,
+    is_error: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&data)?);
+    } else if !text.is_empty() {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+    if is_error {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------- domain subcommand
 
 async fn cmd_domain_sync(
@@ -1442,12 +2008,7 @@ async fn cmd_domain_sync(
 
     let filter = IngestFilter {
         since: since
-            .map(|s| {
-                time::OffsetDateTime::parse(
-                    s,
-                    &time::format_description::well_known::Rfc3339,
-                )
-            })
+            .map(|s| time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339))
             .transpose()
             .map_err(|e| anyhow::anyhow!("invalid --since: {e}"))?,
         max_items,

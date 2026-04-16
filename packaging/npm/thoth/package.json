@@ -1,6 +1,6 @@
 {
-  "name": "@unknownstudio/thoth-cc",
-  "version": "0.2.0",
+  "name": "@unknownstudio/thoth",
+  "version": "0.0.1",
   "description": "Long-term memory and disciplined recall loop for Claude Code agents. Native Rust binary distributed via npm.",
   "license": "(MIT OR Apache-2.0)",
   "repository": {
@@ -29,10 +29,10 @@
     "postinstall": "node scripts/postinstall.js"
   },
   "optionalDependencies": {
-    "@unknownstudio/thoth-cc-darwin-arm64": "0.2.0",
-    "@unknownstudio/thoth-cc-darwin-x64":   "0.2.0",
-    "@unknownstudio/thoth-cc-linux-arm64":  "0.2.0",
-    "@unknownstudio/thoth-cc-linux-x64":    "0.2.0"
+    "@unknownstudio/thoth-darwin-arm64": "0.0.1",
+    "@unknownstudio/thoth-darwin-x64":   "0.0.1",
+    "@unknownstudio/thoth-linux-arm64":  "0.0.1",
+    "@unknownstudio/thoth-linux-x64":    "0.0.1"
   },
   "publishConfig": {
     "access": "public"

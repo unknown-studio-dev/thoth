@@ -1,52 +1,125 @@
-//! `thoth setup` — interactive config wizard.
+//! `thoth setup` — the one-shot bootstrap for Thoth.
 //!
-//! Writes `<root>/config.toml` with the user's choices. Non-interactive
-//! mode accepts the same knobs as flags or falls back to defaults, so the
-//! command is still usable in CI / scripted installs.
+//! Running `thoth setup` is enough to take a fresh repo from zero to a
+//! fully-wired integration:
+//!
+//! 1. Asks a handful of questions (mode, memory handling, ignore
+//!    patterns, gate knobs).
+//! 2. Writes `<root>/config.toml` and seeds `MEMORY.md` + `LESSONS.md`.
+//! 3. Installs hooks + skills + MCP server into `.claude/settings.json`.
+//!
+//! When run a second time it detects the existing install, shows a
+//! status summary, and offers to reconfigure without nuking user-owned
+//! edits.
+//!
+//! `--status` prints the detected state and exits. `--yes` (alias
+//! `--accept-defaults`) and non-TTY stdout both skip the wizard and use
+//! safe defaults — useful for scripted installs and CI.
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
+use serde_json::Value;
 
-// Public knob keys — kept in sync with `DisciplineConfig`.
-const MODES: &[&str] = &["soft", "strict"];
+use crate::hooks;
+
+// Public knob keys — kept in sync with `DisciplineConfig` and the gate
+// binary's `PolicyMode` parser. `nudge` is the default (pass on miss +
+// stderr warning); `strict` blocks; `off` disables the gate entirely.
+const MODES: &[&str] = &["nudge", "strict", "off"];
 const MEMORY_MODES: &[&str] = &["auto", "review"];
 const CADENCES: &[&str] = &["end", "every"];
 
+/// Relevance threshold default — balanced setting. See the comment block
+/// rendered into `config.toml` for the guidance range.
+const DEFAULT_RELEVANCE_THRESHOLD: f64 = 0.30;
+const DEFAULT_WINDOW_SHORT_SECS: u64 = 60;
+const DEFAULT_WINDOW_LONG_SECS: u64 = 1800;
+
+/// Default ignore patterns suggested by the wizard. The user can accept
+/// them verbatim or replace them. These are layered on top of the
+/// project's `.gitignore` / `.ignore`, not a replacement for them.
+const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    "target/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    ".venv/",
+    "*.generated.rs",
+];
+
 #[derive(Clone, Debug)]
 pub struct SetupAnswers {
+    /// Gate verdict on a miss — `nudge` (default) / `strict` / `off`.
     pub mode: String,
     pub memory_mode: String,
-    pub gate_require_nudge: bool,
     pub reflect_cadence: String,
-    pub gate_window_secs: u64,
+    /// Recency shortcut — recall within this window passes automatically
+    /// without a relevance check. Keep short (default 60s).
+    pub gate_window_short_secs: u64,
+    /// Relevance pool — how far back the gate looks for a topically-
+    /// matching recall when recency alone doesn't cover it. Default
+    /// 30min = typical coding-session span.
+    pub gate_window_long_secs: u64,
+    /// Containment threshold in `[0.0, 1.0]`. `0.0` disables relevance
+    /// (time-only legacy behavior). See the `config.toml` comment block
+    /// for the range guidance.
+    pub gate_relevance_threshold: f64,
+    /// Append every gate decision to `.thoth/gate.jsonl` — handy for
+    /// calibrating the threshold. Opt-in because the file grows.
+    pub gate_telemetry_enabled: bool,
     pub nudge_before_write: bool,
     pub global_fallback: bool,
+    pub ignore: Vec<String>,
 }
 
 impl Default for SetupAnswers {
     fn default() -> Self {
         Self {
-            mode: "soft".to_string(),
+            mode: "nudge".to_string(),
             memory_mode: "auto".to_string(),
-            gate_require_nudge: false,
             reflect_cadence: "end".to_string(),
-            gate_window_secs: 180,
+            gate_window_short_secs: DEFAULT_WINDOW_SHORT_SECS,
+            gate_window_long_secs: DEFAULT_WINDOW_LONG_SECS,
+            gate_relevance_threshold: DEFAULT_RELEVANCE_THRESHOLD,
+            gate_telemetry_enabled: false,
             nudge_before_write: true,
             global_fallback: true,
+            ignore: DEFAULT_IGNORE_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
 
-/// Run the wizard (or accept defaults) and write the config.
-///
-/// * If `show` is true, just print the current config and return.
-/// * If `accept_defaults` is true or stdout isn't a TTY, skip prompts.
-pub async fn run(root: &Path, show: bool, accept_defaults: bool) -> Result<()> {
-    if show {
-        return show_current(root).await;
+/// Snapshot of what's already installed. Used to branch the bootstrap
+/// between "fresh install" and "reconfigure" flows.
+#[derive(Clone, Debug, Default)]
+struct InstallState {
+    config_path: Option<PathBuf>,
+    memory_exists: bool,
+    lessons_exists: bool,
+    hooks_installed: bool,
+    mcp_installed: bool,
+    skills_installed: Vec<String>,
+}
+
+impl InstallState {
+    fn is_bootstrapped(&self) -> bool {
+        self.config_path.is_some() && (self.hooks_installed || self.mcp_installed)
+    }
+}
+
+/// Entry point for `thoth setup`.
+pub async fn run(root: &Path, status: bool, accept_defaults: bool) -> Result<()> {
+    let state = detect_state(root).await?;
+
+    if status {
+        print_status(root, &state);
+        return Ok(());
     }
 
     tokio::fs::create_dir_all(root)
@@ -54,48 +127,201 @@ pub async fn run(root: &Path, show: bool, accept_defaults: bool) -> Result<()> {
         .with_context(|| format!("create {}", root.display()))?;
 
     let non_interactive = accept_defaults || !std::io::stdout().is_terminal();
+
+    // If already bootstrapped and we're non-interactive, there's nothing
+    // meaningful to do — just re-run the install step idempotently so
+    // hook entries self-heal if the bundle shipped a new matcher.
+    if state.is_bootstrapped() && non_interactive {
+        println!("thoth setup: already bootstrapped at {}.", root.display());
+        println!("  (non-interactive; re-running install for self-heal)");
+        reinstall_integration(root).await?;
+        print_final_message(root, /* reconfigured */ true);
+        return Ok(());
+    }
+
+    // If bootstrapped and interactive, offer a short menu instead of
+    // walking the full wizard again.
+    if state.is_bootstrapped() && !non_interactive {
+        print_status(root, &state);
+        let theme = ColorfulTheme::default();
+        let choice = Select::with_theme(&theme)
+            .with_prompt("Thoth is already set up here — what would you like to do?")
+            .items(&[
+                "Reinstall hooks + MCP (self-heal, keep config.toml)",
+                "Reconfigure from scratch (rewrite config.toml)",
+                "Quit",
+            ])
+            .default(0)
+            .interact()?;
+        match choice {
+            0 => {
+                reinstall_integration(root).await?;
+                print_final_message(root, /* reconfigured */ true);
+                return Ok(());
+            }
+            1 => { /* fall through to full wizard */ }
+            _ => return Ok(()),
+        }
+    }
+
     let answers = if non_interactive {
         println!("thoth setup: non-interactive — writing defaults.");
         SetupAnswers::default()
     } else {
-        prompt_interactive()?
+        prompt_interactive(&state)?
     };
 
+    // Write config, seed markdown, then wire the integration.
     write_config(root, &answers).await?;
+    seed_markdown(root).await?;
+    install_integration(root).await?;
+
     print_summary(root, &answers);
+    print_final_message(root, state.is_bootstrapped());
     Ok(())
 }
 
-fn prompt_interactive() -> Result<SetupAnswers> {
+// --------------------------------------------------------------- detection
+
+async fn detect_state(root: &Path) -> Result<InstallState> {
+    let mut s = InstallState::default();
+
+    let cfg = root.join("config.toml");
+    if cfg.exists() {
+        s.config_path = Some(cfg);
+    }
+    s.memory_exists = root.join("MEMORY.md").exists();
+    s.lessons_exists = root.join("LESSONS.md").exists();
+
+    // Probe `.claude/settings.json` for thoth-managed hook entries.
+    let settings = PathBuf::from(".claude").join("settings.json");
+    if let Ok(text) = tokio::fs::read_to_string(&settings).await
+        && let Ok(v) = serde_json::from_str::<Value>(&text)
+    {
+        s.hooks_installed = has_thoth_managed_hooks(&v);
+    }
+
+    // Probe `.mcp.json` (Claude Code project-scope MCP config) for our
+    // server entry. MCP config does NOT live in settings.json — Claude Code
+    // ignores `mcpServers` there.
+    let mcp_config = PathBuf::from(".mcp.json");
+    if let Ok(text) = tokio::fs::read_to_string(&mcp_config).await
+        && let Ok(v) = serde_json::from_str::<Value>(&text)
+    {
+        s.mcp_installed = v.get("mcpServers").and_then(|m| m.get("thoth")).is_some();
+    }
+
+    // Probe `.claude/skills/` for the ones we ship.
+    let skills_dir = PathBuf::from(".claude").join("skills");
+    if skills_dir.exists()
+        && let Ok(mut rd) = tokio::fs::read_dir(&skills_dir).await
+    {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Some(name) = entry.file_name().to_str() {
+                s.skills_installed.push(name.to_string());
+            }
+        }
+        s.skills_installed.sort();
+    }
+
+    Ok(s)
+}
+
+fn has_thoth_managed_hooks(settings: &Value) -> bool {
+    let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    for entries in hooks.values() {
+        let Some(list) = entries.as_array() else {
+            continue;
+        };
+        for entry in list {
+            if entry
+                .get("_thoth_managed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn print_status(root: &Path, s: &InstallState) {
+    println!("thoth status @ {}", root.display());
+    println!(
+        "  config.toml   : {}",
+        s.config_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "missing".to_string())
+    );
+    println!(
+        "  MEMORY.md     : {}",
+        if s.memory_exists {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  LESSONS.md    : {}",
+        if s.lessons_exists {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  hooks         : {}",
+        if s.hooks_installed {
+            "installed (project scope)"
+        } else {
+            "not installed"
+        }
+    );
+    println!(
+        "  MCP server    : {}",
+        if s.mcp_installed {
+            "registered"
+        } else {
+            "not registered"
+        }
+    );
+    println!(
+        "  skills        : {}",
+        if s.skills_installed.is_empty() {
+            "none".to_string()
+        } else {
+            s.skills_installed.join(", ")
+        }
+    );
+}
+
+// -------------------------------------------------------------- wizard
+
+fn prompt_interactive(state: &InstallState) -> Result<SetupAnswers> {
     let theme = ColorfulTheme::default();
 
     println!("thoth setup — interactive wizard");
     println!("Press enter to accept the highlighted default.\n");
 
     let mode_idx = Select::with_theme(&theme)
-        .with_prompt("Enforcement mode")
+        .with_prompt(
+            "Gate mode (nudge = warn on miss, strict = block on miss, off = disabled)",
+        )
         .items(MODES)
         .default(0)
         .interact()?;
     let mode = MODES[mode_idx].to_string();
 
     let memory_mode_idx = Select::with_theme(&theme)
-        .with_prompt("Memory mode (auto = commit straight away, review = stage)")
+        .with_prompt("Memory mode (auto = commit straight away, review = stage for approval)")
         .items(MEMORY_MODES)
         .default(0)
         .interact()?;
     let memory_mode = MEMORY_MODES[memory_mode_idx].to_string();
-
-    // Two-event gate only makes sense in strict mode. Silently default to
-    // false otherwise.
-    let gate_require_nudge = if mode == "strict" {
-        Confirm::with_theme(&theme)
-            .with_prompt("Require `thoth.nudge` before every Write/Edit/Bash? (two-event gate)")
-            .default(false)
-            .interact()?
-    } else {
-        false
-    };
 
     let cadence_idx = Select::with_theme(&theme)
         .with_prompt("Reflect cadence (end = only on Stop, every = after each tool call)")
@@ -104,13 +330,44 @@ fn prompt_interactive() -> Result<SetupAnswers> {
         .interact()?;
     let reflect_cadence = CADENCES[cadence_idx].to_string();
 
-    let gate_window_secs: u64 = Input::with_theme(&theme)
-        .with_prompt("Gate window in seconds (max age of a recall/nudge that still counts)")
-        .default(180)
-        .interact_text()?;
+    // Relevance-related knobs only matter when the gate isn't `off`.
+    // Skip the prompts entirely in that case so the wizard stays short.
+    let (gate_window_short_secs, gate_window_long_secs, gate_relevance_threshold) =
+        if mode == "off" {
+            (
+                DEFAULT_WINDOW_SHORT_SECS,
+                DEFAULT_WINDOW_LONG_SECS,
+                DEFAULT_RELEVANCE_THRESHOLD,
+            )
+        } else {
+            let short: u64 = Input::with_theme(&theme)
+                .with_prompt(
+                    "Recency window in seconds (recall within this passes without relevance check)",
+                )
+                .default(DEFAULT_WINDOW_SHORT_SECS)
+                .interact_text()?;
+            let long: u64 = Input::with_theme(&theme)
+                .with_prompt(
+                    "Relevance pool window in seconds (how far back to search for a topical recall)",
+                )
+                .default(DEFAULT_WINDOW_LONG_SECS)
+                .interact_text()?;
+            let threshold: f64 = Input::with_theme(&theme)
+                .with_prompt(
+                    "Relevance threshold [0.0=off, 0.15=permissive, 0.30=balanced, 0.50=strict]",
+                )
+                .default(DEFAULT_RELEVANCE_THRESHOLD)
+                .interact_text()?;
+            (short, long, threshold.clamp(0.0, 1.0))
+        };
+
+    let gate_telemetry_enabled = Confirm::with_theme(&theme)
+        .with_prompt("Append every gate decision to .thoth/gate.jsonl? (useful for tuning)")
+        .default(false)
+        .interact()?;
 
     let nudge_before_write = Confirm::with_theme(&theme)
-        .with_prompt("Prompt the agent to expand `thoth.nudge` before Write/Edit?")
+        .with_prompt("Enable the gate at all? (master switch — uncheck to disable everything)")
         .default(true)
         .interact()?;
 
@@ -119,16 +376,60 @@ fn prompt_interactive() -> Result<SetupAnswers> {
         .default(true)
         .interact()?;
 
+    // Ignore patterns — suggest defaults, offer a comma-separated edit.
+    println!();
+    println!("Ignore patterns (layered on top of .gitignore / .ignore).");
+    println!("  suggested: {}", DEFAULT_IGNORE_PATTERNS.join(", "));
+    let use_defaults = Confirm::with_theme(&theme)
+        .with_prompt("Use the suggested ignore patterns?")
+        .default(true)
+        .interact()?;
+    let ignore = if use_defaults {
+        DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        let raw: String = Input::with_theme(&theme)
+            .with_prompt("Comma-separated patterns (empty = none)")
+            .default(DEFAULT_IGNORE_PATTERNS.join(", "))
+            .allow_empty(true)
+            .interact_text()?;
+        parse_ignore_csv(&raw)
+    };
+
+    // Small courtesy — if skills from a previous install are still there,
+    // warn that the setup will leave them in place.
+    if !state.skills_installed.is_empty() {
+        println!(
+            "\n(Existing skills at .claude/skills/ will be left in place: {})",
+            state.skills_installed.join(", ")
+        );
+    }
+
     Ok(SetupAnswers {
         mode,
         memory_mode,
-        gate_require_nudge,
         reflect_cadence,
-        gate_window_secs,
+        gate_window_short_secs,
+        gate_window_long_secs,
+        gate_relevance_threshold,
+        gate_telemetry_enabled,
         nudge_before_write,
         global_fallback,
+        ignore,
     })
 }
+
+fn parse_ignore_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+// ------------------------------------------------------------- filesystem
 
 async fn write_config(root: &Path, a: &SetupAnswers) -> Result<()> {
     let path = root.join("config.toml");
@@ -140,13 +441,26 @@ async fn write_config(root: &Path, a: &SetupAnswers) -> Result<()> {
 }
 
 fn render_toml(a: &SetupAnswers) -> String {
-    // Keep this human-friendly — users edit it by hand later.
+    // `ignore` is rendered inline; the rest is a flat template.
+    let mut ignore_block = String::new();
+    if a.ignore.is_empty() {
+        ignore_block.push_str("# ignore = []\n");
+    } else {
+        ignore_block.push_str("ignore = [\n");
+        for pat in &a.ignore {
+            ignore_block.push_str(&format!("    \"{}\",\n", escape_toml_str(pat)));
+        }
+        ignore_block.push_str("]\n");
+    }
+
     format!(
-        "# Generated by `thoth setup`. Edit freely; comments survive re-runs\n\
-         # only if you pass `--show` (which never writes).\n\
-         #\n\
+        "# Generated by `thoth setup`. Edit freely.\n\
          # Docs: https://github.com/unknown-studio-dev/thoth#configuration\n\
          \n\
+         [index]\n\
+         # Gitignore-syntax patterns layered on top of `.gitignore` / `.ignore`.\n\
+         # Prefix with `!` to re-include a previously ignored path.\n\
+         {ignore_block}\n\
          [memory]\n\
          # TTL (in days) for episodic log entries. 0 = keep forever.\n\
          episodic_ttl_days = 30\n\
@@ -154,69 +468,184 @@ fn render_toml(a: &SetupAnswers) -> String {
          enable_nudge      = true\n\
          \n\
          [discipline]\n\
-         # \"soft\" (warn) or \"strict\" (block via thoth-gate).\n\
-         mode                     = \"{mode}\"\n\
+         # Master switch — flip to `false` to disable the gate entirely.\n\
+         nudge_before_write         = {nudge_before_write}\n\
          # Fall back to ~/.thoth when this project has no .thoth/.\n\
-         global_fallback          = {global_fallback}\n\
-         # \"end\" or \"every\".\n\
-         reflect_cadence          = \"{reflect_cadence}\"\n\
-         # Ask for thoth.nudge before every Write/Edit.\n\
-         nudge_before_write       = {nudge_before_write}\n\
-         # Opt-in: thoth.grounding_check on every factual claim.\n\
-         grounding_check          = false\n\
-         # Max age (seconds) of a recall/nudge that still satisfies the gate.\n\
-         gate_window_secs         = {gate_window_secs}\n\
+         global_fallback            = {global_fallback}\n\
+         # `end` (only on Stop) or `every` (after each tool call).\n\
+         reflect_cadence            = \"{reflect_cadence}\"\n\
+         # `auto` commits straight to MEMORY.md/LESSONS.md.\n\
+         # `review` stages to *.pending.md — user must promote/reject.\n\
+         memory_mode                = \"{memory_mode}\"\n\
          \n\
-         # --- v2 knobs -------------------------------------------------------\n\
-         # \"auto\" commits straight to MEMORY.md/LESSONS.md.\n\
-         # \"review\" stages to *.pending.md — user must promote/reject.\n\
-         memory_mode              = \"{memory_mode}\"\n\
-         # Strict-mode two-event gate: require thoth.nudge as well as recall.\n\
-         gate_require_nudge       = {gate_require_nudge}\n\
+         # --- gate v2 -------------------------------------------------------\n\
+         # Verdict on a miss:\n\
+         #   `off`    — disable the gate entirely (pass every call silently).\n\
+         #   `nudge`  — pass on miss but print a stderr warning. [default]\n\
+         #   `strict` — block on miss.\n\
+         mode                       = \"{mode}\"\n\
+         \n\
+         # Recency shortcut — a recall within this window passes without\n\
+         # running the relevance check. Keep short; long windows enable\n\
+         # ritual recall (\"call recall once, edit forever\").\n\
+         gate_window_short_secs     = {gate_window_short_secs}\n\
+         \n\
+         # Relevance pool — the gate looks at recalls within this window\n\
+         # when scoring topic overlap against the upcoming edit.\n\
+         gate_window_long_secs      = {gate_window_long_secs}\n\
+         \n\
+         # Relevance threshold in `[0.0, 1.0]` — containment ratio\n\
+         # (|edit tokens ∩ recall tokens| / min(|edit|, |recall|)).\n\
+         #   0.0   — disable relevance (time-only, legacy behavior).\n\
+         #   0.15  — permissive; catches only clear mismatch.\n\
+         #   0.30  — balanced (recommended default).\n\
+         #   0.50  — strict; forces strong token overlap.\n\
+         #   0.70+ — very strict; expect noticeable friction.\n\
+         gate_relevance_threshold   = {gate_relevance_threshold}\n\
+         \n\
+         # Append every decision to `.thoth/gate.jsonl` for calibration.\n\
+         gate_telemetry_enabled     = {gate_telemetry_enabled}\n\
+         \n\
+         # Bash commands matching these prefixes bypass the gate.\n\
+         # This list is additive — built-in defaults (cargo test, git status,\n\
+         # grep, rg, ls, …) are always included.\n\
+         # gate_bash_readonly_prefixes = [\"pnpm lint\", \"just check\"]\n\
+         \n\
+         # Opt-in: thoth.grounding_check on every factual claim.\n\
+         grounding_check            = false\n\
+         \n\
          # Auto-quarantine lessons whose failure ratio crosses this (0.0-1.0).\n\
-         quarantine_failure_ratio = 0.66\n\
+         quarantine_failure_ratio   = 0.66\n\
          # Minimum attempts before quarantine is eligible.\n\
-         quarantine_min_attempts  = 5\n",
+         quarantine_min_attempts    = 5\n\
+         \n\
+         # Actor-specific policy overrides. `THOTH_ACTOR` env var selects\n\
+         # the policy; first matching glob wins. Uncomment to enable.\n\
+         # [[discipline.policies]]\n\
+         # actor = \"hoangsa/*\"            # Hoangsa wave workers\n\
+         # mode = \"nudge\"\n\
+         # window_short_secs = 300\n\
+         # relevance_threshold = 0.20\n\
+         #\n\
+         # [[discipline.policies]]\n\
+         # actor = \"ci-*\"                 # automation — trust it\n\
+         # mode = \"off\"\n",
+        ignore_block = ignore_block,
         mode = a.mode,
         memory_mode = a.memory_mode,
-        gate_require_nudge = a.gate_require_nudge,
         reflect_cadence = a.reflect_cadence,
-        gate_window_secs = a.gate_window_secs,
+        gate_window_short_secs = a.gate_window_short_secs,
+        gate_window_long_secs = a.gate_window_long_secs,
+        gate_relevance_threshold = a.gate_relevance_threshold,
+        gate_telemetry_enabled = a.gate_telemetry_enabled,
         nudge_before_write = a.nudge_before_write,
         global_fallback = a.global_fallback,
     )
 }
 
+fn escape_toml_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Create `MEMORY.md` and `LESSONS.md` if they don't exist. Never
+/// overwrites — an existing file is left alone, matching `thoth init`.
+///
+/// On first creation `MEMORY.md` is seeded with a single init-date fact.
+/// That entry survives `/clear` and `/compact` via the SessionStart
+/// banner (which dumps MEMORY.md into context), so a freshly-installed
+/// project has at least one in-context pointer telling the agent when
+/// Thoth was wired in and how the discipline loop works. Re-running
+/// `thoth setup` on an existing project does NOT overwrite — the user
+/// may have pruned or edited the seed fact, and their state wins.
+async fn seed_markdown(root: &Path) -> Result<()> {
+    let memory = root.join("MEMORY.md");
+    if !memory.exists() {
+        tokio::fs::write(&memory, render_memory_seed(&today_ymd()))
+            .await
+            .with_context(|| format!("write {}", memory.display()))?;
+    }
+    let lessons = root.join("LESSONS.md");
+    if !lessons.exists() {
+        tokio::fs::write(&lessons, "# LESSONS.md\n")
+            .await
+            .with_context(|| format!("write {}", lessons.display()))?;
+    }
+    Ok(())
+}
+
+/// Today in `YYYY-MM-DD`, UTC. Thoth's other memory entries use bare
+/// dates (not timestamps); UTC sidesteps the timezone-shift edge cases
+/// that would otherwise put the init date a day off for users on the
+/// other side of midnight from where the binary runs.
+pub(crate) fn today_ymd() -> String {
+    use time::OffsetDateTime;
+    OffsetDateTime::now_utc()
+        .format(&time::macros::format_description!("[year]-[month]-[day]"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Body written to `MEMORY.md` on first creation. Matches the on-disk
+/// format produced by `thoth_remember_fact` (`### heading`, blank line,
+/// body paragraph, trailing `tags:` line) so the SessionStart banner
+/// renders this entry the same as any other fact.
+fn render_memory_seed(date: &str) -> String {
+    format!(
+        "# MEMORY.md\n\
+         ### Thoth initialized on {date}.\n\
+         \n\
+         This project uses Thoth MCP as its long-term memory. Facts live in this file; \
+         lessons live in `LESSONS.md`. Call `mcp__thoth__thoth_recall` before Write / \
+         Edit / Bash; persist new facts via `mcp__thoth__thoth_remember_fact` and new \
+         lessons via `mcp__thoth__thoth_remember_lesson`. See also `./CLAUDE.md` for \
+         the full policy block loaded into every session.\n\
+         tags: thoth, init, bootstrap\n"
+    )
+}
+
+// -------------------------------------------------- integration wiring
+
+/// Full install — hooks + skills + MCP — into `./.claude/settings.json`.
+async fn install_integration(root: &Path) -> Result<()> {
+    hooks::install_all(hooks::Scope::Project, root).await?;
+    Ok(())
+}
+
+/// Re-run install without touching `config.toml`. Used by the
+/// already-bootstrapped branch.
+async fn reinstall_integration(root: &Path) -> Result<()> {
+    install_integration(root).await
+}
+
+// ------------------------------------------------------ output helpers
+
 fn print_summary(root: &Path, a: &SetupAnswers) {
     let cfg = root.join("config.toml");
     println!("\n✓ Wrote {}", cfg.display());
-    println!("  mode               = {}", a.mode);
-    println!("  memory_mode        = {}", a.memory_mode);
-    println!("  gate_require_nudge = {}", a.gate_require_nudge);
-    println!("  reflect_cadence    = {}", a.reflect_cadence);
-    println!("  gate_window_secs   = {}", a.gate_window_secs);
-    println!();
-    println!("Next:");
-    println!("  1. thoth index .              # build the code index");
-    println!("  2. thoth install              # hooks + skill + MCP in one go");
-    println!("  3. Install the Cowork / Claude Code plugin (see README).");
+    println!("  mode                     = {}", a.mode);
+    println!("  memory_mode              = {}", a.memory_mode);
+    println!("  reflect_cadence          = {}", a.reflect_cadence);
+    println!("  gate_window_short_secs   = {}", a.gate_window_short_secs);
+    println!("  gate_window_long_secs    = {}", a.gate_window_long_secs);
+    println!(
+        "  gate_relevance_threshold = {:.2}",
+        a.gate_relevance_threshold
+    );
+    println!("  gate_telemetry_enabled   = {}", a.gate_telemetry_enabled);
+    println!("  ignore patterns          = {}", a.ignore.len());
 }
 
-async fn show_current(root: &Path) -> Result<()> {
-    let path = root.join("config.toml");
-    match tokio::fs::read_to_string(&path).await {
-        Ok(text) => {
-            println!("# {}", path.display());
-            print!("{text}");
-            if !text.ends_with('\n') {
-                println!();
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("No config.toml at {} — running defaults.", path.display());
-            println!("Run `thoth setup` to create one.");
-        }
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+fn print_final_message(root: &Path, reconfigured: bool) {
+    let cfg = root.join("config.toml");
+    println!();
+    if reconfigured {
+        println!("✓ Thoth integration refreshed.");
+    } else {
+        println!("✓ Thoth is wired into Claude Code for this project.");
     }
-    Ok(())
+    println!();
+    println!("Next:");
+    println!("  1. Open {} and adjust if needed.", cfg.display());
+    println!("  2. thoth index .              # build the code index");
+    println!();
+    println!("Re-run `thoth setup` any time to reconfigure or repair the install.");
 }

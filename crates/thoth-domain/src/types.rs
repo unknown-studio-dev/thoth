@@ -43,21 +43,16 @@ impl RuleKind {
 
 /// Review status of a rule. Only `Accepted` is served to the agent in
 /// Mode::Zero; `Proposed` is shown with a warning flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleStatus {
     /// Just ingested — awaiting human review in a PR.
+    #[default]
     Proposed,
     /// Reviewed and merged. Served by retrieval.
     Accepted,
     /// No longer authoritative. Served with a deprecated flag.
     Deprecated,
-}
-
-impl Default for RuleStatus {
-    fn default() -> Self {
-        RuleStatus::Proposed
-    }
 }
 
 /// A rule produced by a [`crate::DomainIngestor`] — pre-snapshot.

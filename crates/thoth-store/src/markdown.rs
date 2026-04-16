@@ -177,6 +177,23 @@ impl MarkdownStore {
         Ok(parse_lessons(&text))
     }
 
+    /// Case-insensitive substring filter over [`Self::read_lessons`].
+    ///
+    /// Matches either the trigger or the advice body. Returns the lessons
+    /// in the same order they appear on disk. Mirrors [`Self::grep_facts`]
+    /// so recall can surface reflective memory alongside declarative facts.
+    pub async fn grep_lessons(&self, needle: impl AsRef<str>) -> Result<Vec<Lesson>> {
+        let needle = needle.as_ref().to_lowercase();
+        let all = self.read_lessons().await?;
+        Ok(all
+            .into_iter()
+            .filter(|l| {
+                l.trigger.to_lowercase().contains(&needle)
+                    || l.advice.to_lowercase().contains(&needle)
+            })
+            .collect())
+    }
+
     /// Append a lesson. File is created if missing.
     pub async fn append_lesson(&self, l: &Lesson) -> Result<()> {
         let path = self.root.join(LESSONS_MD);

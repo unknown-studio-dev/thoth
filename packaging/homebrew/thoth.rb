@@ -13,7 +13,7 @@
 class Thoth < Formula
   desc "Long-term memory & disciplined recall loop for coding agents"
   homepage "https://github.com/unknown-studio-dev/thoth"
-  version "0.2.0"
+  version "0.0.1"
   license "MIT OR Apache-2.0"
 
   on_macos do
@@ -42,17 +42,19 @@ class Thoth < Formula
 
   def caveats
     <<~EOS
-      Thoth is installed. Next steps:
+      Thoth is installed. To wire it into Claude Code in the current project,
+      run the one-shot bootstrap from your repo root:
 
-        thoth setup              # interactive config wizard
-        thoth index .            # build the code index in .thoth/
-        thoth install            # wire up Claude Code hooks, skill, MCP
+        thoth setup              # interactive wizard: hooks + MCP + skills + .thoth/
 
-      Install the Cowork plugin from:
-        https://github.com/unknown-studio-dev/thoth/releases/download/v#{version}/thoth-discipline-#{version}.plugin
+      Re-running `thoth setup` on a project that's already wired up will
+      detect the existing install, offer to reinstall hooks, or self-heal
+      missing pieces. After setup, edit `.thoth/config.toml` to taste, then:
 
-      The plugin requires the `thoth-mcp` and `thoth-gate` binaries this
-      formula provides — don't install one without the other.
+        thoth index .
+
+      `thoth-mcp` and `thoth-gate` are the daemons this formula provides;
+      `thoth setup` registers them in `.claude/settings.json` for you.
     EOS
   end
 

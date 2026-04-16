@@ -40,6 +40,7 @@ thoth-memory   = { workspace = true }
 thoth-embed    = { workspace = true }
 thoth-synth    = { workspace = true }
 thoth-domain   = { workspace = true }
+thoth-mcp      = { workspace = true }
 
 tokio                = { workspace = true, features = ["signal", "process", "io-std", "net"] }
 anyhow               = { workspace = true }
@@ -52,3 +53,6 @@ time                 = { workspace = true }
 clap                 = { workspace = true }
 indicatif            = "0.17"
 dialoguer            = { version = "0.11", default-features = false, features = ["fuzzy-select"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

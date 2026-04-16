@@ -2,7 +2,7 @@
 # Fetch SHA256s from a released tag and stamp them into thoth.rb.
 #
 # Usage:
-#   ./packaging/homebrew/bump.sh v0.2.0
+#   ./packaging/homebrew/bump.sh v0.0.1
 #
 # Prints a ready-to-commit formula to stdout.
 set -euo pipefail

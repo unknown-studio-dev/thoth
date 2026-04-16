@@ -134,6 +134,20 @@ impl EpisodeLog {
         })
     }
 
+    /// Convenience: append a `QueryIssued` event for `text` with a fresh
+    /// id and the current UTC timestamp. Exists so callers that only want
+    /// to satisfy `thoth-gate`'s recall window (e.g. `thoth query` on the
+    /// direct-store path) don't need to pull `uuid` / `time` into their
+    /// own Cargo manifest just to mint one event.
+    pub async fn log_query_issued(&self, text: String) -> Result<i64> {
+        let ev = Event::QueryIssued {
+            id: EventId::new_v4(),
+            text,
+            at: OffsetDateTime::now_utc(),
+        };
+        self.append(&ev).await
+    }
+
     /// Append an event. Returns the autoincrementing row id.
     pub async fn append(&self, ev: &Event) -> Result<i64> {
         let conn = self.conn.clone();

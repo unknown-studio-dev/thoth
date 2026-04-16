@@ -1,7 +1,7 @@
 {
-  "name": "@unknownstudio/thoth-cc-{PLATFORM}",
-  "version": "0.2.0",
-  "description": "Platform-specific native binary for @unknownstudio/thoth-cc ({TRIPLE}).",
+  "name": "@unknownstudio/thoth-{PLATFORM}",
+  "version": "0.0.1",
+  "description": "Platform-specific native binary for @unknownstudio/thoth ({TRIPLE}).",
   "license": "(MIT OR Apache-2.0)",
   "repository": {
     "type": "git",

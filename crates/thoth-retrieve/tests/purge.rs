@@ -146,10 +146,8 @@ async fn purge_path_clears_kv_graph_and_vectors() {
         .unwrap();
 
     // Index, then assert KV + graph hold entries for this file.
-    let idx = Indexer::new(store.clone(), LanguageRegistry::new()).with_embedding(
-        std::sync::Arc::new(DummyEmbedder::default()),
-        vectors.clone(),
-    );
+    let idx = Indexer::new(store.clone(), LanguageRegistry::new())
+        .with_embedding(std::sync::Arc::new(DummyEmbedder), vectors.clone());
     idx.index_file(&file).await.unwrap();
     idx.commit().await.unwrap();
 

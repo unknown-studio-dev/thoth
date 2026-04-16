@@ -4,10 +4,10 @@ Thoth is a Rust binary. We ship it through npm using the **platform
 subpackages** pattern popularised by esbuild and Biome, all scoped under
 `@unknownstudio`:
 
-- `@unknownstudio/thoth-cc` — the package users install. Pure JS: a
+- `@unknownstudio/thoth` — the package users install. Pure JS: a
   `postinstall` script and three shim entrypoints (`thoth`, `thoth-mcp`,
   `thoth-gate`).
-- `@unknownstudio/thoth-cc-darwin-arm64` / `-darwin-x64` /
+- `@unknownstudio/thoth-darwin-arm64` / `-darwin-x64` /
   `-linux-arm64` / `-linux-x64` — one per platform, each contains just
   the prebuilt binaries under `bin/`.
 
@@ -18,14 +18,22 @@ subpackage that doesn't match the host, so the user only downloads
 ## End-user install
 
 ```bash
-npm install -g @unknownstudio/thoth-cc
-# or
-npx @unknownstudio/thoth-cc setup
+# Zero-config: drops you into the setup wizard immediately, then prints
+# the next step (review config.toml, then `thoth index .`).
+npx @unknownstudio/thoth
+
+# Or install globally and call `thoth` from anywhere.
+npm install -g @unknownstudio/thoth
 ```
 
-Both commands should Just Work on macOS (arm64/x86_64) and Linux
-(arm64/x86_64). For other platforms the postinstall prints install
-instructions and exits cleanly (npm install stays green).
+Both commands work on macOS (arm64/x86_64) and Linux (arm64/x86_64).
+For other platforms the postinstall prints install instructions and
+exits cleanly (npm install stays green).
+
+`npx @unknownstudio/thoth` with no arguments routes to `thoth setup` —
+the one-shot bootstrap that installs hooks, MCP config, skills, and
+seeds `.thoth/`. Pass any subcommand (e.g. `npx @unknownstudio/thoth
+query "foo"`) to bypass the wizard.
 
 ## Publishing (maintainer)
 
@@ -34,10 +42,10 @@ After `release.yml` has uploaded the tarballs to a GitHub Release:
 ```bash
 gh auth status           # must be logged in
 npm whoami               # must be logged in + have publish rights on @unknownstudio
-./packaging/npm/publish.sh v0.2.0
+./packaging/npm/publish.sh v0.0.1
 
 # Dry run first — pack but don't publish
-DRY_RUN=1 ./packaging/npm/publish.sh v0.2.0
+DRY_RUN=1 ./packaging/npm/publish.sh v0.0.1
 ```
 
 The script downloads the tarballs, re-packs each as a platform
@@ -51,11 +59,11 @@ which is the desired behaviour.
 
 ```
 packaging/npm/
-  thoth-cc/                  main wrapper package (published as
-                             @unknownstudio/thoth-cc)
+  thoth/                     main wrapper package (published as
+                             @unknownstudio/thoth)
     package.json
     bin/
-      _shim.js               shared resolver/exec logic
+      _shim.js               shared resolver/exec logic + npx default-args
       thoth.js               entrypoint: thoth
       thoth-mcp.js           entrypoint: thoth-mcp
       thoth-gate.js          entrypoint: thoth-gate
@@ -64,6 +72,6 @@ packaging/npm/
   platform-stubs/
     template/package.json    templated per-platform package
                              (published as
-                             @unknownstudio/thoth-cc-<platform>)
+                             @unknownstudio/thoth-<platform>)
   publish.sh                 release helper
 ```

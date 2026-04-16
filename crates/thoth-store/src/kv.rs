@@ -349,6 +349,33 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Every symbol row whose declared path equals `path`. Same O(table-scan)
+    /// cost as [`Self::delete_symbols_by_path`]; fine while the number of
+    /// indexed symbols stays in the low millions. Returned order matches the
+    /// underlying key sort (FQN), which is stable across calls.
+    pub async fn symbols_for_path(&self, path: impl AsRef<Path>) -> Result<Vec<SymbolRow>> {
+        let db = self.db.clone();
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<Vec<SymbolRow>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(SYMBOLS).map_err(store)?;
+            let mut out = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (_k, v) = entry.map_err(store)?;
+                let row: SymbolRow = match serde_json::from_slice(v.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if row.path == path {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Delete every graph node whose JSON payload `path` field matches
     /// `path`. Returns the list of node ids removed (so the caller can clean
     /// up the edges that touch them).

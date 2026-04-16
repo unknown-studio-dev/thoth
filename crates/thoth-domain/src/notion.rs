@@ -103,11 +103,10 @@ impl DomainIngestor for NotionIngestor {
                 });
             }
 
-            let page: DbQueryResp =
-                resp.json().await.map_err(|e| DomainError::Source {
-                    source_id: "notion".into(),
-                    message: format!("decode error: {e}"),
-                })?;
+            let page: DbQueryResp = resp.json().await.map_err(|e| DomainError::Source {
+                source_id: "notion".into(),
+                message: format!("decode error: {e}"),
+            })?;
 
             for row in page.results {
                 if let Some(rule) = to_remote_rule(&row) {

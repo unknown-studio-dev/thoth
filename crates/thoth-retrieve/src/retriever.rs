@@ -147,6 +147,16 @@ impl Retriever {
             fuse(&mut fused, cand, rank);
         }
 
+        // 4b. reflective lessons — keyed by trigger / advice, also global.
+        //     Separate from (4) so a future query can weight them differently;
+        //     today they share `RetrievalSource::Markdown` and only differ by
+        //     path (`LESSONS.md` vs `MEMORY.md`), which is enough for callers
+        //     to tell them apart in renders.
+        let lesson_hits = self.lessons_stage(&search_text).await?;
+        for (rank, cand) in lesson_hits.iter().enumerate() {
+            fuse(&mut fused, cand, rank);
+        }
+
         // 5. episodic log — past queries / answers / outcomes. Scope filters
         //    do not apply; episodes are cross-cutting.
         let ep_hits = self.episodic_stage(&search_text, k * 2).await?;
@@ -262,6 +272,47 @@ impl Retriever {
                 out.push(Candidate {
                     id,
                     path: PathBuf::from("MEMORY.md"),
+                    start_line: 0,
+                    end_line: 0,
+                    symbol: None,
+                    source: RetrievalSource::Markdown,
+                    preview: Some(preview),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Grep `LESSONS.md` for lessons whose `trigger` or `advice` match any
+    /// meaningful token in the query. Same shape as [`Self::markdown_stage`]
+    /// but renders a `trigger → advice` preview so the caller can see at a
+    /// glance why the lesson fired. Ids are namespaced under `lessons.md:`
+    /// so they never collide with fact ids from MEMORY.md.
+    async fn lessons_stage(&self, text: &str) -> Result<Vec<Candidate>> {
+        let md: &MarkdownStore = &self.store.markdown;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for tok in tokens(text) {
+            let lessons = md.grep_lessons(&tok).await?;
+            for l in lessons {
+                let advice_line = first_nonempty_line(&l.advice);
+                let preview = if advice_line.is_empty() {
+                    format!("lesson — {}", l.trigger.trim())
+                } else {
+                    format!("lesson — {} → {}", l.trigger.trim(), advice_line)
+                };
+                // Stable id on the trigger alone: advice edits (e.g. bumped
+                // success counters) must not spawn a new chunk.
+                let id = format!(
+                    "lessons.md:{}",
+                    blake3::hash(l.trigger.trim().to_lowercase().as_bytes()).to_hex()
+                );
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                out.push(Candidate {
+                    id,
+                    path: PathBuf::from("LESSONS.md"),
                     start_line: 0,
                     end_line: 0,
                     symbol: None,

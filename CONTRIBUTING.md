@@ -29,8 +29,11 @@ Requirements:
 ## Repo layout
 
 See [`README.md`](./README.md). In short: one Cargo workspace with 11
-crates, a Claude Code / Cowork plugin under `plugins/thoth-discipline/`,
-and packaging scaffolding under `packaging/`.
+crates. The Claude Code wiring (MCP config, hooks, skills) is bundled
+inside the CLI binary at compile time — source-of-truth files live in
+`crates/thoth-cli/assets/` and `thoth setup` writes them into
+`.claude/settings.json`. Packaging scaffolding (Homebrew formula, npm
+wrapper) sits under `packaging/`.
 
 ## Workflow
 
@@ -85,14 +88,15 @@ and packaging scaffolding under `packaging/`.
 - **Embedder adapters** in `thoth-embed` — self-hosted / local models
   are especially welcome.
 - **Gold sets** in `eval/` — recall is only as good as we can measure.
-- **Plugin docs and examples** — show off real `LESSONS.md` evolving
-  over a real project.
+- **Setup-flow polish and docs** — show off real `LESSONS.md` evolving
+  over a real project; improve the `thoth setup` wizard prompts; better
+  walkthroughs of hook / skill behavior.
 - **Translations** — if you can review/extend the Vietnamese docs or
   add another language, open a `docs/<lang>/` PR.
 
 ## Design changes
 
-Anything that touches [`DESIGN.md`](./DESIGN.md) or changes the on-disk
+Anything that touches [`DESIGN.md`](docs/DESIGN.md) or changes the on-disk
 layout of `.thoth/` needs a design-note PR first. We'll discuss, then
 implement. This is to avoid store-format churn that breaks existing
 projects — one of the things the memory layer is specifically designed
@@ -100,11 +104,13 @@ not to do.
 
 ## Releasing (maintainers)
 
-1. Bump `version` in `Cargo.toml` workspace + `plugins/thoth-discipline/.claude-plugin/plugin.json`.
+1. Bump `version` in the `Cargo.toml` workspace and
+   `packaging/npm/thoth/package.json` (wrapper) +
+   `packaging/npm/platform-stubs/template/package.json` (stub).
 2. Update `CHANGELOG.md`.
-3. Tag `vX.Y.Z` on `main`. CI publishes the binaries + `.plugin`.
+3. Tag `vX.Y.Z` on `main`. CI builds + uploads platform tarballs + sha256s.
 4. `packaging/homebrew/bump.sh vX.Y.Z` → commit to `homebrew-thoth` tap.
-5. `packaging/npm/publish.sh vX.Y.Z` → publishes to npm.
+5. `packaging/npm/publish.sh vX.Y.Z` → publishes wrapper + 4 platform stubs to npm.
 
 ## Code of conduct
 

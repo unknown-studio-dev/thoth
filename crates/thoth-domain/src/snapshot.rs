@@ -67,10 +67,10 @@ impl SnapshotStore {
         let incoming_hash = rule.content_hash();
 
         if let Ok(existing) = fs::read_to_string(&path).await {
-            if let Ok((fm, _body)) = parse(&existing) {
-                if fm.source_hash == incoming_hash {
-                    return Ok(SnapshotWrite::Unchanged);
-                }
+            if let Ok((fm, _body)) = parse(&existing)
+                && fm.source_hash == incoming_hash
+            {
+                return Ok(SnapshotWrite::Unchanged);
             }
             self.write(rule, &incoming_hash).await?;
             return Ok(SnapshotWrite::Updated);
@@ -141,14 +141,14 @@ pub fn render(fm: &Frontmatter, title: &str, body: &str) -> Result<String> {
 /// The title is preserved inside `body` — we don't strip it because the
 /// snapshot is meant to be human-readable as-is.
 pub fn parse(contents: &str) -> Result<(Frontmatter, String)> {
-    let rest = contents.strip_prefix(DELIM).ok_or_else(|| {
-        DomainError::Snapshot("missing opening +++ delimiter".into())
-    })?;
+    let rest = contents
+        .strip_prefix(DELIM)
+        .ok_or_else(|| DomainError::Snapshot("missing opening +++ delimiter".into()))?;
     let rest = rest.trim_start_matches('\n');
 
-    let close = rest.find(&format!("\n{DELIM}")).ok_or_else(|| {
-        DomainError::Snapshot("missing closing +++ delimiter".into())
-    })?;
+    let close = rest
+        .find(&format!("\n{DELIM}"))
+        .ok_or_else(|| DomainError::Snapshot("missing closing +++ delimiter".into()))?;
     let toml_block = &rest[..close];
     let body = rest[close + DELIM.len() + 1..].trim_start().to_string();
 

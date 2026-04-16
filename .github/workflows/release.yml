@@ -1,14 +1,11 @@
 name: Release
 
 # Builds prebuilt binaries for macOS/Linux on each tagged release.
-# Triggered by pushing a `v*` tag (e.g. `v0.2.0`).
+# Triggered by pushing a `v*` tag (e.g. `v0.0.1`).
 #
 # Outputs per platform:
 #   thoth-<version>-<target>.tar.gz   containing `thoth`, `thoth-mcp`, `thoth-gate`
 #   thoth-<version>-<target>.tar.gz.sha256
-#
-# Plus:
-#   thoth-discipline-<version>.plugin   the Cowork/Claude-Code plugin bundle
 #
 # Consumers (Homebrew formula, npm install script) fetch these directly.
 
@@ -18,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v0.2.0). Leave blank for a dry-run."
+        description: "Tag to build (e.g. v0.0.1). Leave blank for a dry-run."
         required: false
 
 permissions:
@@ -103,36 +100,10 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
-  # ------------------------------------------------------------- plugin zip
-  plugin:
-    name: package plugin
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Pack thoth-discipline.plugin
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION:-0.0.0-dev}"
-          mkdir -p dist
-          (cd plugins/thoth-discipline && zip -rq "../../dist/thoth-discipline-${VERSION}.plugin" . \
-            -x "*.DS_Store" "*.pyc")
-          (cd dist && shasum -a 256 "thoth-discipline-${VERSION}.plugin" \
-            > "thoth-discipline-${VERSION}.plugin.sha256")
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: thoth-discipline-plugin
-          path: |
-            dist/*.plugin
-            dist/*.sha256
-
   # ----------------------------------------------------------- gh release
   publish:
     name: publish release
-    needs: [build, plugin]
+    needs: [build]
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -147,5 +118,4 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
-            dist/*.plugin
           generate_release_notes: true

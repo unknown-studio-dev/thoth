@@ -138,13 +138,13 @@ impl Graph {
 
     /// BFS callees: `fqn` → what `fqn` calls, transitively, up to `depth`.
     pub async fn callees(&self, fqn: &str, depth: usize) -> Result<Vec<Node>> {
-        self.bfs(fqn, depth, Direction::Out, Some(EdgeKind::Calls))
+        self.bfs(fqn, depth, Direction::Out, Some(&[EdgeKind::Calls]))
             .await
     }
 
     /// BFS callers: who calls `fqn`, transitively, up to `depth`.
     pub async fn callers(&self, fqn: &str, depth: usize) -> Result<Vec<Node>> {
-        self.bfs(fqn, depth, Direction::In, Some(EdgeKind::Calls))
+        self.bfs(fqn, depth, Direction::In, Some(&[EdgeKind::Calls]))
             .await
     }
 
@@ -152,6 +152,43 @@ impl Graph {
     /// code" fan-outs in retrieval.
     pub async fn neighbors(&self, fqn: &str, depth: usize) -> Result<Vec<Node>> {
         self.bfs(fqn, depth, Direction::Both, None).await
+    }
+
+    /// Blast-radius / impact analysis: BFS from `fqn` grouped by distance.
+    ///
+    /// - [`BlastDir::Up`]: incoming `Calls`, `References`, and `Extends` —
+    ///   "what breaks if I change `fqn`?" (callers, referrers, subtypes).
+    /// - [`BlastDir::Down`]: outgoing `Calls` and `Extends` — "what does
+    ///   `fqn` depend on?" (transitive callees and parent types).
+    /// - [`BlastDir::Both`]: union of the two.
+    ///
+    /// Returns `(node, depth)` pairs in BFS order so callers can group by
+    /// depth without re-running the traversal.
+    pub async fn impact(
+        &self,
+        fqn: &str,
+        dir: BlastDir,
+        depth: usize,
+    ) -> Result<Vec<(Node, usize)>> {
+        let (direction, kinds) = match dir {
+            BlastDir::Up => (
+                Direction::In,
+                [EdgeKind::Calls, EdgeKind::References, EdgeKind::Extends],
+            ),
+            BlastDir::Down => (
+                Direction::Out,
+                // Second slot doubles `Calls` to pad the fixed-size array;
+                // `bfs_depth_tagged` dedupes edge-kind matches, so repeats
+                // are harmless.
+                [EdgeKind::Calls, EdgeKind::Calls, EdgeKind::Extends],
+            ),
+            BlastDir::Both => (
+                Direction::Both,
+                [EdgeKind::Calls, EdgeKind::References, EdgeKind::Extends],
+            ),
+        };
+        self.bfs_depth_tagged(fqn, depth, direction, Some(&kinds))
+            .await
     }
 
     /// Delete every node and every edge that touches any symbol declared in
@@ -219,6 +256,54 @@ impl Graph {
         Ok(out)
     }
 
+    /// Direct outgoing neighbours filtered to a single edge kind.
+    ///
+    /// Unlike [`Self::callees`] / [`Self::callers`] this is depth=1 and
+    /// returns [`Node`]s (not just FQNs) so callers can render a path/line
+    /// for every neighbour without a second round-trip. Missing nodes
+    /// (edges pointing at unresolved names — common for third-party
+    /// callees the indexer couldn't map) are silently dropped.
+    pub async fn out_neighbors(&self, fqn: &str, kind: EdgeKind) -> Result<Vec<Node>> {
+        let mut out = Vec::new();
+        for e in self.outgoing(fqn).await? {
+            if e.kind == kind
+                && let Some(n) = self.get(&e.to).await?
+            {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Direct incoming neighbours filtered to a single edge kind. Mirror of
+    /// [`Self::out_neighbors`].
+    pub async fn in_neighbors(&self, fqn: &str, kind: EdgeKind) -> Result<Vec<Node>> {
+        let mut out = Vec::new();
+        for e in self.incoming(fqn).await? {
+            if e.kind == kind
+                && let Some(n) = self.get(&e.from).await?
+            {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Unresolved destinations — i.e. `to` values of outgoing edges whose
+    /// kind matches but that have no corresponding [`Node`] (external
+    /// references, imports pointing at third-party modules, etc.). Useful
+    /// for the symbol-context tool to report "imports: serde::Deserialize"
+    /// even when `serde::Deserialize` isn't in the graph.
+    pub async fn out_unresolved(&self, fqn: &str, kind: EdgeKind) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for e in self.outgoing(fqn).await? {
+            if e.kind == kind && self.get(&e.to).await?.is_none() {
+                out.push(e.to);
+            }
+        }
+        Ok(out)
+    }
+
     /// Direct outgoing edges of any kind.
     pub async fn outgoing(&self, fqn: &str) -> Result<Vec<Edge>> {
         Ok(self
@@ -248,8 +333,26 @@ impl Graph {
         start: &str,
         depth: usize,
         dir: Direction,
-        only: Option<EdgeKind>,
+        only: Option<&[EdgeKind]>,
     ) -> Result<Vec<Node>> {
+        Ok(self
+            .bfs_depth_tagged(start, depth, dir, only)
+            .await?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect())
+    }
+
+    /// Core BFS that also records the depth each node was reached at.
+    /// `only = None` walks every [`EdgeKind`]; otherwise only edges whose
+    /// kind is in the slice are followed. `start` is never returned.
+    async fn bfs_depth_tagged(
+        &self,
+        start: &str,
+        depth: usize,
+        dir: Direction,
+        only: Option<&[EdgeKind]>,
+    ) -> Result<Vec<(Node, usize)>> {
         if depth == 0 {
             return Ok(Vec::new());
         }
@@ -267,7 +370,7 @@ impl Graph {
                     continue;
                 }
                 if let Some(node) = self.get(&nid).await? {
-                    out.push(node);
+                    out.push((node, d + 1));
                 }
                 frontier.push_back((nid, d + 1));
             }
@@ -275,24 +378,43 @@ impl Graph {
         Ok(out)
     }
 
-    async fn step(&self, cur: &str, dir: Direction, only: Option<EdgeKind>) -> Result<Vec<String>> {
+    async fn step(
+        &self,
+        cur: &str,
+        dir: Direction,
+        only: Option<&[EdgeKind]>,
+    ) -> Result<Vec<String>> {
+        let allow = |k: EdgeKind| only.is_none_or(|ks| ks.contains(&k));
         let mut out = Vec::new();
         if matches!(dir, Direction::Out | Direction::Both) {
             for e in self.outgoing(cur).await? {
-                if only.is_none_or(|k| k == e.kind) {
+                if allow(e.kind) {
                     out.push(e.to);
                 }
             }
         }
         if matches!(dir, Direction::In | Direction::Both) {
             for e in self.incoming(cur).await? {
-                if only.is_none_or(|k| k == e.kind) {
+                if allow(e.kind) {
                     out.push(e.from);
                 }
             }
         }
         Ok(out)
     }
+}
+
+/// Direction for [`Graph::impact`]. `Up` walks reverse edges (callers,
+/// referrers, subclasses); `Down` walks forward edges (callees, parent
+/// types); `Both` is the union.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlastDir {
+    /// Reverse edges — who depends on `fqn`.
+    Up,
+    /// Forward edges — what `fqn` depends on.
+    Down,
+    /// Union of both directions.
+    Both,
 }
 
 #[derive(Clone, Copy)]

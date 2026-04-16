@@ -66,14 +66,12 @@ impl DomainIngestor for AsanaIngestor {
         let mut offset: Option<String> = None;
 
         loop {
-            let mut url = reqwest::Url::parse(&format!(
-                "{ASANA_BASE}/projects/{}/tasks",
-                self.project_gid
-            ))
-            .map_err(|e| DomainError::Source {
-                source_id: "asana".into(),
-                message: format!("bad URL: {e}"),
-            })?;
+            let mut url =
+                reqwest::Url::parse(&format!("{ASANA_BASE}/projects/{}/tasks", self.project_gid))
+                    .map_err(|e| DomainError::Source {
+                    source_id: "asana".into(),
+                    message: format!("bad URL: {e}"),
+                })?;
             {
                 let mut q = url.query_pairs_mut();
                 q.append_pair("opt_fields", OPT_FIELDS);

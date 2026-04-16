@@ -95,10 +95,10 @@ impl DomainIngestor for FileIngestor {
                 message: format!("{}: {e}", path.display()),
             })?;
 
-            if let Some(cutoff) = filter.since {
-                if fr.updated_at < cutoff {
-                    continue;
-                }
+            if let Some(cutoff) = filter.since
+                && fr.updated_at < cutoff
+            {
+                continue;
             }
 
             out.push(RemoteRule {

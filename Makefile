@@ -36,7 +36,9 @@ export RUST_LOG  ?= thoth=info,tantivy=warn,warn
 
 .PHONY: help build release debug check clippy fmt fmt-check test test-mcp \
         clean clean-self init index query watch mcp demo doctor eval \
-        memory-show memory-forget skills-list print-root
+        memory-show memory-forget skills-list print-root \
+        smoke smoke-rust smoke-build smoke-npm \
+        install-local install-local-npm uninstall-local
 
 # --- help ------------------------------------------------------------------
 
@@ -124,6 +126,31 @@ demo: $(THOTH) init ## Full happy path: index this repo + run a few real queries
 	    $(THOTH) --root $(THOTH_ROOT) query -k 4 "$$q" || true; \
 	    echo; \
 	done
+
+# --- local smoke (no tags, no publish) -------------------------------------
+
+smoke: ## Full local smoke (Rust + binary + npm pack)
+	./scripts/local-smoke.sh full
+
+smoke-rust: ## fmt-check + clippy + test + feature matrix
+	./scripts/local-smoke.sh rust
+
+smoke-build: ## smoke-rust + build host binary + tar + sha256
+	./scripts/local-smoke.sh build
+
+smoke-npm: ## Build binary + npm pack wrapper + platform stub + local install
+	./scripts/local-smoke.sh npm
+
+# --- install-local (thực sự cài ra PATH để xài thử) ------------------------
+
+install-local: ## cargo install → binary vào ~/.cargo/bin/ (cách nhanh nhất)
+	./scripts/install-local.sh cargo
+
+install-local-npm: ## Build + npm install -g (mô phỏng đường user thật)
+	./scripts/install-local.sh npm
+
+uninstall-local: ## Gỡ cả cargo install và npm global
+	./scripts/install-local.sh uninstall
 
 # --- housekeeping ----------------------------------------------------------
 

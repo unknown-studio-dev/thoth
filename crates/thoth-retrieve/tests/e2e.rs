@@ -212,3 +212,134 @@ async fn recall_fuses_markdown_memory_hits() {
         out.chunks
     );
 }
+
+#[tokio::test]
+async fn recall_surfaces_lessons_by_trigger() {
+    // Reflective memory (LESSONS.md) must be surfaced by recall, not just
+    // MEMORY.md. Without this, `thoth_lesson_outcome` bumps counters in a
+    // file nobody reads — the learn-from-mistakes loop stays open.
+    let thoth_dir = tempdir().unwrap();
+    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
+
+    tokio::fs::write(
+        thoth_dir.path().join("LESSONS.md"),
+        "# LESSONS.md\n\
+         \n\
+         ### when editing sqlx migrations\n\
+         Always run `sqlx prepare` after changing SQL. Skipping this breaks CI.\n\
+         \n",
+    )
+    .await
+    .unwrap();
+
+    let r = Retriever::new(store);
+    // Query contains tokens from both the trigger ("sqlx", "migrations")
+    // and the advice ("prepare"). Any of them should fire the lesson.
+    let out = r
+        .recall(&Query::text("sqlx migrations prepare"))
+        .await
+        .unwrap();
+
+    let lesson_hit = out
+        .chunks
+        .iter()
+        .find(|c| c.path.ends_with("LESSONS.md"))
+        .unwrap_or_else(|| panic!("expected a LESSONS.md chunk: {:?}", out.chunks));
+    assert!(
+        lesson_hit.preview.contains("sqlx prepare")
+            || lesson_hit.preview.contains("sqlx migrations"),
+        "preview should surface trigger or advice: {:?}",
+        lesson_hit.preview
+    );
+}
+
+/// The indexer writes an `Extends` edge for every `impl Trait for Type`
+/// block. Checking this end-to-end proves both that the parser's new
+/// `extract_extends` path fires *and* that the retrieve layer routes
+/// the resulting `(child, parent)` pair through `write_extends_edges`
+/// into the graph.
+#[tokio::test]
+async fn indexer_writes_extends_edge_for_rust_impl_trait() {
+    let src = r#"
+pub trait Greet {
+    fn hello(&self) -> String;
+}
+
+pub struct English;
+
+impl Greet for English {
+    fn hello(&self) -> String { "hello".into() }
+}
+"#;
+    let src_dir = tempdir().unwrap();
+    tokio::fs::write(src_dir.path().join("greet.rs"), src)
+        .await
+        .unwrap();
+
+    let thoth_dir = tempdir().unwrap();
+    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
+    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
+    idx.index_path(src_dir.path()).await.unwrap();
+
+    // `greet::English` extends `greet::Greet`. The aliases map in this
+    // file is empty (no `use` statements), so the parent name `Greet`
+    // is written through unresolved — the Extends edge stores the bare
+    // name. Accept either the bare or resolved form to stay robust to
+    // future resolution upgrades.
+    let graph = thoth_graph::Graph::new(store.kv.clone());
+    let extends = graph
+        .outgoing("greet::English")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == thoth_graph::EdgeKind::Extends)
+        .collect::<Vec<_>>();
+    assert!(
+        extends.iter().any(|e| e.to == "Greet" || e.to == "greet::Greet"),
+        "expected an Extends edge English -> Greet; got {extends:?}"
+    );
+}
+
+/// `use foo::Bar as Baz;` paired with a call to `Baz::make()` should
+/// rewrite the call edge's destination from the local alias (`make`)
+/// to the resolved path the graph actually knows about. We can't assert
+/// the exact resolved FQN without cross-file linking, but we *can*
+/// verify that the import-alias pipeline populated the file's Imports
+/// edges with the fully qualified target.
+#[tokio::test]
+async fn indexer_uses_import_aliases_for_imports_edge() {
+    let src = r#"
+use std::sync::Arc as A;
+use std::collections::HashMap;
+
+pub fn noop() {}
+"#;
+    let src_dir = tempdir().unwrap();
+    tokio::fs::write(src_dir.path().join("m.rs"), src)
+        .await
+        .unwrap();
+
+    let thoth_dir = tempdir().unwrap();
+    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
+    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
+    idx.index_path(src_dir.path()).await.unwrap();
+
+    let graph = thoth_graph::Graph::new(store.kv.clone());
+    let imports = graph
+        .outgoing("m")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == thoth_graph::EdgeKind::Imports)
+        .map(|e| e.to)
+        .collect::<Vec<_>>();
+
+    assert!(
+        imports.iter().any(|t| t == "std::sync::Arc"),
+        "expected resolved target std::sync::Arc; got {imports:?}"
+    );
+    assert!(
+        imports.iter().any(|t| t == "std::collections::HashMap"),
+        "expected resolved target std::collections::HashMap; got {imports:?}"
+    );
+}

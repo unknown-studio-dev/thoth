@@ -23,6 +23,7 @@ path = "src/lib.rs"
 [dependencies]
 thoth-core     = { workspace = true }
 thoth-parse    = { workspace = true }
+thoth-graph    = { workspace = true }
 thoth-store    = { workspace = true }
 thoth-retrieve = { workspace = true }
 thoth-memory   = { workspace = true }

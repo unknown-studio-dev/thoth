@@ -165,3 +165,215 @@ async fn initialized_notification_returns_nothing() {
 
     assert!(srv.handle(msg).await.is_none());
 }
+
+/// Small helper: index a tempdir containing one Rust source file through
+/// the MCP `thoth_index` tool, so subsequent graph tools have data to
+/// work with. Returns the source directory's temp handle so the caller
+/// can keep it alive for the test's duration.
+async fn index_rust_fixture(srv: &Server, src: &str) -> tempfile::TempDir {
+    let src_dir = tempfile::tempdir().unwrap();
+    tokio::fs::write(src_dir.path().join("m.rs"), src)
+        .await
+        .unwrap();
+    let resp = srv
+        .handle(req(
+            100,
+            "thoth.call",
+            json!({
+                "name": "thoth_index",
+                "arguments": { "path": src_dir.path().to_string_lossy() }
+            }),
+        ))
+        .await
+        .expect("response");
+    assert!(resp.error.is_none(), "index failed: {:?}", resp.error);
+    let r = resp.result.unwrap();
+    // The indexer walker filters hidden directories by default. On
+    // macOS / Linux the tempdir path doesn't start with a dot, so the
+    // walk usually fires — but a misconfiguration (or a tempdir created
+    // under a dot-prefixed parent) would produce zero files. Catching
+    // it here turns a confusing "no edges" assertion further down into
+    // a clear "the indexer saw nothing" error.
+    let files = r["data"]["files"].as_u64().unwrap_or(0);
+    assert!(
+        files >= 1,
+        "indexer walked 0 files; test fixture not seen: {r}"
+    );
+    src_dir
+}
+
+#[tokio::test]
+async fn impact_returns_depth_grouped_callers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = open(&tmp).await;
+
+    // `root -> mid -> leaf`. An upstream impact on `leaf` should surface
+    // `mid` at depth 1 and `root` at depth 2.
+    let src = r#"
+pub fn leaf() -> i32 { 1 }
+pub fn mid() -> i32 { leaf() }
+pub fn root() -> i32 { mid() }
+"#;
+    let _src_dir = index_rust_fixture(&srv, src).await;
+
+    let resp = srv
+        .handle(req(
+            101,
+            "thoth.call",
+            json!({
+                "name": "thoth_impact",
+                "arguments": { "fqn": "m::leaf", "direction": "up", "depth": 3 }
+            }),
+        ))
+        .await
+        .expect("response");
+    let data = resp.result.unwrap()["data"].clone();
+    let by_depth = data["by_depth"].as_array().expect("by_depth array");
+    // Collect (depth, fqn) tuples for robust assertions.
+    let mut hits: Vec<(u64, String)> = Vec::new();
+    for level in by_depth {
+        let d = level["depth"].as_u64().unwrap();
+        for n in level["nodes"].as_array().unwrap() {
+            hits.push((d, n["fqn"].as_str().unwrap().to_string()));
+        }
+    }
+    assert!(
+        hits.iter().any(|(d, f)| *d == 1 && f == "m::mid"),
+        "expected m::mid at depth 1; got {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|(d, f)| *d == 2 && f == "m::root"),
+        "expected m::root at depth 2; got {hits:?}"
+    );
+}
+
+#[tokio::test]
+async fn symbol_context_categorizes_neighbors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = open(&tmp).await;
+
+    let src = r#"
+pub trait Greet { fn hello(&self); }
+pub struct English;
+impl Greet for English { fn hello(&self) {} }
+
+pub fn caller() { let _ = English; }
+"#;
+    let _src_dir = index_rust_fixture(&srv, src).await;
+
+    let resp = srv
+        .handle(req(
+            102,
+            "thoth.call",
+            json!({
+                "name": "thoth_symbol_context",
+                "arguments": { "fqn": "m::English" }
+            }),
+        ))
+        .await
+        .expect("response");
+    let data = resp.result.unwrap()["data"].clone();
+
+    let extends: Vec<String> = data["extends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["fqn"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        extends.iter().any(|f| f == "m::Greet"),
+        "English should extend Greet; got {extends:?}"
+    );
+
+    let siblings: Vec<String> = data["siblings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["fqn"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        siblings.iter().any(|f| f == "m::Greet") || siblings.iter().any(|f| f == "m::caller"),
+        "expected other same-file symbols as siblings; got {siblings:?}"
+    );
+}
+
+#[tokio::test]
+async fn detect_changes_finds_touched_symbol_and_blast_radius() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = open(&tmp).await;
+
+    let src = r#"
+pub fn leaf() -> i32 { 1 }
+pub fn mid() -> i32 { leaf() }
+pub fn root() -> i32 { mid() }
+"#;
+    let src_dir = index_rust_fixture(&srv, src).await;
+    let path_str = src_dir.path().join("m.rs").to_string_lossy().into_owned();
+
+    // Construct a synthetic diff that targets the line range where
+    // `leaf` is declared (line 2, 1 line long). The post-image is
+    // trivially the same line count so we report `+2,1`.
+    let diff = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -2,1 +2,1 @@\n pub fn leaf() -> i32 {{ 1 }}\n",
+        path = path_str,
+    );
+
+    let resp = srv
+        .handle(req(
+            103,
+            "thoth.call",
+            json!({
+                "name": "thoth_detect_changes",
+                "arguments": { "diff": diff, "depth": 3 }
+            }),
+        ))
+        .await
+        .expect("response");
+    let data = resp.result.unwrap()["data"].clone();
+
+    let touched: Vec<String> = data["touched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["fqn"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        touched.iter().any(|f| f == "m::leaf"),
+        "expected m::leaf in touched set; got {touched:?}"
+    );
+
+    let impact: Vec<String> = data["impact"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["fqn"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        impact.iter().any(|f| f == "m::mid"),
+        "expected m::mid in upstream blast radius; got {impact:?}"
+    );
+}
+
+#[tokio::test]
+async fn impact_reports_unknown_symbol_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let srv = open(&tmp).await;
+
+    let resp = srv
+        .handle(req(
+            104,
+            "thoth.call",
+            json!({
+                "name": "thoth_impact",
+                "arguments": { "fqn": "does::not::exist" }
+            }),
+        ))
+        .await
+        .expect("response");
+    let result = resp.result.unwrap();
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "missing symbol should return is_error=true: {result}"
+    );
+}

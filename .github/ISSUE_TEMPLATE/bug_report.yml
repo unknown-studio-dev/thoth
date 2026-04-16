@@ -13,7 +13,7 @@ body:
     attributes:
       label: Thoth version
       description: Output of `thoth --version`.
-      placeholder: thoth 0.2.0
+      placeholder: thoth 0.0.1
     validations:
       required: true
 
@@ -26,7 +26,7 @@ body:
         - thoth CLI
         - thoth-mcp (MCP server)
         - thoth-gate (strict-mode hook)
-        - thoth-discipline plugin
+        - thoth plugin (Claude Code / Cowork)
         - Homebrew / npm packaging
         - Docs / README
         - I'm not sure

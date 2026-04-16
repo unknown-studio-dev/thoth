@@ -12,7 +12,7 @@ cd homebrew-thoth
 mkdir -p Formula
 cp ../thoth/packaging/homebrew/thoth.rb Formula/
 git add Formula/thoth.rb
-git commit -m "chore: initial formula for thoth v0.2.0"
+git commit -m "chore: initial formula for thoth v0.0.1"
 git push -u origin main
 ```
 
@@ -22,7 +22,7 @@ After `.github/workflows/release.yml` finishes and uploads tarballs,
 run the helper to stamp fresh SHA256s into the formula:
 
 ```bash
-./packaging/homebrew/bump.sh v0.2.0
+./packaging/homebrew/bump.sh v0.0.1
 # copy the output into homebrew-thoth/Formula/thoth.rb and commit
 ```
 
