@@ -960,6 +960,14 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
     if !root.exists() {
         return Ok(());
     }
+
+    // Bump the session watermark so ReflectionDebt windows off this
+    // point. Failing the write only degrades debt accounting; it must
+    // never block the hook.
+    if let Err(e) = thoth_memory::mark_session_start(root).await {
+        tracing::warn!(error = %e, "mark_session_start failed");
+    }
+
     // Policy banner — always emitted, even when MEMORY.md / LESSONS.md
     // are empty. This is the only signal in the default wiring that
     // tells the agent Thoth owns long-term memory *before* it reaches
@@ -986,6 +994,20 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
     );
     println!();
 
+    // Carry-over nag: if the previous session left reflection debt
+    // that crossed the nudge threshold, run_stop wrote a marker into
+    // `.thoth/.reflect-nag`. Consume it here so the agent sees the
+    // message in its first context injection of the new session —
+    // stderr during run_stop only surfaces to the user.
+    if let Some(body) = thoth_memory::reflection::take_nag(root).await {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            println!("### Reflection debt from the previous session");
+            println!("{trimmed}");
+            println!();
+        }
+    }
+
     // Print MEMORY.md + LESSONS.md verbatim; Claude Code picks stdout up
     // as additional context. Keep it compact.
     for name in ["MEMORY.md", "LESSONS.md"] {
@@ -999,6 +1021,53 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
         }
         println!("### {name}");
         println!("{trimmed}");
+        println!();
+    }
+
+    // Curator pass. Equivalent to invoking `thoth curate --quiet`
+    // directly, but inlined so we don't re-exec the binary from its
+    // own hook (costly on cold start). Any findings are printed to
+    // stdout → Claude Code injects them as banner context.
+    if let Err(e) = curate_quiet(root).await {
+        tracing::warn!(error = %e, "curate_quiet failed");
+    }
+
+    Ok(())
+}
+
+/// Inlined equivalent of `thoth curate --quiet` used by the
+/// SessionStart hook. Keeps the hook self-contained (no re-exec) and
+/// never fails the hook — errors degrade to a trace line.
+async fn curate_quiet(root: &Path) -> anyhow::Result<()> {
+    let mut findings: Vec<String> = Vec::new();
+
+    // Forget pass via daemon if alive; otherwise skip silently — the
+    // direct-store path needs an exclusive redb lock that the MCP
+    // daemon typically holds at session start. Losing this run only
+    // delays the GC by one session.
+    if let Some(mut d) = crate::daemon::DaemonClient::try_connect(root).await
+        && let Ok(res) = d.call("thoth_memory_forget", serde_json::json!({})).await
+        && !crate::daemon::tool_is_error(&res)
+    {
+        let t = crate::daemon::tool_text(&res).trim().to_string();
+        if !t.is_empty() {
+            findings.push(t);
+        }
+    }
+
+    // Reflection debt report — independent of the daemon. This is
+    // the same counter the gate blocks on, surfaced for visibility.
+    let disc = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let debt = thoth_memory::ReflectionDebt::compute(root).await;
+    if debt.should_nudge(&disc) {
+        findings.push(debt.render());
+    }
+
+    if !findings.is_empty() {
+        println!("### Curator findings");
+        for f in &findings {
+            println!("- {f}");
+        }
         println!();
     }
     Ok(())
@@ -1017,6 +1086,21 @@ async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
         .to_string();
     if prompt.is_empty() {
         return Ok(());
+    }
+
+    // Reflection-debt heartbeat. If the agent has been editing
+    // without persisting anything, prepend a visible reminder to the
+    // recall block below so the agent sees it at every prompt — the
+    // single most load-bearing moment for the reflect loop.
+    //
+    // Deliberately cheap: two file reads (config + two JSONL tails).
+    // Worst case < 5 ms on a session-sized log.
+    let discipline = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let debt = thoth_memory::ReflectionDebt::compute(root).await;
+    if debt.should_nudge(&discipline) {
+        println!("### Reflection debt");
+        println!("{}", debt.render());
+        println!();
     }
 
     // Prefer the running MCP daemon. `thoth-mcp` holds an exclusive redb
@@ -1131,6 +1215,21 @@ async fn run_post_tool(root: &Path, payload: &Value) -> anyhow::Result<()> {
 async fn run_stop(root: &Path, _payload: &Value) -> anyhow::Result<()> {
     if !root.exists() {
         return Ok(());
+    }
+
+    // Reflection-debt nag. Compute first so stderr carries the
+    // message to the user (who can see it immediately) AND drop a
+    // marker file so the next SessionStart injects the message into
+    // agent context (where it's actionable). Failing either path is
+    // non-fatal — the Stop hook must never block the turn.
+    let discipline = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let debt = thoth_memory::ReflectionDebt::compute(root).await;
+    if debt.should_nudge(&discipline) {
+        let msg = debt.render();
+        eprintln!("thoth: {msg}");
+        if let Err(e) = thoth_memory::reflection::write_nag(root, &msg).await {
+            tracing::warn!(error = %e, "write_nag failed");
+        }
     }
 
     // Prefer the daemon: `thoth_memory_forget` runs the same TTL +

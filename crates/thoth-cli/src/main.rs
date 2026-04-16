@@ -289,6 +289,18 @@ enum Cmd {
         #[arg(short = 'd', long, default_value_t = 2)]
         depth: usize,
     },
+
+    /// Maintenance pass over memory. Runs the forget pass (TTL +
+    /// capacity + quarantine), reports reflection debt, and — with
+    /// `--quiet` — stays silent unless something actionable turned
+    /// up. Also invoked by the `SessionStart` hook so findings land
+    /// in the agent's first context injection.
+    Curate {
+        /// Hide output when there's nothing to flag. Used by the
+        /// SessionStart hook so a clean session emits no banner noise.
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 /// CLI-facing subset of [`thoth_graph::BlastDir`] so clap can derive
@@ -597,6 +609,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Changes { from, depth } => {
             cmd_changes(&cli.root, from.as_deref(), depth, cli.json).await?
         }
+        Cmd::Curate { quiet } => cmd_curate(&cli.root, quiet).await?,
         Cmd::Domain { cmd } => match cmd {
             DomainCmd::Sync {
                 source,
@@ -799,6 +812,20 @@ const DEFAULT_CONFIG_TOML: &str = r#"# Thoth config. All fields are optional; de
 
 # Append decisions to `.thoth/gate.jsonl` for calibration.
 # gate_telemetry_enabled = false
+
+# Reflection-debt thresholds. Debt = mutations (successful Write/Edit/
+# NotebookEdit passes, read from gate.jsonl) minus remembers (append
+# ops in memory-history.jsonl), windowed to the current session.
+#
+# Above the nudge threshold, the Stop + UserPromptSubmit hooks inject
+# a reminder into agent context. Above the block threshold, the gate
+# hard-blocks new mutations until the agent calls thoth_remember_fact
+# or thoth_remember_lesson. Set `THOTH_DEFER_REFLECT=1` in the env to
+# bypass for one session.
+#
+# Set either to `0` to disable that tier.
+# reflect_debt_nudge = 10
+# reflect_debt_block = 20
 
 # Additional Bash prefixes that bypass the gate (additive with built-ins
 # like `cargo test`, `git status`, `grep`).
@@ -1938,6 +1965,96 @@ async fn cmd_changes(
     let args = serde_json::json!({ "diff": diff, "depth": depth });
     let (text, data, is_error) = call_mcp_tool(root, "thoth_detect_changes", args).await?;
     emit_output(text, data, is_error, json)
+}
+
+/// `thoth curate` — maintenance pass over memory. Composes three
+/// cheap checks that together keep the store honest between sessions:
+///
+/// 1. **Forget pass** (`thoth_memory_forget` via daemon, else direct)
+///    — TTL + capacity + quarantine pruning.
+/// 2. **Reflection debt report** — same counter the gate blocks on,
+///    surfaced here as a heads-up so the user can see where a session
+///    landed before the next one starts.
+///
+/// Designed to be safe to call every SessionStart: short-circuit to a
+/// silent exit when `--quiet` is set and nothing actionable turned
+/// up. That keeps the banner clean in the healthy case.
+async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
+    if !root.exists() {
+        if !quiet {
+            println!("(no .thoth/ at {} — nothing to curate)", root.display());
+        }
+        return Ok(());
+    }
+
+    let mut findings: Vec<String> = Vec::new();
+
+    // Forget pass. Prefer the daemon so we don't collide with the
+    // MCP server's exclusive redb lock; fall back to opening the
+    // store directly.
+    let forget_report = if let Some(mut d) = daemon::DaemonClient::try_connect(root).await {
+        match d.call("thoth_memory_forget", serde_json::json!({})).await {
+            Ok(res) if !daemon::tool_is_error(&res) => Some(daemon::tool_text(&res).to_string()),
+            Ok(res) => {
+                findings.push(format!("forget failed: {}", daemon::tool_text(&res)));
+                None
+            }
+            Err(e) => {
+                findings.push(format!("forget failed: {e}"));
+                None
+            }
+        }
+    } else {
+        // Direct store access — needed when no daemon is alive.
+        // `forget_pass` returns a detailed report; only surface it
+        // when something was actually dropped.
+        match thoth_memory::MemoryManager::open(root).await {
+            Ok(m) => match m.forget_pass().await {
+                Ok(r) => {
+                    let total = r.episodes_ttl + r.episodes_cap;
+                    if total > 0 {
+                        Some(format!("forgot {total} stale episode(s)"))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    findings.push(format!("forget failed: {e}"));
+                    None
+                }
+            },
+            Err(e) => {
+                findings.push(format!("open store failed: {e}"));
+                None
+            }
+        }
+    };
+    if let Some(s) = forget_report {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            findings.push(trimmed.to_string());
+        }
+    }
+
+    // Reflection debt. Sync compute keeps this cheap (~1 ms).
+    let disc = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let debt = thoth_memory::ReflectionDebt::compute(root).await;
+    if debt.should_nudge(&disc) {
+        findings.push(debt.render());
+    }
+
+    if findings.is_empty() {
+        if !quiet {
+            println!("curate: nothing to flag (debt={}, no TTL work)", debt.debt());
+        }
+        return Ok(());
+    }
+
+    println!("### Curator findings");
+    for f in &findings {
+        println!("- {f}");
+    }
+    Ok(())
 }
 
 /// Invoke an MCP tool over the daemon socket when one is running; else

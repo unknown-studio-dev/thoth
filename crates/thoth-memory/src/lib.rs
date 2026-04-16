@@ -20,7 +20,9 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
+pub mod reflection;
 pub mod working;
+pub use reflection::{ReflectionDebt, mark_session_start};
 pub use working::{WorkingMemory, WorkingNote};
 
 use std::path::Path;
@@ -150,6 +152,27 @@ pub struct DisciplineConfig {
     /// for quarantine. Default `5` — a freshly minted lesson with one
     /// failure shouldn't get yanked.
     pub quarantine_min_attempts: u32,
+    /// Reflection debt — number of **mutations** (successful Write/Edit/
+    /// NotebookEdit tool calls, derived from `gate.jsonl`) since the last
+    /// `thoth_remember_fact` / `thoth_remember_lesson` call (derived from
+    /// `memory-history.jsonl`). Above [`Self::reflect_debt_nudge`] the
+    /// hooks surface a soft reminder; above [`Self::reflect_debt_block`]
+    /// the gate hard-blocks new mutations until the agent reflects.
+    ///
+    /// Rationale: pre-action recall is enforced by the gate, but
+    /// post-action reflection was previously a prompt contract only —
+    /// agents drift. This turns reflection into an enforced loop with
+    /// the same mechanism (hook injection + PreToolUse block) that
+    /// proved effective for recall.
+    ///
+    /// Default `10`. Set to `0` to disable the soft reminder.
+    pub reflect_debt_nudge: u32,
+    /// Reflection debt that triggers a hard gate block on mutations.
+    /// Set `THOTH_DEFER_REFLECT=1` to bypass one session when the user
+    /// genuinely wants to land a batch before reflecting.
+    ///
+    /// Default `20`. Set to `0` to disable the hard block.
+    pub reflect_debt_block: u32,
 }
 
 impl Default for DisciplineConfig {
@@ -164,6 +187,8 @@ impl Default for DisciplineConfig {
             gate_require_nudge: false,
             quarantine_failure_ratio: 0.66,
             quarantine_min_attempts: 5,
+            reflect_debt_nudge: 10,
+            reflect_debt_block: 20,
         }
     }
 }
@@ -192,7 +217,27 @@ impl DisciplineConfig {
                 return Self::default();
             }
         };
-        match toml::from_str::<ConfigFile>(&text) {
+        Self::parse_or_default(&text, &path)
+    }
+
+    /// Sync twin of [`Self::load_or_default`] for callers that can't
+    /// spin a tokio runtime (the `thoth-gate` hook binary).
+    pub fn load_or_default_sync(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "discipline: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        Self::parse_or_default(&text, &path)
+    }
+
+    fn parse_or_default(text: &str, path: &Path) -> Self {
+        match toml::from_str::<ConfigFile>(text) {
             Ok(cf) => cf.discipline,
             Err(e) => {
                 tracing::warn!(error = %e, path = %path.display(),

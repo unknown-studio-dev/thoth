@@ -232,6 +232,49 @@ fn run(input: &Value) -> (Value, Option<String>, Option<TelemetryRecord>) {
     let actor = resolve_actor();
     let policy = cfg.resolve_policy(&actor);
 
+    // Reflection-debt block. Independent of the recall-relevance
+    // decision below — runs even in nudge mode, because reflection is
+    // a separate contract (persist what you learn) from grounding
+    // (consult what was learned). Only fires for mutations (the
+    // `Intent::Mutation` arm we're already in) and only when
+    // `discipline.reflect_debt_block` is non-zero.
+    //
+    // `THOTH_DEFER_REFLECT=1` is the explicit bypass — matches the
+    // memory-discipline skill's wording so the stderr message doubles
+    // as documentation.
+    if policy.mode != PolicyMode::Off {
+        let disc = thoth_memory::DisciplineConfig::load_or_default_sync(&root);
+        let debt = thoth_memory::ReflectionDebt::compute_sync(&root);
+        let bypass = std::env::var("THOTH_DEFER_REFLECT").is_ok_and(|v| v == "1" || v == "true");
+        if !bypass && debt.should_block(&disc) {
+            let msg = format!(
+                "Thoth discipline: reflection debt {} ≥ block threshold {} \
+                 ({} mutation(s), {} remember(s) this session). Call \
+                 `thoth_remember_fact` / `thoth_remember_lesson` for anything \
+                 durable from the recent edits, or set \
+                 `THOTH_DEFER_REFLECT=1` to dismiss for this session.",
+                debt.debt(),
+                disc.reflect_debt_block,
+                debt.mutations,
+                debt.remembers,
+            );
+            let telemetry = cfg.telemetry_enabled.then(|| TelemetryRecord {
+                root: root.clone(),
+                ts_iso: now_iso(),
+                actor: actor.clone(),
+                tool: tool_name.clone(),
+                path: tool_input_path(&tool_input),
+                decision: "block".to_string(),
+                reason: "reflection_debt".to_string(),
+                recency_secs: None,
+                best_score: None,
+                considered: 0,
+                missed_tokens: Vec::new(),
+            });
+            return (block_json(&msg), Some(msg), telemetry);
+        }
+    }
+
     if policy.mode == PolicyMode::Off {
         let telemetry = cfg.telemetry_enabled.then(|| TelemetryRecord {
             root: root.clone(),
@@ -1513,6 +1556,112 @@ mod tests {
         // Past short window + threshold 0 → time_lapsed miss → block under strict.
         assert_eq!(d.verdict, Verdict::Block);
         assert_eq!(d.reason, "time_lapsed");
+    }
+
+    // ---- reflection-debt block ----
+
+    // These tests mutate process-wide env (`THOTH_ROOT`,
+    // `THOTH_DEFER_REFLECT`) — serialise them so the default
+    // parallel test runner can't race.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn reflection_debt_block_fires_on_mutation_over_threshold() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Set up a .thoth root with:
+        //   - config.toml lowering reflect_debt_block to 3
+        //   - gate.jsonl with 5 passed Write events (debt = 5)
+        //   - no memory-history.jsonl (remembers = 0)
+        // Gate should block the incoming Write tool call.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[discipline]
+mode = "nudge"
+reflect_debt_block = 3
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("gate.jsonl"),
+            (0..5)
+                .map(|_| r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        // Point the gate at this root via THOTH_ROOT. `THOTH_DEFER_REFLECT`
+        // is cleared so the bypass doesn't kick in.
+        // SAFETY: tests using env vars serialise via the runtime scheduler;
+        // we use distinct vars so no sibling test races on these.
+        unsafe {
+            std::env::set_var("THOTH_ROOT", tmp.path());
+            std::env::remove_var("THOTH_DEFER_REFLECT");
+        }
+
+        let input = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": "src/lib.rs", "content": "fn x() {}" }
+        });
+        let (verdict, stderr, telemetry) = run(&input);
+
+        assert_eq!(verdict["decision"], "block", "verdict: {verdict}");
+        let msg = stderr.expect("stderr message on block");
+        assert!(
+            msg.contains("reflection debt"),
+            "stderr should explain why: {msg}"
+        );
+        assert!(msg.contains("THOTH_DEFER_REFLECT"), "stderr should mention bypass: {msg}");
+        // No telemetry because the config above left telemetry_enabled at
+        // its default (false).
+        assert!(telemetry.is_none(), "telemetry shouldn't fire when disabled");
+
+        unsafe { std::env::remove_var("THOTH_ROOT"); }
+    }
+
+    #[test]
+    fn reflection_debt_bypass_via_env_var() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[discipline]
+mode = "nudge"
+reflect_debt_block = 3
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("gate.jsonl"),
+            (0..10)
+                .map(|_| r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("THOTH_ROOT", tmp.path());
+            std::env::set_var("THOTH_DEFER_REFLECT", "1");
+        }
+
+        let input = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": "src/lib.rs", "content": "fn x() {}" }
+        });
+        let (verdict, _stderr, _tel) = run(&input);
+        // With bypass set, the debt check doesn't fire — we fall through
+        // to the recall-relevance path, which on an empty log under
+        // nudge mode emits a nudge (not a block).
+        assert_ne!(verdict["decision"], "block", "bypass should prevent debt block: {verdict}");
+
+        unsafe {
+            std::env::remove_var("THOTH_ROOT");
+            std::env::remove_var("THOTH_DEFER_REFLECT");
+        }
     }
 
     // ---- glob ----

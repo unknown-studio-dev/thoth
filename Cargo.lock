@@ -5697,6 +5697,7 @@ version = "0.0.1"
 dependencies = [
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thoth-core",
  "thoth-store",
