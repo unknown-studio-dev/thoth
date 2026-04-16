@@ -17,6 +17,9 @@
   <a href="./LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-green" alt="license" /></a>
 </p>
 
+> [!WARNING]
+> **Work in progress — not production-ready.** Thoth is under active development (`0.0.1-alpha`). APIs, on-disk formats, and CLI flags may change without notice. Expect bugs, breaking changes, and incomplete features. Use at your own risk; do **not** rely on it for production workloads yet.
+
 ---
 
 ## What it is
@@ -30,13 +33,18 @@ memory of a codebase. The project ships in two layers:
    makes a Claude Code / Cowork session actually *use* the memory on every
    turn.
 
-Four memory kinds, one store:
+Five memory kinds, one store:
 
 - **Semantic** — every symbol, call, import, reference, parsed by tree-sitter.
 - **Episodic** — every query, answer, and outcome appended to an FTS5 log.
 - **Procedural** — reusable skills stored as `agentskills.io`-compatible folders.
 - **Reflective** — lessons learned from mistakes, confidence-scored in
   `LESSONS.md`, auto-quarantined when they start doing more harm than good.
+- **Domain** — business rules, invariants, workflows and glossary ingested
+  from Notion / Asana / NotebookLM / local files and snapshotted to
+  `domain/<context>/` as reviewable markdown. Answers *"why does this
+  enforce a $500 refund limit?"* — the code-aware → codebase-aware gap.
+  See [ADR 0001](./docs/adr/0001-domain-memory.md).
 
 Two operating modes:
 
@@ -63,13 +71,13 @@ brew install thoth
 ### npm
 
 ```bash
-npm install -g thoth-memory
+npm install -g @unknownstudio/thoth-cc
 # or one-off:
-npx thoth-memory setup
+npx @unknownstudio/thoth-cc setup
 ```
 
-npm publishes `thoth-memory` plus four platform-specific subpackages
-(`thoth-memory-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}`);
+npm publishes `@unknownstudio/thoth-cc` plus four platform-specific
+subpackages (`@unknownstudio/thoth-cc-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}`);
 `optionalDependencies` make npm pick the right one automatically.
 
 ### From source
@@ -180,6 +188,8 @@ quarantine_min_attempts   = 5
   │   LESSONS.quarantined.md  lessons auto-demoted after repeated miss │
   │   MEMORY.pending.md, LESSONS.pending.md  staged in `review` mode   │
   │   memory-history.jsonl  versioned audit trail                      │
+  │   domain/<ctx>/DOMAIN.md        accepted business rules            │
+  │   domain/<ctx>/_remote/<src>/*  ingestor-written proposed snapshots│
   │   skills/               procedural skills                          │
   └────────────────────────────────────────────────────────────────────┘
 ```
@@ -222,6 +232,12 @@ thoth memory log --limit 50               # audit trail from memory-history.json
 thoth memory forget                       # TTL + quarantine pass
 thoth --synth anthropic memory nudge      # LLM-curated lesson proposals
 
+# domain (business-rule memory — needs the matching cargo feature)
+thoth domain sync --source file    --from ./specs/             # air-gapped / tests
+thoth domain sync --source notion  --from <database-id>        # needs NOTION_TOKEN
+thoth domain sync --source asana   --project-id <gid>          # needs ASANA_TOKEN
+thoth domain sync --source notebooklm                          # stub; export → file
+
 # Claude Code wiring
 thoth install                             # skills + hooks + MCP, project scope
 thoth install --scope user                # global
@@ -258,6 +274,48 @@ Tools published:
 Plus two resources (`thoth://memory/MEMORY.md`, `thoth://memory/LESSONS.md`)
 and two prompts (`thoth.nudge`, `thoth.reflect`) — the nudge prompt logs a
 `NudgeInvoked` event that strict mode's two-event gate can check.
+
+## Domain memory (business rules)
+
+Thoth's sixth memory kind (see [ADR 0001](./docs/adr/0001-domain-memory.md))
+captures the *why* — business rules, invariants, workflows and glossary —
+that lives outside the AST. It's a separate code path from the rest of
+memory on purpose:
+
+- **Ingest only on command.** `thoth domain sync` pulls from the selected
+  remote. `recall()` never hits the network — Mode::Zero stays deterministic.
+- **Snapshot-based.** Each rule lands as a single markdown file with TOML
+  frontmatter (`id`, `source`, `source_hash`, `context`, `kind`,
+  `last_synced`, `status`). `source_hash` (blake3) makes re-sync a no-op
+  when nothing upstream changed.
+- **Suggest-only merge.** Ingestor output goes to `## Proposed`. Humans
+  (or CODEOWNERS) promote entries to `## Accepted` via PR. Retrieval
+  ranks Accepted first.
+- **Redaction first.** JWTs, provider tokens (`sk-`, `xoxb-`, `ghp_`, …),
+  16-digit card numbers and AWS access keys are scanned before any write;
+  hits drop the rule and log a `redacted` counter.
+
+Build feature flags in `thoth-cli` (all opt-in, none on by default):
+
+```bash
+cargo install --git https://github.com/unknown-studio-dev/thoth \
+  thoth-cli --features "notion,asana,notebooklm"
+# or: thoth-cli --features full   (everything)
+```
+
+Adapters:
+
+| Adapter | Feature | Auth | Notes |
+|---|---|---|---|
+| `file` | always on | — | reads `*.toml` from a directory; for air-gapped use and tests |
+| `notion` | `notion` | `NOTION_TOKEN` | queries one database; routes by `Thoth.Context` property |
+| `asana` | `asana` | `ASANA_TOKEN` | queries one project; routes by `Thoth.Context` custom field |
+| `notebooklm` | `notebooklm` | — | stub until MCP lands; use export → `file` adapter |
+
+Route rules to bounded contexts by setting a `Thoth.Context` property /
+custom field on the source side; any rule without a context is dropped
+(the `unmapped` stat). This is the ADR 0001 rule that PMs opt a record
+into Thoth explicitly.
 
 ## Release flow
 
@@ -330,7 +388,10 @@ workflow, code style, and issue templates.
 
 **Alpha.** Design frozen in [`DESIGN.md`](./DESIGN.md). Milestones M1–M6
 (parse + store + graph + retrieve + CLI + MCP + Mode::Full + discipline
-plugin) are in.
+plugin) are in. **M7 — Domain memory** (the `thoth-domain` crate with
+file / Notion / Asana / NotebookLM adapters and `thoth domain sync`
+CLI) landed in 0.0.1-alpha; the MCP-universal ingestor remains on the
+roadmap.
 
 ## License
 

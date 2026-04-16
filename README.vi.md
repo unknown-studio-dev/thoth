@@ -17,6 +17,9 @@
   <a href="./LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-green" alt="license" /></a>
 </p>
 
+> [!WARNING]
+> **Đang phát triển — chưa sẵn sàng cho production.** Thoth đang trong giai đoạn phát triển tích cực (`0.0.1-alpha`). API, định dạng lưu trữ trên đĩa và các flag CLI có thể thay đổi bất cứ lúc nào mà không báo trước. Sẽ có bug, breaking changes và nhiều tính năng chưa hoàn thiện. Dùng với rủi ro của riêng bạn; **không** nên dùng cho hệ thống production.
+
 ---
 
 ## Tổng quan
@@ -26,12 +29,13 @@ Thoth là một thư viện Rust (kèm CLI, MCP server và plugin cho Claude Cod
 1. **Engine** — ba binary: `thoth`, `thoth-mcp`, `thoth-gate`.
 2. **Plugin** — `thoth-discipline` (hooks + skills + MCP wiring) — biến session Claude Code / Cowork thành một vòng lặp *thực sự sử dụng bộ nhớ ở mỗi lượt*.
 
-Một store duy nhất, bốn loại bộ nhớ:
+Một store duy nhất, năm loại bộ nhớ:
 
 - **Semantic** — toàn bộ symbol, call, import, reference được phân tích bằng tree-sitter.
 - **Episodic** — log toàn bộ query / answer / outcome bằng FTS5.
 - **Procedural** — các skill tái sử dụng, lưu dưới dạng folder tương thích `agentskills.io`.
 - **Reflective** — các bài học rút ra từ sai lầm, có confidence score trong `LESSONS.md`, tự động bị “cách ly” (quarantine) nếu gây hại nhiều hơn lợi.
+- **Domain** — business rule, invariant, workflow và glossary được sync về từ Notion / Asana / NotebookLM / file cục bộ, snapshot dưới dạng markdown trong `domain/<context>/` để review qua git. Trả lời được câu hỏi *"vì sao chỗ này giới hạn refund $500?"* — đây là khoảng trống giữa *hiểu code* và *hiểu codebase*. Xem [ADR 0001](./docs/adr/0001-domain-memory.md).
 
 Hai chế độ hoạt động:
 
@@ -52,13 +56,13 @@ brew install thoth
 ### npm
 
 ```bash
-npm install -g thoth-memory
+npm install -g @unknownstudio/thoth-cc
 # hoặc:
-npx thoth-memory setup
+npx @unknownstudio/thoth-cc setup
 ```
 
-Package `thoth-memory` publish kèm 4 subpackage theo platform
-(`thoth-memory-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}`);
+Package `@unknownstudio/thoth-cc` publish kèm 4 subpackage theo platform
+(`@unknownstudio/thoth-cc-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}`);
 `optionalDependencies` sẽ tự chọn đúng binary.
 
 ### Build từ source
@@ -164,6 +168,8 @@ quarantine_min_attempts   = 5
   │   LESSONS.quarantined.md  lessons bị loại                          │
   │   MEMORY.pending.md, LESSONS.pending.md  staged (review mode)      │
   │   memory-history.jsonl  audit trail                                │
+  │   domain/<ctx>/DOMAIN.md        business rule đã accepted          │
+  │   domain/<ctx>/_remote/<src>/*  snapshot ingestor ghi (proposed)   │
   │   skills/               procedural skills                          │
   └────────────────────────────────────────────────────────────────────┘
 ```
@@ -198,6 +204,12 @@ thoth memory log --limit 50
 thoth memory forget
 thoth --synth anthropic memory nudge
 
+# domain (business-rule memory — cần bật đúng cargo feature)
+thoth domain sync --source file    --from ./specs/             # offline / test
+thoth domain sync --source notion  --from <database-id>        # cần NOTION_TOKEN
+thoth domain sync --source asana   --project-id <gid>          # cần ASANA_TOKEN
+thoth domain sync --source notebooklm                          # stub; export → file
+
 # Claude Code
 thoth install
 thoth install --scope user
@@ -228,6 +240,47 @@ thoth eval --gold eval/gold.toml -k 8
 | `thoth_skill_propose`   | Đề xuất skill                |
 | `thoth_skills_list`     | List skill                   |
 
+## Domain memory (business rule)
+
+Loại bộ nhớ thứ sáu của Thoth (xem [ADR 0001](./docs/adr/0001-domain-memory.md))
+bắt *cái "vì sao"* — business rule, invariant, workflow, glossary — những
+thứ nằm ngoài AST. Code path tách biệt khỏi memory còn lại, có chủ đích:
+
+- **Chỉ sync khi gõ lệnh.** `thoth domain sync` pull từ remote đã chọn.
+  `recall()` không bao giờ đi mạng — Mode::Zero vẫn deterministic.
+- **Snapshot-based.** Mỗi rule thành một file markdown riêng với TOML
+  frontmatter (`id`, `source`, `source_hash`, `context`, `kind`,
+  `last_synced`, `status`). `source_hash` (blake3) khiến re-sync khi
+  upstream không đổi là no-op.
+- **Suggest-only merge.** Ingestor ghi vào `## Proposed`. Con người
+  (hoặc CODEOWNERS) mới được promote lên `## Accepted` qua PR. Retrieval
+  xếp `Accepted` lên đầu.
+- **Redact trước tiên.** JWT, provider token (`sk-`, `xoxb-`, `ghp_`, …),
+  thẻ 16 số, AWS access key bị scan trước khi ghi đĩa; trúng pattern là
+  drop cả rule và đếm vào counter `redacted`.
+
+Cargo feature trong `thoth-cli` (tất cả opt-in, mặc định không bật):
+
+```bash
+cargo install --git https://github.com/unknown-studio-dev/thoth \
+  thoth-cli --features "notion,asana,notebooklm"
+# hoặc: thoth-cli --features full   (bật tất cả)
+```
+
+Adapter:
+
+| Adapter | Feature | Auth | Ghi chú |
+|---|---|---|---|
+| `file` | luôn bật | — | đọc `*.toml` trong thư mục; dùng cho air-gapped và test |
+| `notion` | `notion` | `NOTION_TOKEN` | query một database; route theo property `Thoth.Context` |
+| `asana` | `asana` | `ASANA_TOKEN` | query một project; route theo custom field `Thoth.Context` |
+| `notebooklm` | `notebooklm` | — | stub, chờ MCP; tạm export → dùng adapter `file` |
+
+Route rule về bounded context bằng cách set property / custom field
+`Thoth.Context` phía nguồn; rule không có context sẽ bị drop (counter
+`unmapped`). Đây là cam kết của ADR 0001: **PM chủ động opt record nào
+vào Thoth**, không auto-ingest hết.
+
 ## Release flow
 
 * Tag `vX.Y.Z`
@@ -246,7 +299,10 @@ Xem `CONTRIBUTING.vi.md`.
 
 ## Trạng thái
 
-**Alpha.** Core design đã ổn định. M1–M6 hoàn thành.
+**Alpha.** Core design đã ổn định. M1–M6 hoàn thành. **M7 — Domain
+memory** (crate `thoth-domain` với adapter file / Notion / Asana /
+NotebookLM và lệnh `thoth domain sync`) đã landed trong 0.0.1-alpha;
+MCP-universal ingestor vẫn nằm trong roadmap.
 
 ## License
 
