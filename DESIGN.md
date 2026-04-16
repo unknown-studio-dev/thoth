@@ -28,8 +28,8 @@ Thoth is the substrate for that — a single embedded library, not a service.
 
 - **Not a server.** No gRPC daemon, no IDE plugin in v1. Thoth is a library and
   two thin binaries (CLI, MCP server).
-- **Not general-purpose memory.** Scope is *code*. For general chat memory,
-  use Hermes/Letta/Mem0.
+- **Not general-purpose memory.** Scope is *code and the business rules
+  that code enforces*. For general chat memory, use Hermes/Letta/Mem0.
 - **Not a search engine for the internet.** The memory is local to a project.
 - **Not locked to one model.** Embedding and synthesis are trait-based; users
   bring their own provider (Voyage, OpenAI, Anthropic, ...).
@@ -50,6 +50,7 @@ Thoth is the substrate for that — a single embedded library, not a service.
 | File watcher | [notify](https://github.com/notify-rs/notify), internal only |
 | Embedding | `Embedder` trait; adapters: Voyage, OpenAI, Cohere (feature-gated) |
 | Synthesis | `Synthesizer` trait; adapters: Anthropic (feature-gated) |
+| Domain ingest | `DomainIngestor` trait; adapters: `file` (always on), `notion`, `asana`, `notebooklm` (feature-gated). Snapshots to markdown — no live remote calls on the recall path. See [ADR 0001](docs/adr/0001-domain-memory.md). |
 | Skills format | Compatible with [agentskills.io](https://agentskills.io) standard |
 | Delivery | (1) `thoth-core` library, (2) `thoth` CLI, (3) `thoth-mcp` server |
 
@@ -76,6 +77,13 @@ Thoth is the substrate for that — a single embedded library, not a service.
            │   └────────────┘  └────────────┘  └──────────────┘     │
            └─────────────────────────┬──────────────────────────────┘
                                      │  atomic delta writes
+                                     │
+        ┌────────── DOMAIN INGEST (on `thoth domain sync`) ─────────┐
+        │  DomainIngestor trait: file / notion / asana / notebooklm │
+        │         │          redact (JWT, keys, PAN, AWS)           │
+        │         ▼          hash (blake3) → SnapshotStore          │
+        │   RemoteRule → domain/<context>/_remote/<src>/<id>.md     │
+        └─────────────────────────┬─────────────────────────────────┘
                                      ▼
         ┌──────────────────────────────────────────────────────────┐
         │                   STORAGE (embedded)                      │
@@ -84,8 +92,8 @@ Thoth is the substrate for that — a single embedded library, not a service.
         │  │ markdown │ │  redb   │ │ tantivy │ │ LanceDB        │ │
         │  │ MEMORY/  │ │ graph + │ │ BM25    │ │ vectors        │ │
         │  │ LESSONS/ │ │ metadata│ │ index   │ │ (Mode::Full)   │ │
-        │  │ skills/  │ │         │ │         │ │                │ │
-        │  │          │ │ sqlite  │ │         │ │                │ │
+        │  │ domain/  │ │         │ │         │ │                │ │
+        │  │ skills/  │ │ sqlite  │ │         │ │                │ │
         │  │          │ │ + FTS5  │ │         │ │                │ │
         │  │          │ │ episodes│ │         │ │                │ │
         │  └──────────┘ └─────────┘ └─────────┘ └────────────────┘ │
@@ -106,7 +114,7 @@ Thoth is the substrate for that — a single embedded library, not a service.
                  └───────────────┘             └───────────────┘
 ```
 
-## 5. Five Memory Types
+## 5. Six Memory Types
 
 | Kind | What it holds | Where it lives | Lifecycle |
 |---|---|---|---|
@@ -115,6 +123,55 @@ Thoth is the substrate for that — a single embedded library, not a service.
 | **Episodic** | Query → answer → outcome events | SQLite + FTS5 | TTL + decay |
 | **Procedural** | Reusable skills / playbooks | `skills/*/SKILL.md` on disk | Persistent, edited by LLM or human |
 | **Reflective** | Lessons from mistakes | `LESSONS.md` on disk | Confidence-gated |
+| **Domain** | Business rules, invariants, workflows, glossary | `domain/<context>/DOMAIN.md` + `_remote/<source>/*.md` | Proposed → Accepted via PR; rebuildable from remote |
+
+Semantic answers *"what calls X?"*. Domain answers *"why does X enforce a $500 refund limit?"*. The two together let the agent reason about both the code *and* the business rules it embodies. See [ADR 0001](docs/adr/0001-domain-memory.md) for the full decision record.
+
+### 5a. Domain memory layout and lifecycle
+
+Source of truth is markdown on disk, same discipline as `MEMORY.md` / `LESSONS.md`:
+
+```
+.thoth/domain/
+├── index.md                         ← optional glossary + bounded-context map
+└── <context>/                       ← one folder per bounded context (DDD)
+    ├── DOMAIN.md                    ← human-authored rules (## Accepted)
+    └── _remote/<source>/<id>.md     ← ingestor-written snapshots (## Proposed)
+```
+
+Flat layout (`domain/DOMAIN.md` only) is fine for small repos; `layout = "hierarchical"` in config enables per-context sharding once the glossary starts crossing bounded contexts.
+
+**Four write paths, one review gate.** All ingested content lands in a `## Proposed` section. Only a human PR (or an owner listed in `CODEOWNERS`) promotes an entry to `## Accepted`. Retrieval ranks `Accepted` first; `Proposed` only surfaces when explicitly asked.
+
+| Path | Trust | Source |
+|---|---|---|
+| Human PR | high | editor |
+| Remote sync (`thoth domain sync`) | medium | Notion / Asana / NotebookLM / file |
+| LLM nudge (Mode::Full) | low | session diff + conversation |
+| Test extraction | high (narrow) | test assertions |
+
+**Snapshots are first-class markdown** with TOML frontmatter (delimited by `+++`):
+
+```markdown
++++
+id = "PROJ-1234"
+source = "asana"
+source_uri = "https://app.asana.com/…/task/1234"
+source_hash = "blake3:ab…"
+context = "billing"
+kind = "invariant"
+last_synced = 2026-04-16T08:00:00Z
+status = "proposed"
++++
+# Refund over $500 requires manager approval
+…
+```
+
+`source_hash` enables drift detection (re-sync with no upstream change is a no-op); `status` gates retrieval. `kind` is one of `invariant | workflow | glossary | policy`.
+
+**Mode::Zero preserved.** Retrieval only reads on-disk snapshots. All remote API calls live in `thoth domain sync` — never in `recall()`. §6 determinism guarantee intact.
+
+**Redaction runs before every write.** The sync pipeline scans each `RemoteRule` for JWTs, provider tokens (`sk-`, `xoxb-`, `ghp_`, …), 16-digit card numbers and AWS access keys; any hit drops the rule and records a `redacted` stat. No snapshot is ever written for a redacted rule.
 
 ## 6. Mode::Zero vs Mode::Full
 
@@ -145,9 +202,15 @@ only a `Synthesizer` — each component is independently optional.
 ```
 <project>/
 └── .thoth/
-    ├── config.toml           ← user config (mode, providers, TTL)
+    ├── config.toml           ← user config (mode, providers, TTL, domain sources)
     ├── MEMORY.md             ← project-level facts (human/LLM curated)
     ├── LESSONS.md            ← reflective memory, confidence-scored
+    ├── domain/
+    │   ├── index.md          ← optional glossary + bounded-context map
+    │   └── <context>/
+    │       ├── DOMAIN.md     ← human-authored rules (## Accepted)
+    │       └── _remote/
+    │           └── <source>/<id>.md   ← ingestor snapshots (## Proposed)
     ├── skills/
     │   └── <slug>/
     │       ├── SKILL.md      ← agentskills.io compatible
@@ -204,6 +267,28 @@ pub trait Synthesizer: Send + Sync {
     async fn synthesize(&self, prompt: &Prompt) -> Result<Synthesis>;
     async fn critique(&self, outcome: &Outcome) -> Result<Option<Lesson>>;
 }
+
+#[async_trait]
+pub trait DomainIngestor: Send + Sync {
+    /// Stable identifier: "notion", "asana", "file", "notebooklm", ...
+    fn source_id(&self) -> &str;
+    /// Pull rules from the upstream source, respecting `filter`.
+    async fn list(&self, filter: &IngestFilter) -> Result<Vec<RemoteRule>>;
+    /// Project-level routing: which bounded context does this rule belong to?
+    fn map_to_context(&self, rule: &RemoteRule) -> Option<String> { /* default */ }
+}
+```
+
+Domain sync is a single top-level call from the CLI / MCP:
+
+```rust
+use std::sync::Arc;
+use thoth_domain::{DomainIngestor, IngestFilter, SnapshotStore, sync_source};
+
+let ing: Arc<dyn DomainIngestor> = Arc::new(FileIngestor::new("./specs"));
+let snap = SnapshotStore::new(".thoth");
+let report = sync_source(ing, &snap, &IngestFilter::default()).await?;
+println!("{report}"); // created / updated / unchanged / redacted / unmapped
 ```
 
 ## 9. Memory Lifecycle
@@ -213,6 +298,10 @@ pub trait Synthesizer: Send + Sync {
   redb + tantivy + (LanceDB if Full).
 - **Episodic** appended on every `Event`. Cheap, never blocking.
 - **Procedural / Reflective** written only via explicit call or LLM nudge.
+- **Domain** written only via `thoth domain sync` (any adapter) or a human PR
+  editing `DOMAIN.md`. Remote snapshots are content-hash gated (re-sync with
+  no upstream change is a no-op); redaction runs before disk touch; writes
+  are atomic (tmp + rename).
 
 ### Forget
 - **Hard delete**: semantic fact whose source file is deleted; symbol whose AST
@@ -251,7 +340,9 @@ The design borrows deliberately and acknowledges sources.
 - **Voyager** (Wang et al., NVIDIA) — skill library as executable procedural
   memory.
 - **ACT-R / Soar** — the 5-kind taxonomy (working / semantic / episodic /
-  procedural / reflective).
+  procedural / reflective); Thoth adds a 6th, **Domain**, for business rules.
+- **Domain-Driven Design** (Evans, Vernon) — bounded contexts as the
+  sharding unit for `domain/<context>/` layout.
 - **Ebbinghaus** — exponential forgetting curve.
 - **Sourcegraph / Cody / Aider / Cursor** — code-intelligence + repo-map patterns.
 - **agentskills.io** — procedural memory format compatibility.
@@ -267,7 +358,8 @@ The design borrows deliberately and acknowledges sources.
 | **M4 — CLI** | `thoth init`, `index`, `query`, `watch`, `memory`, `skills` |
 | **M5 — MCP server** | `thoth-mcp` stdio, tool catalog, resource exposure |
 | **M6 — Mode::Full** | `Embedder` + `Synthesizer` adapters, LanceDB, nudge flow |
-| **M7 — Hardening** | Eval harness, benchmarks, docs, examples |
+| **M7 — Domain memory** | `thoth-domain` crate, `DomainIngestor` trait, file/Notion/Asana adapters, `thoth domain sync` CLI, suggest-only merge |
+| **M8 — Hardening** | Eval harness, benchmarks, docs, examples |
 
 ## 12. Open Questions (explicitly deferred)
 
@@ -293,6 +385,19 @@ The design borrows deliberately and acknowledges sources.
   (b) shipping `.so`/`.dylib` grammars complicates install on Windows and in
   distroless containers. Revisit once the grammar set needs to expand past
   what's convenient to vendor.
+- **Universal MCP ingestor.** `DomainIngestor` currently ships three native
+  adapters (file, Notion, Asana) and one stub (NotebookLM). A universal
+  MCP-based ingestor would collapse most remote adapters into one path that
+  any MCP-enabled tool (Jira, Linear, NotebookLM, custom internal systems)
+  can plug into. Deferred because (a) the MCP tool-catalog conventions for
+  "list knowledge rows" are not yet standardized and (b) two real adapters
+  are more informative than a premature abstraction. Revisit after the
+  third or fourth native adapter.
+- **Summary-first retrieval.** Per-context `DOMAIN.md` files can grow past
+  the retrieval budget on large monorepos. A two-stage "summary → full text"
+  retrieval (summary hit expands to the referenced rules) is in ADR 0001
+  but deferred until BM25 + accepted-first ranking proves insufficient in
+  the eval harness.
 
 ## 13. Credits
 

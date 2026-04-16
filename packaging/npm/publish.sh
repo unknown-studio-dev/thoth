@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Publish thoth-memory + platform subpackages to npm.
+# Publish @unknownstudio/thoth-cc + platform subpackages to npm.
 #
 # Run after a GitHub release is published. Downloads the release tarballs,
-# re-packs them as npm packages, and publishes all four plus the main
-# wrapper.
+# re-packs them as npm packages, and publishes all four platform subpackages
+# plus the main wrapper. All packages are scoped under `@unknownstudio`;
+# `--access public` is required to publish a scoped package publicly.
 #
-# Requires: gh, npm (logged in), jq, tar.
+# Requires: gh, npm (logged in, with publish rights to @unknownstudio),
+# jq, tar.
 #
 # Usage:
 #   ./packaging/npm/publish.sh v0.2.0
@@ -46,7 +48,10 @@ publish() {
 # 1. Platform subpackages.
 for entry in "${platforms[@]}"; do
   IFS=: read -r plat triple os cpu <<<"$entry"
-  pkg="thoth-memory-${plat}"
+  # Directory name uses a flat form so mktemp/path lookups stay simple;
+  # the package's true name (set via template substitution below) is the
+  # scoped `@unknownstudio/thoth-cc-<plat>`.
+  pkg="thoth-cc-${plat}"
   out="$WORKDIR/$pkg"
   mkdir -p "$out/bin"
 
@@ -72,8 +77,8 @@ for entry in "${platforms[@]}"; do
 done
 
 # 2. Main wrapper package — update version and publish.
-wrapper="$WORKDIR/thoth-memory"
-cp -R thoth-memory "$wrapper"
+wrapper="$WORKDIR/thoth-cc"
+cp -R thoth-cc "$wrapper"
 jq --arg v "$VERSION" '
   .version = $v
   | .optionalDependencies |= (to_entries | map(.value = $v) | from_entries)
@@ -82,4 +87,4 @@ mv "$wrapper/package.json.tmp" "$wrapper/package.json"
 
 publish "$wrapper"
 
-echo "✓ published thoth-memory@${VERSION} + 4 platform packages" >&2
+echo "✓ published @unknownstudio/thoth-cc@${VERSION} + 4 platform packages" >&2

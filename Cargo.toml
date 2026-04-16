@@ -14,6 +14,7 @@ members = [
     "crates/thoth-retrieve",
     "crates/thoth-embed",
     "crates/thoth-synth",
+    "crates/thoth-domain",
     "crates/thoth-cli",
     "crates/thoth-mcp",
 ]
@@ -37,6 +38,7 @@ thoth-memory   = { path = "crates/thoth-memory",   version = "0.0.1" }
 thoth-retrieve = { path = "crates/thoth-retrieve", version = "0.0.1" }
 thoth-embed    = { path = "crates/thoth-embed",    version = "0.0.1" }
 thoth-synth    = { path = "crates/thoth-synth",    version = "0.0.1" }
+thoth-domain   = { path = "crates/thoth-domain",   version = "0.0.1" }
 
 # Async + error handling
 tokio        = { version = "1.43", features = ["macros", "rt-multi-thread", "fs", "sync", "time", "io-util"] }

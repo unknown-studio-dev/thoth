@@ -1,0 +1,38 @@
+[package]
+name = "thoth-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Domain / business-rule memory: ingestors, snapshots, sync engine."
+
+[features]
+default = []
+# Each remote adapter is feature-gated so the base crate stays dependency-light.
+# Any adapter feature pulls in reqwest.
+notion      = ["dep:reqwest"]
+asana       = ["dep:reqwest"]
+# NotebookLM has no public read API; this feature is a stub that documents
+# the MCP-based path and fails loudly on use until that lands.
+notebooklm  = []
+
+[dependencies]
+thoth-core    = { workspace = true }
+async-trait   = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+toml          = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+time          = { workspace = true }
+blake3        = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }
+
+reqwest       = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile      = { workspace = true }
+tokio         = { workspace = true, features = ["macros", "rt-multi-thread"] }

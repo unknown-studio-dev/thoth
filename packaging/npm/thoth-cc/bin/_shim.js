@@ -2,9 +2,9 @@
 //
 // Resolution order:
 //   1. The platform-specific optional dependency
-//      (`thoth-memory-<platform>-<arch>/bin/<exe>`).
+//      (`@unknownstudio/thoth-cc-<platform>-<arch>/bin/<exe>`).
 //   2. The prebuilt binary downloaded by postinstall into
-//      `packaging/npm/thoth-memory/bin-native/thoth-<ver>-<triple>/`.
+//      `<this-package>/bin-native/thoth-<ver>-<triple>/`.
 //   3. Hard error with install instructions.
 //
 // Exec-replaces the current process — Ctrl-C, stdio, exit code all pass
@@ -19,7 +19,7 @@ const EXE_SUFFIX = process.platform === "win32" ? ".exe" : "";
 
 function fromOptionalDep(exe) {
   try {
-    const pkg = require.resolve(`thoth-memory-${PLAT}/package.json`);
+    const pkg = require.resolve(`@unknownstudio/thoth-cc-${PLAT}/package.json`);
     const p = path.join(path.dirname(pkg), "bin", exe + EXE_SUFFIX);
     return fs.existsSync(p) ? p : null;
   } catch {
@@ -46,8 +46,8 @@ function run(exe) {
   const bin = resolve(exe);
   if (!bin) {
     console.error(
-      `thoth-memory: no native binary for ${PLAT}. ` +
-      `Reinstall via \`npm i -g thoth-memory\` or use Homebrew: ` +
+      `@unknownstudio/thoth-cc: no native binary for ${PLAT}. ` +
+      `Reinstall via \`npm i -g @unknownstudio/thoth-cc\` or use Homebrew: ` +
       `\`brew tap unknown-studio-dev/thoth && brew install thoth\``
     );
     process.exit(127);

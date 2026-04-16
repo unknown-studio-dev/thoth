@@ -1,7 +1,7 @@
 {
-  "name": "thoth-memory-{PLATFORM}",
+  "name": "@unknownstudio/thoth-cc-{PLATFORM}",
   "version": "0.2.0",
-  "description": "Platform-specific native binary for thoth-memory ({TRIPLE}).",
+  "description": "Platform-specific native binary for @unknownstudio/thoth-cc ({TRIPLE}).",
   "license": "(MIT OR Apache-2.0)",
   "repository": {
     "type": "git",
@@ -15,5 +15,8 @@
   ],
   "files": [
     "bin/"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }

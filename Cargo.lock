@@ -5598,12 +5598,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thoth-core",
+ "thoth-domain",
  "thoth-embed",
  "thoth-memory",
  "thoth-parse",
  "thoth-retrieve",
  "thoth-store",
  "thoth-synth",
+ "time",
  "tokio",
  "toml",
  "tracing",
@@ -5621,6 +5623,25 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "uuid",
+]
+
+[[package]]
+name = "thoth-domain"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "thoth-core",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

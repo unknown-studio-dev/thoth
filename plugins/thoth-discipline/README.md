@@ -10,8 +10,9 @@ every session, or ignoring lessons it learned yesterday.
 
 > **Requires the Thoth binaries.** This plugin calls `thoth-mcp` and
 > `thoth-gate` via hooks and `.mcp.json`. Install them first —
-> `brew install thoth` or `npm i -g thoth-memory` — then install the
-> plugin. See the [main README](../../README.md#install) for options.
+> `brew install thoth` or `npm i -g @unknownstudio/thoth-cc` — then
+> install the plugin. See the [main README](../../README.md#install)
+> for options.
 
 ## What it does
 

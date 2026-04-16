@@ -10,7 +10,7 @@ mỗi session, và không phớt lờ bài học đã học hôm qua.
 
 > **Cần binary Thoth.** Plugin gọi `thoth-mcp` và `thoth-gate` qua hooks
 > và `.mcp.json`. Cài binary trước — `brew install thoth` hoặc
-> `npm i -g thoth-memory` — rồi mới cài plugin. Chi tiết xem
+> `npm i -g @unknownstudio/thoth-cc` — rồi mới cài plugin. Chi tiết xem
 > [README chính](../../README.vi.md#cài-đặt).
 
 ## Plugin làm gì
@@ -46,7 +46,7 @@ Khuyến nghị nhất — prebuilt qua brew hoặc npm:
 ```bash
 brew tap unknown-studio-dev/thoth && brew install thoth
 # hoặc
-npm install -g thoth-memory
+npm install -g @unknownstudio/thoth-cc
 ```
 
 Build from source (cần Rust toolchain):

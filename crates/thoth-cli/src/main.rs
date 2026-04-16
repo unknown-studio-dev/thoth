@@ -193,6 +193,52 @@ enum Cmd {
         #[arg(short = 'k', long, default_value_t = 8)]
         top_k: usize,
     },
+
+    /// Domain memory: ingest business rules from remote sources.
+    Domain {
+        #[command(subcommand)]
+        cmd: DomainCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DomainCmd {
+    /// Pull rules from a source and upsert snapshots under
+    /// `<root>/domain/<context>/_remote/<source>/`.
+    Sync {
+        /// Which adapter to use.
+        #[arg(long, value_enum)]
+        source: DomainSource,
+
+        /// Local directory for `--source file`.
+        #[arg(long, required_if_eq("source", "file"))]
+        from: Option<PathBuf>,
+
+        /// Remote project / database id. Meaning depends on `--source`:
+        /// Notion database id, Asana project gid, ... Ignored for `file`.
+        #[arg(long)]
+        project_id: Option<String>,
+
+        /// Only pull rules modified since this RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Per-sync cap on rules returned. Default 500.
+        #[arg(long, default_value_t = 500)]
+        max_items: usize,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum DomainSource {
+    /// Local TOML directory — always available, useful for tests and bootstrap.
+    File,
+    /// Notion database (requires `--features notion` and `NOTION_TOKEN`).
+    Notion,
+    /// Asana project (requires `--features asana` and `ASANA_TOKEN`).
+    Asana,
+    /// NotebookLM (stub — see `docs/adr/0001-domain-memory.md`).
+    Notebooklm,
 }
 
 #[derive(Subcommand, Debug)]
@@ -406,6 +452,26 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Install { scope } => hooks::install_all(scope, &cli.root).await?,
         Cmd::Uninstall { scope } => hooks::uninstall_all(scope, &cli.root).await?,
         Cmd::Eval { gold, top_k } => cmd_eval(&cli.root, &gold, top_k, cli.json).await?,
+        Cmd::Domain { cmd } => match cmd {
+            DomainCmd::Sync {
+                source,
+                from,
+                project_id,
+                since,
+                max_items,
+            } => {
+                cmd_domain_sync(
+                    &cli.root,
+                    source,
+                    from.as_deref(),
+                    project_id.as_deref(),
+                    since.as_deref(),
+                    max_items,
+                    cli.json,
+                )
+                .await?
+            }
+        },
     }
 
     Ok(())
@@ -1355,5 +1421,92 @@ async fn cmd_skills_list(root: &std::path::Path, json: bool) -> anyhow::Result<(
     for s in skills {
         println!("{:<28}  {}", s.slug, s.description);
     }
+    Ok(())
+}
+
+// -------------------------------------------------------- domain subcommand
+
+async fn cmd_domain_sync(
+    root: &std::path::Path,
+    source: DomainSource,
+    from: Option<&std::path::Path>,
+    project_id: Option<&str>,
+    since: Option<&str>,
+    max_items: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    use thoth_domain::{IngestFilter, SnapshotStore, file::FileIngestor, sync_source};
+
+    tokio::fs::create_dir_all(root).await?;
+    let snap = SnapshotStore::new(root);
+
+    let filter = IngestFilter {
+        since: since
+            .map(|s| {
+                time::OffsetDateTime::parse(
+                    s,
+                    &time::format_description::well_known::Rfc3339,
+                )
+            })
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid --since: {e}"))?,
+        max_items,
+    };
+
+    let ingestor: Arc<dyn thoth_domain::DomainIngestor> = match source {
+        DomainSource::File => {
+            let dir = from.ok_or_else(|| anyhow::anyhow!("--from required for --source file"))?;
+            Arc::new(FileIngestor::new(dir))
+        }
+        #[cfg(feature = "notion")]
+        DomainSource::Notion => {
+            let db = project_id
+                .ok_or_else(|| anyhow::anyhow!("--project-id required for --source notion"))?;
+            Arc::new(thoth_domain::notion::NotionIngestor::new(db)?)
+        }
+        #[cfg(not(feature = "notion"))]
+        DomainSource::Notion => {
+            anyhow::bail!("--source notion requires `--features notion` at build time")
+        }
+        #[cfg(feature = "asana")]
+        DomainSource::Asana => {
+            let gid = project_id
+                .ok_or_else(|| anyhow::anyhow!("--project-id required for --source asana"))?;
+            Arc::new(thoth_domain::asana::AsanaIngestor::new(gid)?)
+        }
+        #[cfg(not(feature = "asana"))]
+        DomainSource::Asana => {
+            anyhow::bail!("--source asana requires `--features asana` at build time")
+        }
+        #[cfg(feature = "notebooklm")]
+        DomainSource::Notebooklm => Arc::new(thoth_domain::notebooklm::NotebookLmIngestor::new()?),
+        #[cfg(not(feature = "notebooklm"))]
+        DomainSource::Notebooklm => anyhow::bail!(
+            "--source notebooklm requires `--features notebooklm` at build time (stub)"
+        ),
+    };
+    // `project_id` is only consumed by remote adapters — silence the unused
+    // warning for builds without those features.
+    let _ = project_id;
+
+    let rep = sync_source(ingestor, &snap, &filter).await?;
+
+    if json {
+        let payload = serde_json::json!({
+            "source": rep.source,
+            "created": rep.stats.created,
+            "updated": rep.stats.updated,
+            "unchanged": rep.stats.unchanged,
+            "unmapped": rep.stats.unmapped,
+            "redacted": rep.stats.redacted,
+            "errors": rep.errors.iter()
+                .map(|(id, e)| serde_json::json!({"id": id, "error": e}))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print!("{rep}");
+    }
+
     Ok(())
 }

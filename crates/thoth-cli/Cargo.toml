@@ -20,10 +20,16 @@ voyage    = ["thoth-embed/voyage"]
 openai    = ["thoth-embed/openai"]
 cohere    = ["thoth-embed/cohere"]
 anthropic = ["thoth-synth/anthropic"]
+# Domain-memory adapters. The `file` ingestor is always on — it ships
+# in the base crate and powers the `thoth domain sync --source file`
+# path that air-gapped users and tests rely on.
+notion     = ["thoth-domain/notion"]
+asana      = ["thoth-domain/asana"]
+notebooklm = ["thoth-domain/notebooklm"]
 # LanceDB-backed vector store (local-only). Flips every `VectorStore`
 # reference in thoth-retrieve / thoth to the LanceDB implementation.
 lance     = ["thoth-retrieve/lance", "thoth-store/lance"]
-full      = ["voyage", "openai", "cohere", "anthropic"]
+full      = ["voyage", "openai", "cohere", "anthropic", "notion", "asana", "notebooklm"]
 
 [dependencies]
 thoth-core     = { workspace = true }
@@ -33,6 +39,7 @@ thoth-retrieve = { workspace = true }
 thoth-memory   = { workspace = true }
 thoth-embed    = { workspace = true }
 thoth-synth    = { workspace = true }
+thoth-domain   = { workspace = true }
 
 tokio                = { workspace = true, features = ["signal", "process", "io-std", "net"] }
 anyhow               = { workspace = true }
@@ -41,6 +48,7 @@ tracing-subscriber   = { workspace = true }
 serde                = { workspace = true }
 serde_json           = { workspace = true }
 toml                 = { workspace = true }
+time                 = { workspace = true }
 clap                 = { workspace = true }
 indicatif            = "0.17"
 dialoguer            = { version = "0.11", default-features = false, features = ["fuzzy-select"] }

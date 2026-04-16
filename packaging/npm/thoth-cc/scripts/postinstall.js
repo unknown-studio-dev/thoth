@@ -27,7 +27,7 @@ function platformKey() {
 
 function installedBinDir() {
   const key = platformKey();
-  const pkg = `thoth-memory-${key}`;
+  const pkg = `@unknownstudio/thoth-cc-${key}`;
   try {
     const res = require.resolve(`${pkg}/package.json`);
     return path.join(path.dirname(res), "bin");
@@ -41,7 +41,7 @@ async function downloadFallback() {
   const triple = TRIPLES[key];
   if (!triple) {
     console.error(
-      `[thoth-memory] Unsupported platform: ${key}. ` +
+      `[@unknownstudio/thoth-cc] Unsupported platform: ${key}. ` +
       `Supported: ${Object.keys(TRIPLES).join(", ")}. ` +
       `Install from source: cargo install --git https://github.com/${REPO} thoth-cli thoth-mcp`
     );
@@ -54,7 +54,7 @@ async function downloadFallback() {
   fs.mkdirSync(outDir, { recursive: true });
   const outFile = path.join(outDir, tarball);
 
-  console.log(`[thoth-memory] fetching ${url}`);
+  console.log(`[@unknownstudio/thoth-cc] fetching ${url}`);
   await new Promise((resolve, reject) => {
     const file = fs.createWriteStream(outFile);
     https.get(url, (res) => {
@@ -72,11 +72,11 @@ async function downloadFallback() {
   const { spawnSync } = require("node:child_process");
   const r = spawnSync("tar", ["-xzf", outFile, "-C", outDir], { stdio: "inherit" });
   if (r.status !== 0) {
-    console.error("[thoth-memory] tar extraction failed");
+    console.error("[@unknownstudio/thoth-cc] tar extraction failed");
     process.exit(0);
   }
   fs.unlinkSync(outFile);
-  console.log(`[thoth-memory] installed prebuilt binaries to ${outDir}`);
+  console.log(`[@unknownstudio/thoth-cc] installed prebuilt binaries to ${outDir}`);
 }
 
 (async () => {
@@ -87,7 +87,7 @@ async function downloadFallback() {
   try {
     await downloadFallback();
   } catch (e) {
-    console.error(`[thoth-memory] postinstall: ${e.message}`);
+    console.error(`[@unknownstudio/thoth-cc] postinstall: ${e.message}`);
     process.exit(0); // keep npm install green
   }
 })();

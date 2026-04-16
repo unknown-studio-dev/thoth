@@ -21,6 +21,7 @@ Thumbs.db
 # should never be tracked.
 .thoth*/
 .dist/
+/dist/
 # Stray local databases from prototype runs
 /identifier.sqlite
 /identifier.sqlite-*
