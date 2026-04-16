@@ -127,6 +127,35 @@ const DEFAULT_BASH_READONLY_PREFIXES: &[&str] = &[
     "pytest",
     "mypy",
     "ruff check",
+    // Thoth's own read-only / recovery commands. Omitting these
+    // deadlocks the reflection-debt enforcement: at high debt the
+    // agent can't run `thoth curate` to see why, `thoth memory
+    // show|pending` to inspect, or — critically — `thoth memory
+    // fact|lesson|promote|reject` to resolve the block. Anything
+    // listed here is either pure read/audit or a deliberate
+    // memory-curation action the user would explicitly want
+    // unblocked during a debt lockdown.
+    //
+    // Deliberately NOT whitelisted: `thoth setup`, `thoth index`,
+    // `thoth watch`, `thoth uninstall`, `thoth skills install` —
+    // these are real mutations (write DBs, settings.json, skill
+    // directories) and shouldn't bypass discipline.
+    "thoth curate",
+    "thoth query ",
+    "thoth impact ",
+    "thoth context ",
+    "thoth changes",
+    "thoth memory show",
+    "thoth memory edit",
+    "thoth memory pending",
+    "thoth memory log",
+    "thoth memory promote ",
+    "thoth memory reject ",
+    "thoth memory forget",
+    "thoth memory fact ",
+    "thoth memory lesson ",
+    "thoth skills list",
+    "thoth eval ",
 ];
 
 // ===========================================================================
