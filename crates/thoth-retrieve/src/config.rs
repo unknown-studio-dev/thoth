@@ -136,16 +136,148 @@ impl OutputConfig {
     }
 }
 
-/// TOML file schema — the outer document. We only care about `[index]`
-/// and `[output]`; other tables (e.g. `[memory]`, read by
-/// `thoth-memory`) are left to their owners, so we tolerate them instead
-/// of `deny_unknown_fields` here.
+/// Retrieval-time rerank tuning. Mirrors the `[retrieve]` table in
+/// `<root>/config.toml`.
+///
+/// Only one knob today: `rerank_markdown_boost` multiplies the fused
+/// score of every Markdown-sourced chunk (MEMORY.md / LESSONS.md).
+/// Values > 1.0 lift facts/lessons over code for the same query — useful
+/// when a lesson matches on prose but loses the rank to a symbol stage
+/// hit with a literal identifier overlap. Values < 1.0 push markdown
+/// down; 0.0 effectively hides it. Default 1.0 (no-op).
+///
+/// Example:
+///
+/// ```toml
+/// [retrieve]
+/// rerank_markdown_boost = 1.8  # prefer lessons/facts for prose queries
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetrieveConfig {
+    /// Post-fusion multiplier applied to the score of every
+    /// `RetrievalSource::Markdown` hit. Default `1.0` (disabled).
+    /// Clamped into `[0.0, 10.0]` at load time so a typo (`18.0`
+    /// instead of `1.8`) cannot make one markdown line outrank
+    /// every code hit.
+    pub rerank_markdown_boost: f32,
+}
+
+impl Default for RetrieveConfig {
+    fn default() -> Self {
+        Self {
+            rerank_markdown_boost: 1.0,
+        }
+    }
+}
+
+impl RetrieveConfig {
+    /// Load `<root>/config.toml` if it exists, returning the `[retrieve]`
+    /// table (or [`Self::default`] if the file / table are missing).
+    ///
+    /// Tolerant, like [`OutputConfig::load_or_default`]: missing or
+    /// malformed file → warn + defaults. The returned
+    /// `rerank_markdown_boost` is clamped into `[0.0, 10.0]`.
+    pub async fn load_or_default(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "retrieve: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        let raw = match toml::from_str::<ConfigFile>(&text) {
+            Ok(cf) => cf.retrieve.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "retrieve: config.toml parse error, using defaults");
+                Self::default()
+            }
+        };
+        Self {
+            rerank_markdown_boost: raw.rerank_markdown_boost.clamp(0.0, 10.0),
+        }
+    }
+}
+
+/// Background file-watcher config. Mirrors the `[watch]` table in
+/// `<root>/config.toml`.
+///
+/// When `enabled = true`, the MCP server spawns a background file watcher
+/// on startup so source changes are reindexed automatically — no separate
+/// `thoth watch` process required. Since the MCP daemon already holds the
+/// redb exclusive lock, the watcher runs in-process and shares the same
+/// `Indexer` instance.
+///
+/// Example:
+///
+/// ```toml
+/// [watch]
+/// enabled = true
+/// debounce_ms = 300
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatchConfig {
+    /// Whether to auto-watch the project source tree. Default: `false`.
+    pub enabled: bool,
+    /// Debounce window in milliseconds. Events arriving within this window
+    /// after the first change are batched into a single reindex pass.
+    /// Default: 300.
+    pub debounce_ms: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            debounce_ms: 300,
+        }
+    }
+}
+
+impl WatchConfig {
+    /// Load `<root>/config.toml` if it exists, returning the `[watch]`
+    /// table (or [`Self::default`] if the file / table are missing).
+    pub async fn load_or_default(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "watch: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        match toml::from_str::<ConfigFile>(&text) {
+            Ok(cf) => cf.watch.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "watch: config.toml parse error, using defaults");
+                Self::default()
+            }
+        }
+    }
+}
+
+/// TOML file schema — the outer document. We only care about `[index]`,
+/// `[output]`, `[retrieve]`, and `[watch]`; other tables (e.g. `[memory]`,
+/// read by `thoth-memory`) are left to their owners, so we tolerate them
+/// instead of `deny_unknown_fields` here.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
     index: Option<IndexConfig>,
     #[serde(default)]
     output: Option<OutputConfig>,
+    #[serde(default)]
+    retrieve: Option<RetrieveConfig>,
+    #[serde(default)]
+    watch: Option<WatchConfig>,
 }
 
 impl IndexConfig {
@@ -315,5 +447,91 @@ mod tests {
         .unwrap();
         let cfg = OutputConfig::load_or_default(dir.path()).await;
         assert_eq!(cfg.max_body_lines, 200);
+    }
+
+    #[tokio::test]
+    async fn retrieve_config_defaults_to_unit_boost() {
+        let dir = tempdir().unwrap();
+        let cfg = RetrieveConfig::load_or_default(dir.path()).await;
+        assert!((cfg.rerank_markdown_boost - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn retrieve_config_parses_markdown_boost() {
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+            [retrieve]
+            rerank_markdown_boost = 2.5
+            "#,
+        )
+        .await
+        .unwrap();
+        let cfg = RetrieveConfig::load_or_default(dir.path()).await;
+        assert!((cfg.rerank_markdown_boost - 2.5).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn retrieve_config_clamps_runaway_boost() {
+        // User mistypes 18.0 instead of 1.8 — clamp stops one markdown
+        // line from shadowing the entire code corpus.
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+            [retrieve]
+            rerank_markdown_boost = 18.0
+            "#,
+        )
+        .await
+        .unwrap();
+        let cfg = RetrieveConfig::load_or_default(dir.path()).await;
+        assert!((cfg.rerank_markdown_boost - 10.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn retrieve_config_rejects_unknown_keys() {
+        // Typos in `[retrieve]` keys must surface (via warn! + defaults)
+        // rather than silently ignoring the user's intent.
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+            [retrieve]
+            rerank_markdown_boos = 2.0   # typo: boos
+            "#,
+        )
+        .await
+        .unwrap();
+        let cfg = RetrieveConfig::load_or_default(dir.path()).await;
+        // Parse failed → default (1.0), not the intended 2.0.
+        assert!((cfg.rerank_markdown_boost - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn retrieve_output_and_index_coexist() {
+        let dir = tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("config.toml"),
+            r#"
+            [index]
+            ignore = ["dist/"]
+
+            [output]
+            max_body_lines = 80
+
+            [retrieve]
+            rerank_markdown_boost = 1.6
+            "#,
+        )
+        .await
+        .unwrap();
+        let idx = IndexConfig::load_or_default(dir.path()).await;
+        let out = OutputConfig::load_or_default(dir.path()).await;
+        let ret = RetrieveConfig::load_or_default(dir.path()).await;
+        assert_eq!(idx.ignore, vec!["dist/".to_string()]);
+        assert_eq!(out.max_body_lines, 80);
+        assert!((ret.rerank_markdown_boost - 1.6).abs() < 1e-6);
     }
 }

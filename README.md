@@ -571,6 +571,65 @@ custom field on the source side; any rule without a context is dropped
 (the `unmapped` stat). This is the ADR 0001 rule that PMs opt a record
 into Thoth explicitly.
 
+## Benchmarks
+
+All numbers measured on MacBook Pro 14" (Nov 2023), Apple M3 Pro, 18 GB RAM, macOS 26.3.1,
+release build (`cargo build --release`). Corpus: Thoth's own source tree
+(**65 Rust files, ~26 k LoC, 1 313 chunks, 9 817 call edges, 1 313 symbols**).
+Mode::Zero only (no embedding, no LLM calls).
+
+### Indexing (cold, Mode::Zero)
+
+| Metric | Value |
+|--------|-------|
+| Wall time (median of 3) | **~1.23 s** |
+| Throughput | ~53 files/s, ~1 070 chunks/s, ~21 k LoC/s |
+| CPU utilization | ~40 % (now parse-bound; was 10 % / I/O-bound pre-batching) |
+| Concurrency | 11 (auto = CPU count, capped at 16) |
+| Store on disk | 3.8 MB (graph.redb 3.1 MB, fts.tantivy 640 KB, episodes.db 32 KB) |
+
+> **Optimization history:** the first version did one `redb` transaction per symbol /
+> node / edge — ~13 000 fsyncs for this corpus → **40 s wall / 4 s CPU** (I/O-bound).
+> Batching all writes per file into one transaction each dropped this to **1.23 s —
+> a 33× speedup**. See `Indexer::index_file_no_embed` +
+> `KvStore::{put_symbols_batch, put_nodes_batch, put_edges_batch}`.
+
+### Recall (`thoth query`, top-k = 8)
+
+| Query | Run 1 | Run 2 | Run 3 |
+|-------|------:|------:|------:|
+| `hybrid recall RRF fusion` | 25 ms | 24 ms | 23 ms |
+| `symbol graph blast radius` | 24 ms | 23 ms | 23 ms |
+| `index walk parse` | 22 ms | 22 ms | 22 ms |
+| `memory lesson fact` | 22 ms | 22 ms | 22 ms |
+| `gate relevance threshold` | 23 ms | 23 ms | 22 ms |
+| **Median** | | **~23 ms** | |
+
+### Eval (`thoth eval --gold eval/gold.toml -k 8`)
+
+| Metric | Value |
+|--------|-------|
+| Precision@8 | **87.5 %** (7/8 gold queries hit) |
+| MRR | **0.88** |
+| Latency p50 | 83 ms |
+| Latency p95 | 117 ms |
+
+### Graph analysis tools
+
+All graph tools run under **25 ms** (median of 3 runs):
+
+| Command | Median |
+|---------|-------:|
+| `thoth impact <fqn>` | 22 ms |
+| `thoth context <fqn>` | 22 ms |
+| `thoth changes --from -` | 22 ms |
+| `thoth memory show` | 22 ms |
+
+> **Note:** Eval p50/p95 are higher than the `thoth query` median because eval
+> runs every gold query back-to-back against a single opened store — the first
+> few include redb page-cache warmup. Graph queries hit warm pages and are
+> effectively O(1) for local lookups.
+
 ## Release flow
 
 - Tag `vX.Y.Z` on `main`.

@@ -444,21 +444,49 @@ const CLAUDE_MD_PATH: &str = "CLAUDE.md";
 /// a no-op write on same-day re-runs.
 fn render_claude_md_block(init_date: &str) -> String {
     format!(
-        "{start}\n\
-         ## Thoth memory (managed by `thoth setup` — edits inside this block are overwritten)\n\
-         \n\
-         This project uses **Thoth MCP** as its long-term memory. Initialized on {date}.\n\
-         \n\
-         - Persist facts via `mcp__thoth__thoth_remember_fact` → `./.thoth/MEMORY.md`.\n\
-         - Persist lessons via `mcp__thoth__thoth_remember_lesson` → `./.thoth/LESSONS.md`.\n\
-         - Before every Write / Edit / Bash: call `mcp__thoth__thoth_recall` at least once.\n\
-         - The `UserPromptSubmit` hook auto-recalls for context but passes `log_event: false`, \
-         so that ceremonial recall does NOT satisfy the `thoth-gate` PreToolUse gate — only \
-         agent-initiated recalls do.\n\
-         - Browse raw memory without tool calls: open `./.thoth/MEMORY.md` and \
-         `./.thoth/LESSONS.md`.\n\
-         - Remove this block and all Thoth wiring: `thoth uninstall`.\n\
-         {end}",
+        "\
+{start}
+## Thoth memory (managed by `thoth setup` — edits inside this block are overwritten)
+
+This project uses **Thoth MCP** as its long-term memory. Initialized on {date}.
+
+### Memory workflow
+
+- Persist facts via `thoth_remember_fact({{text, tags?}})` → `./.thoth/MEMORY.md`.
+- Persist lessons via `thoth_remember_lesson({{trigger, advice}})` → `./.thoth/LESSONS.md`.
+- Before every Write / Edit / Bash: call `thoth_recall({{query}})` at least once.
+- The `UserPromptSubmit` hook auto-recalls for context but passes `log_event: false`, \
+so that ceremonial recall does NOT satisfy the `thoth-gate` PreToolUse gate — only \
+agent-initiated recalls do.
+- Browse raw memory without tool calls: open `./.thoth/MEMORY.md` and `./.thoth/LESSONS.md`.
+- Remove this block and all Thoth wiring: `thoth uninstall`.
+
+### Code intelligence tools
+
+| Tool | Params | Purpose |
+|------|--------|---------|
+| `thoth_recall` | `query`, `top_k?` (default 8) | Hybrid search (symbol + BM25 + graph + markdown) |
+| `thoth_impact` | `fqn`, `direction?` (up/down/both), `depth?` (1-8) | Blast radius — who breaks if this symbol changes |
+| `thoth_symbol_context` | `fqn`, `limit?` (default 32) | 360° view: callers, callees, imports, siblings, doc |
+| `thoth_detect_changes` | `diff` (git diff output), `depth?` (1-6) | Find symbols touched by a diff + their blast radius |
+| `thoth_index` | `path?` (default \".\") | Reindex source tree |
+
+### Before editing code
+
+1. **MUST** run `thoth_impact({{fqn: \"module::symbol\"}})` before modifying any function/class.
+2. Report blast radius (direct callers at d=1, indirect at d=2+) to the user.
+3. **MUST** warn the user if d=1 impact includes critical paths before proceeding.
+
+### Before committing
+
+Run `thoth_detect_changes({{diff: \"<git diff output>\"}})` to verify changes only affect expected symbols.
+
+### Available skills
+
+Use `/skill-name` to invoke: `thoth-exploring` (understand code), `thoth-debugging` (trace bugs), \
+`thoth-refactoring` (safe renames/moves), `thoth-impact-analysis` (blast radius), \
+`thoth-reflect` (end-of-session lessons), `thoth-guide` (Thoth help).
+{end}",
         start = CLAUDE_MD_START,
         end = CLAUDE_MD_END,
         date = init_date,
@@ -1190,6 +1218,13 @@ async fn run_user_prompt(root: &Path, payload: &Value, buf: &mut String) -> anyh
     // incidentally ran a recall on the prompt text. So: this path is
     // purely context injection; the agent still has to invoke
     // `mcp__thoth__thoth_recall` itself before Write/Edit/Bash.
+    // Minimum score for a chunk to be injected by the auto-recall hook.
+    // With RRF K=10 a single-stage rank-0 hit scores ~0.09; a two-stage
+    // hit scores ~0.18. Setting the bar at 0.08 filters truly irrelevant
+    // results (no stage ranked them near the top) while preserving any
+    // hit that at least one stage considered a strong match.
+    const MIN_AUTO_RECALL_SCORE: f64 = 0.08;
+
     if let Some(mut d) = crate::daemon::DaemonClient::try_connect(root).await {
         let result = d
             .call(
@@ -1202,12 +1237,23 @@ async fn run_user_prompt(root: &Path, payload: &Value, buf: &mut String) -> anyh
             )
             .await?;
         if !crate::daemon::tool_is_error(&result) {
-            // Render the daemon's formatted recall block so Claude Code
-            // picks it up as context — same surface as the direct path.
-            let text = crate::daemon::tool_text(&result);
-            if !text.trim().is_empty() {
-                let _ = writeln!(buf, "### thoth recall");
-                let _ = writeln!(buf, "{text}");
+            // Check if the best chunk score exceeds the relevance bar.
+            // The daemon's `data.chunks` array carries per-chunk scores.
+            let dominated_by_noise = crate::daemon::tool_data(&result)
+                .get("chunks")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.get("score").and_then(Value::as_f64))
+                        .all(|s| s < MIN_AUTO_RECALL_SCORE)
+                })
+                .unwrap_or(false);
+            if !dominated_by_noise {
+                let text = crate::daemon::tool_text(&result);
+                if !text.trim().is_empty() {
+                    let _ = writeln!(buf, "### thoth recall");
+                    let _ = writeln!(buf, "{text}");
+                }
             }
         }
         return Ok(());
@@ -1227,11 +1273,16 @@ async fn run_user_prompt(root: &Path, payload: &Value, buf: &mut String) -> anyh
         ..thoth_core::Query::text("")
     };
     let out = retriever.recall(&q).await?;
-    if out.chunks.is_empty() {
+    let relevant: Vec<_> = out
+        .chunks
+        .iter()
+        .filter(|c| (c.score as f64) >= MIN_AUTO_RECALL_SCORE)
+        .collect();
+    if relevant.is_empty() {
         return Ok(());
     }
-    let _ = writeln!(buf, "### thoth recall (top {})", out.chunks.len());
-    for c in out.chunks.iter() {
+    let _ = writeln!(buf, "### thoth recall (top {})", relevant.len());
+    for c in relevant.iter() {
         let sym = c.symbol.as_deref().unwrap_or("-");
         let _ = writeln!(
             buf,

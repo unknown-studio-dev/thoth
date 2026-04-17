@@ -163,7 +163,32 @@ impl MarkdownStore {
     }
 
     /// Append a fact to `MEMORY.md`. File is created if missing.
+    ///
+    /// Also writes an `op = "append"` entry to `memory-history.jsonl` so
+    /// the reflection-debt counter in `thoth-memory` sees the remember
+    /// and decrements debt accordingly. Before this bug fix
+    /// (2026-04-17) canonical appends skipped the history log, so auto
+    /// mode silently hid every `thoth_remember_fact` from the counter
+    /// — debt kept growing until the gate hard-blocked. History writes
+    /// are best-effort: a failure here only affects the debt counter,
+    /// so we swallow it with a `warn!` the same way `append_history`
+    /// itself does.
     pub async fn append_fact(&self, f: &Fact) -> Result<()> {
+        self.append_fact_to_file(f).await?;
+        self.append_history(&HistoryEntry {
+            op: "append",
+            kind: "fact",
+            title: first_line(&f.text),
+            actor: None,
+            reason: None,
+        })
+        .await
+    }
+
+    /// Append a fact to `MEMORY.md` without writing history. Used by
+    /// [`Self::promote_pending_fact`] to avoid double-counting debt
+    /// (the stage already counted).
+    async fn append_fact_to_file(&self, f: &Fact) -> Result<()> {
         let path = self.root.join(MEMORY_MD);
         append_atomic(&path, &render_fact(f)).await
     }
@@ -195,7 +220,25 @@ impl MarkdownStore {
     }
 
     /// Append a lesson. File is created if missing.
+    ///
+    /// Writes an `op = "append"` entry to `memory-history.jsonl` for
+    /// the same reason [`Self::append_fact`] does (see its doc).
     pub async fn append_lesson(&self, l: &Lesson) -> Result<()> {
+        self.append_lesson_to_file(l).await?;
+        self.append_history(&HistoryEntry {
+            op: "append",
+            kind: "lesson",
+            title: l.trigger.trim().to_string(),
+            actor: None,
+            reason: None,
+        })
+        .await
+    }
+
+    /// Append a lesson to `LESSONS.md` without writing history. Used by
+    /// [`Self::promote_pending_lesson`] to avoid double-counting debt
+    /// (the stage already counted).
+    async fn append_lesson_to_file(&self, l: &Lesson) -> Result<()> {
         let path = self.root.join(LESSONS_MD);
         append_atomic(&path, &render_lesson(l)).await
     }
@@ -328,7 +371,7 @@ impl MarkdownStore {
             return Ok(None);
         }
         let fact = pending.remove(index);
-        self.append_fact(&fact).await?;
+        self.append_fact_to_file(&fact).await?;
         self.rewrite_pending_facts(&pending).await?;
         self.append_history(&HistoryEntry {
             op: "promote",
@@ -372,7 +415,7 @@ impl MarkdownStore {
             return Ok(None);
         }
         let lesson = pending.remove(index);
-        self.append_lesson(&lesson).await?;
+        self.append_lesson_to_file(&lesson).await?;
         self.rewrite_pending_lessons(&pending).await?;
         self.append_history(&HistoryEntry {
             op: "promote",

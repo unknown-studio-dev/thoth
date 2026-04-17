@@ -1,7 +1,5 @@
 # Contributing to Thoth
 
-🇬🇧 English · [🇻🇳 Tiếng Việt](./CONTRIBUTING.vi.md)
-
 Thanks for taking the time — Thoth is a young project and every reproducer,
 PR, and design comment helps. This doc covers how to get the repo running,
 the conventions we hold the code to, and what a good contribution looks

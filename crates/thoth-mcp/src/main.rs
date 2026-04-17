@@ -35,6 +35,17 @@ async fn main() -> anyhow::Result<()> {
 
     let server = Server::open(&root).await?;
 
+    // If `[watch] enabled = true`, spawn a background file watcher that
+    // reindexes source changes in-process. The watched directory is the
+    // project root (parent of `.thoth/`).
+    let project_root = root
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    if server.spawn_watcher(project_root).await {
+        tracing::info!("background file watcher enabled");
+    }
+
     // Run stdio (for Claude Code / MCP clients) and a Unix socket (for the
     // CLI thin-client) concurrently. When stdio hits EOF the process exits
     // and the socket task is cancelled automatically.

@@ -43,7 +43,7 @@ pub use thoth_core::{
 
 pub use thoth_memory::{MemoryConfig, MemoryManager, NudgeReport, WorkingMemory, WorkingNote};
 pub use thoth_parse::LanguageRegistry;
-pub use thoth_retrieve::{IndexProgress, IndexStats, Indexer, Retriever};
+pub use thoth_retrieve::{IndexProgress, IndexStats, Indexer, Retriever, RetrieveConfig};
 pub use thoth_store::{StoreRoot, VectorStore};
 
 // --------------------------------------------------------------- CodeMemory
@@ -65,6 +65,7 @@ pub struct CodeMemory {
     memory: MemoryManager,
     registry: LanguageRegistry,
     working: WorkingMemory,
+    retrieve: RetrieveConfig,
 }
 
 impl CodeMemory {
@@ -98,12 +99,14 @@ impl CodeMemory {
             }
         }
         let memory = MemoryManager::open_with(&root, store.episodes.clone()).await?;
+        let retrieve = RetrieveConfig::load_or_default(&root).await;
         Ok(Self {
             root,
             store,
             memory,
             registry: LanguageRegistry::new(),
             working: WorkingMemory::with_capacity(128),
+            retrieve,
         })
     }
 
@@ -139,8 +142,11 @@ impl CodeMemory {
     }
 
     /// Build a Mode::Zero [`Retriever`] bound to this memory.
+    ///
+    /// The `[retrieve] rerank_markdown_boost` config knob loaded at
+    /// [`Self::open`] is applied to every retriever handed out here.
     pub fn retriever(&self) -> Retriever {
-        Retriever::new(self.store.clone())
+        Retriever::new(self.store.clone()).with_markdown_boost(self.retrieve.rerank_markdown_boost)
     }
 
     /// Index a source tree. Runs the full pipeline: walk → parse → write
@@ -171,6 +177,7 @@ impl CodeMemory {
                 let embedder: Option<Arc<dyn Embedder>> = embedder.map(Arc::from);
                 let synth: Option<Arc<dyn Synthesizer>> = synthesizer.map(Arc::from);
                 Retriever::with_full(self.store.clone(), Some(vectors), embedder, synth)
+                    .with_markdown_boost(self.retrieve.rerank_markdown_boost)
                     .recall_full(&q)
                     .await
             }

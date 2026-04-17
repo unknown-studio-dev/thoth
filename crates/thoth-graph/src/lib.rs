@@ -131,6 +131,36 @@ impl Graph {
             .await
     }
 
+    /// Insert or update many nodes in a single transaction.
+    pub async fn upsert_nodes_batch(&self, nodes: Vec<Node>) -> Result<()> {
+        let rows = nodes
+            .into_iter()
+            .map(|n| {
+                let payload = serde_json::json!({ "path": n.path, "line": n.line });
+                NodeRow {
+                    id: n.fqn,
+                    kind: n.kind,
+                    payload,
+                }
+            })
+            .collect();
+        self.kv.put_nodes_batch(rows).await
+    }
+
+    /// Insert or update many edges in a single transaction.
+    pub async fn upsert_edges_batch(&self, edges: Vec<Edge>) -> Result<()> {
+        let rows = edges
+            .into_iter()
+            .map(|e| EdgeRow {
+                src: e.from,
+                dst: e.to,
+                kind: e.kind.tag().to_string(),
+                payload: serde_json::Value::Null,
+            })
+            .collect();
+        self.kv.put_edges_batch(rows).await
+    }
+
     /// Fetch a node by FQN.
     pub async fn get(&self, fqn: &str) -> Result<Option<Node>> {
         Ok(self.kv.get_node(fqn).await?.map(row_to_node))

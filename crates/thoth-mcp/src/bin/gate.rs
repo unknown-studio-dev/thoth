@@ -44,8 +44,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Deserialize;
 use serde_json::{Value, json};
+use thoth_memory::{DisciplineConfig, gate_defaults};
 
 // ===========================================================================
 // Defaults — surface for user-facing docs.
@@ -58,26 +58,20 @@ use serde_json::{Value, json};
 ///   Chosen as default because a noisy false block is worse than a silent
 ///   miss. Opt-in to stricter mode via config.
 const DEFAULT_MODE: &str = "nudge";
-const DEFAULT_GLOBAL_FALLBACK: bool = true;
-const DEFAULT_NUDGE_BEFORE_WRITE: bool = true;
 
 /// Recency shortcut — recall within this window passes without a relevance
 /// check. Kept short because recency alone is the weakest signal.
-const DEFAULT_WINDOW_SHORT_SECS: u64 = 60;
+const DEFAULT_WINDOW_SHORT_SECS: u64 = gate_defaults::WINDOW_SHORT_SECS;
 
 /// Relevance pool — how far back we search for a topically-matching recall.
 /// 30 min covers a typical coding session; older recalls are stale context
 /// that probably doesn't justify the current edit anyway.
-const DEFAULT_WINDOW_LONG_SECS: u64 = 1800;
+const DEFAULT_WINDOW_LONG_SECS: u64 = gate_defaults::WINDOW_LONG_SECS;
 
 /// Containment ratio threshold for relevance. See the `threshold` comment
 /// block on `GateConfig::relevance_threshold` for the user-facing range
 /// guidance.
-const DEFAULT_RELEVANCE_THRESHOLD: f64 = 0.30;
-
-/// Legacy single window — kept so old `gate_window_secs = 180` configs
-/// still parse and are interpreted as the short-recency shortcut.
-const LEGACY_WINDOW_SECS: u64 = 180;
+const DEFAULT_RELEVANCE_THRESHOLD: f64 = gate_defaults::RELEVANCE_THRESHOLD;
 
 /// Default read-only Bash prefixes — expanded from the most common
 /// developer loops. Anything that only *observes* the system (no writes,
@@ -972,10 +966,14 @@ impl GateConfig {
 
 impl Default for GateConfig {
     fn default() -> Self {
+        // Derive every runtime default from the shared `DisciplineConfig`
+        // defaults so the gate can never disagree with the rest of the
+        // workspace on what "unconfigured" means.
+        let disc = DisciplineConfig::default();
         Self {
-            global_fallback: DEFAULT_GLOBAL_FALLBACK,
-            nudge_before_write: DEFAULT_NUDGE_BEFORE_WRITE,
-            telemetry_enabled: false,
+            global_fallback: disc.global_fallback,
+            nudge_before_write: disc.nudge_before_write,
+            telemetry_enabled: disc.gate_telemetry_enabled,
             bash_readonly_prefixes: DEFAULT_BASH_READONLY_PREFIXES
                 .iter()
                 .map(|s| (*s).to_string())
@@ -1052,119 +1050,62 @@ struct ActorPolicy {
     policy: Policy,
 }
 
-// ---- config file schema ----------------------------------------------------
-
-#[derive(Deserialize, Default)]
-struct FileShape {
-    #[serde(default)]
-    discipline: Option<DisciplineFile>,
-}
-
-#[derive(Deserialize, Default)]
-struct DisciplineFile {
-    // Legacy flat fields — still honored.
-    mode: Option<String>,
-    global_fallback: Option<bool>,
-    nudge_before_write: Option<bool>,
-    gate_window_secs: Option<u64>,
-    gate_require_nudge: Option<bool>,
-
-    // New fields.
-    gate_window_short_secs: Option<u64>,
-    gate_window_long_secs: Option<u64>,
-    gate_relevance_threshold: Option<f64>,
-    gate_telemetry_enabled: Option<bool>,
-    gate_bash_readonly_prefixes: Option<Vec<String>>,
-    #[serde(default)]
-    policies: Vec<PolicyFile>,
-}
-
-#[derive(Deserialize, Default)]
-struct PolicyFile {
-    actor: String,
-    mode: Option<String>,
-    window_short_secs: Option<u64>,
-    window_long_secs: Option<u64>,
-    relevance_threshold: Option<f64>,
-}
+// ---- config loading --------------------------------------------------------
+//
+// Gate-v2 keys all live on `thoth_memory::DisciplineConfig`. This is the
+// only parser in the workspace that consumes them — earlier, the gate
+// kept its own `DisciplineFile` struct with `Option<T>` fields to tell
+// "unset" from "default". That turned out to be a liability: adding a
+// new field to `DisciplineConfig` (the *other* parser reading the same
+// file) and missing it here caused silent config drift. Now there is
+// one struct, one parse, and the gate reads the already-defaulted values
+// directly.
 
 fn load_config(root: &Path) -> GateConfig {
-    let path = root.join("config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return GateConfig::default(),
-    };
-    let shape: FileShape = match toml::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[thoth-gate] config.toml parse error: {e}");
-            return GateConfig::default();
-        }
-    };
-    let Some(d) = shape.discipline else {
-        return GateConfig::default();
-    };
+    let disc = DisciplineConfig::load_or_default_sync(root);
 
-    let mut cfg = GateConfig::default();
-
-    if let Some(g) = d.global_fallback {
-        cfg.global_fallback = g;
-    }
-    if let Some(n) = d.nudge_before_write {
-        cfg.nudge_before_write = n;
-    }
-    if let Some(t) = d.gate_telemetry_enabled {
-        cfg.telemetry_enabled = t;
-    }
-    if let Some(extra) = d.gate_bash_readonly_prefixes {
-        // Additive: user prefixes extend the built-in list so nobody
-        // loses the obvious wins (cargo test, git status) by customizing.
-        for p in extra {
-            if !cfg.bash_readonly_prefixes.contains(&p) {
-                cfg.bash_readonly_prefixes.push(p);
+    let default_mode = if disc.mode.is_empty() {
+        PolicyMode::Nudge
+    } else {
+        match PolicyMode::parse(&disc.mode) {
+            Some(m) => m,
+            None => {
+                eprintln!(
+                    "[thoth-gate] unknown mode {:?}; using default {DEFAULT_MODE}",
+                    disc.mode
+                );
+                PolicyMode::Nudge
             }
         }
-    }
+    };
 
-    // Default policy fields: new names win, legacy names as fallback.
-    if let Some(m) = d.mode.as_deref().and_then(PolicyMode::parse) {
-        cfg.default_policy.mode = m;
-    } else if let Some(m) = d.mode.as_deref() {
-        eprintln!("[thoth-gate] unknown mode {m:?}; using default {DEFAULT_MODE}");
-    }
-    // Short window: new field, else legacy `gate_window_secs`.
-    if let Some(w) = d.gate_window_short_secs {
-        cfg.default_policy.window_short_secs = w;
-    } else if let Some(w) = d.gate_window_secs {
-        cfg.default_policy.window_short_secs = w;
-    }
-    if let Some(w) = d.gate_window_long_secs {
-        cfg.default_policy.window_long_secs = w;
-    }
-    if let Some(r) = d.gate_relevance_threshold {
-        cfg.default_policy.relevance_threshold = r.clamp(0.0, 1.0);
-    }
+    let mut cfg = GateConfig {
+        global_fallback: disc.global_fallback,
+        nudge_before_write: disc.nudge_before_write,
+        telemetry_enabled: disc.gate_telemetry_enabled,
+        bash_readonly_prefixes: DEFAULT_BASH_READONLY_PREFIXES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        default_policy: Policy {
+            mode: default_mode,
+            window_short_secs: disc.gate_window_short_secs,
+            window_long_secs: disc.gate_window_long_secs,
+            relevance_threshold: disc.gate_relevance_threshold.clamp(0.0, 1.0),
+        },
+        policies: Vec::with_capacity(disc.policies.len()),
+    };
 
-    // Legacy `gate_require_nudge` (soft/strict sub-flag) is no longer
-    // meaningful under the new verdict model — `PolicyMode::Strict`
-    // already implies "block on miss". Emit a deprecation hint if
-    // someone still has it in config — once per process (load_config
-    // runs twice per invocation: bootstrap + resolved root).
-    if d.gate_require_nudge.is_some() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "[thoth-gate] note: `gate_require_nudge` is deprecated; use \
-                 `mode = \"strict\"` instead (see config.toml comment block)."
-            );
+    // User-provided read-only prefixes *extend* the built-in list —
+    // nobody should lose `cargo test` / `git status` by customising.
+    for p in disc.gate_bash_readonly_prefixes {
+        if !cfg.bash_readonly_prefixes.contains(&p) {
+            cfg.bash_readonly_prefixes.push(p);
         }
     }
-    // Silence the "unused legacy window" warning when someone sets both.
-    let _ = LEGACY_WINDOW_SECS;
 
     // Actor-specific policies. Missing fields inherit from default_policy.
-    for pf in d.policies {
+    for pf in disc.policies {
         let mut p = cfg.default_policy.clone();
         if let Some(m) = pf.mode.as_deref().and_then(PolicyMode::parse) {
             p.mode = m;

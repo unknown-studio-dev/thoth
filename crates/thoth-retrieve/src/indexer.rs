@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use thoth_core::{Embedder, Result};
 use thoth_graph::{Edge, EdgeKind, Graph, Node};
 use thoth_parse::{
-    LanguageRegistry, SourceChunk, Symbol, SymbolKind, SymbolTable,
+    LanguageRegistry, SourceChunk, SymbolKind,
     walk::{WalkOptions, walk_sources},
 };
 use thoth_store::{ChunkDoc, StoreRoot, SymbolRow, VectorStore};
@@ -395,27 +395,51 @@ impl Indexer {
         }
 
         self.purge_path(path).await?;
-        let mut s = IndexStats::default();
         let (chunks, table) = thoth_parse::parse_file(&self.registry, path).await?;
 
-        for c in &chunks {
-            self.write_chunk(c).await?;
-            s.chunks += 1;
-        }
-        for sym in &table.symbols {
-            self.write_symbol(sym).await?;
-            s.symbols += 1;
-        }
-        // Build the file-local resolution map. Two ingredients, in
-        // priority order:
-        //   1. Import aliases (`use foo::Bar as Baz`) — the local name
-        //      the source will use maps to the fully qualified target.
-        //   2. Symbols declared in this file — for every call to a
-        //      same-file function (`foo()` inside module `m`) we want
-        //      the edge to land on `m::foo` instead of the bare leaf,
-        //      so BFS over `Calls` actually connects.
-        // #2 fills in gaps #1 misses. When both produce a binding we
-        // prefer the alias (explicit > implicit).
+        // --- batch FTS writes (single spawn_blocking) ---
+        let chunk_docs: Vec<ChunkDoc> = chunks
+            .iter()
+            .map(|c| ChunkDoc {
+                id: chunk_id(&c.path, c.start_line, c.end_line),
+                path: c.path.to_string_lossy().into_owned(),
+                symbol: c.symbol.clone(),
+                body: c.body.clone(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                language: c.language.to_string(),
+            })
+            .collect();
+        self.store.fts.index_chunks_batch(chunk_docs).await?;
+
+        // --- batch KV symbol writes (single redb transaction) ---
+        let symbol_rows: Vec<SymbolRow> = table
+            .symbols
+            .iter()
+            .map(|sym| SymbolRow {
+                fqn: sym.fqn.clone(),
+                path: sym.path.clone(),
+                start_line: sym.span.0,
+                end_line: sym.span.1,
+                kind: symbol_kind_tag(sym.kind).to_string(),
+            })
+            .collect();
+        self.store.kv.put_symbols_batch(symbol_rows).await?;
+
+        // --- batch graph node writes (single redb transaction) ---
+        let nodes: Vec<Node> = table
+            .symbols
+            .iter()
+            .map(|sym| Node {
+                fqn: sym.fqn.clone(),
+                kind: symbol_kind_tag(sym.kind).to_string(),
+                path: sym.path.clone(),
+                line: sym.span.0,
+            })
+            .collect();
+        self.graph.upsert_nodes_batch(nodes).await?;
+
+        // Build the file-local resolution map.
         let mut resolution: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for sym in &table.symbols {
@@ -428,16 +452,72 @@ impl Indexer {
         for (local, target) in &table.aliases {
             resolution.insert(local.clone(), target.clone());
         }
-        self.write_call_edges(&table, &resolution).await?;
-        s.calls += table.calls.len();
+
+        // --- batch all edges (calls + imports + extends) in one transaction ---
+        let mut all_edges: Vec<Edge> = Vec::new();
+
+        // Call edges
+        for (caller, callee) in &table.calls {
+            let resolved = resolution.get(callee).cloned().unwrap_or_else(|| callee.clone());
+            all_edges.push(Edge {
+                from: caller.clone(),
+                to: resolved,
+                kind: EdgeKind::Calls,
+            });
+        }
+
+        // Import edges
         let alias_only: std::collections::HashMap<String, String> =
             table.aliases.iter().cloned().collect();
-        self.write_import_edges(&table, path, &alias_only).await?;
-        s.imports += table.imports.len();
-        self.write_extends_edges(&table, &resolution).await?;
+        let module = module_fqn(path);
+        if !alias_only.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for target in alias_only.values() {
+                if seen.insert(target.clone()) {
+                    all_edges.push(Edge {
+                        from: module.clone(),
+                        to: target.clone(),
+                        kind: EdgeKind::Imports,
+                    });
+                }
+            }
+        } else {
+            for imp in &table.imports {
+                let target = imp.trim().to_string();
+                if !target.is_empty() {
+                    all_edges.push(Edge {
+                        from: module.clone(),
+                        to: target,
+                        kind: EdgeKind::Imports,
+                    });
+                }
+            }
+        }
 
-        // Record the new content hash *after* all the writes succeeded — if
-        // we crash mid-write, next run will see a hash miss and retry.
+        // Extends edges
+        for (child, parent) in &table.extends {
+            let resolved = resolution.get(parent).cloned().unwrap_or_else(|| parent.clone());
+            if !resolved.is_empty() {
+                all_edges.push(Edge {
+                    from: child.clone(),
+                    to: resolved,
+                    kind: EdgeKind::Extends,
+                });
+            }
+        }
+
+        self.graph.upsert_edges_batch(all_edges).await?;
+
+        let s = IndexStats {
+            files: 0, // caller increments
+            chunks: chunks.len(),
+            symbols: table.symbols.len(),
+            calls: table.calls.len(),
+            imports: table.imports.len(),
+            embedded: 0,
+        };
+
+        // Record the new content hash *after* all the writes succeeded.
         self.store.kv.put_meta(hash_key, new_hash_bytes).await?;
 
         Ok((s, chunks))
@@ -466,146 +546,6 @@ impl Indexer {
         Ok(Some(items.len()))
     }
 
-    // -------------------------------------------------------------------
-
-    async fn write_chunk(&self, c: &SourceChunk) -> Result<()> {
-        let id = chunk_id(&c.path, c.start_line, c.end_line);
-        self.store
-            .fts
-            .index_chunk(ChunkDoc {
-                id,
-                path: c.path.to_string_lossy().into_owned(),
-                symbol: c.symbol.clone(),
-                body: c.body.clone(),
-                start_line: c.start_line,
-                end_line: c.end_line,
-                language: c.language.to_string(),
-            })
-            .await
-    }
-
-    async fn write_symbol(&self, sym: &Symbol) -> Result<()> {
-        let kind_tag = symbol_kind_tag(sym.kind).to_string();
-        // KV symbol row for exact lookup.
-        self.store
-            .kv
-            .put_symbol(SymbolRow {
-                fqn: sym.fqn.clone(),
-                path: sym.path.clone(),
-                start_line: sym.span.0,
-                end_line: sym.span.1,
-                kind: kind_tag.clone(),
-            })
-            .await?;
-        // Graph node.
-        self.graph
-            .upsert_node(Node {
-                fqn: sym.fqn.clone(),
-                kind: kind_tag,
-                path: sym.path.clone(),
-                line: sym.span.0,
-            })
-            .await
-    }
-
-    async fn write_call_edges(
-        &self,
-        table: &SymbolTable,
-        aliases: &std::collections::HashMap<String, String>,
-    ) -> Result<()> {
-        for (caller, callee) in &table.calls {
-            // Callee names come out of the parser as a bare leaf
-            // identifier (`foo()` → `"foo"`; `x.bar()` → `"bar"`). If
-            // the file's import-alias map has a binding for that name
-            // we route the edge to the resolved FQN so cross-module
-            // call chains connect through the graph.
-            let resolved = aliases.get(callee).cloned().unwrap_or_else(|| callee.clone());
-            self.graph
-                .upsert_edge(Edge {
-                    from: caller.clone(),
-                    to: resolved,
-                    kind: EdgeKind::Calls,
-                })
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn write_import_edges(
-        &self,
-        table: &SymbolTable,
-        path: &Path,
-        aliases: &std::collections::HashMap<String, String>,
-    ) -> Result<()> {
-        let module = module_fqn(path);
-
-        // Prefer parsed aliases — each one is a real (local_name,
-        // resolved_target) pair, so writing an Imports edge to the
-        // resolved side gives a clean module→symbol graph without
-        // dragging raw statement text like "use std::sync::Arc;" into
-        // the graph.
-        if !aliases.is_empty() {
-            let mut seen = std::collections::HashSet::new();
-            for target in aliases.values() {
-                if seen.insert(target.clone()) {
-                    self.graph
-                        .upsert_edge(Edge {
-                            from: module.clone(),
-                            to: target.clone(),
-                            kind: EdgeKind::Imports,
-                        })
-                        .await?;
-                }
-            }
-            return Ok(());
-        }
-
-        // Fallback: no alias info (unsupported language, malformed
-        // source). Store the raw statement text so the graph at least
-        // remembers *something* about the file's dependencies.
-        for imp in &table.imports {
-            let target = imp.trim().to_string();
-            if target.is_empty() {
-                continue;
-            }
-            self.graph
-                .upsert_edge(Edge {
-                    from: module.clone(),
-                    to: target,
-                    kind: EdgeKind::Imports,
-                })
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn write_extends_edges(
-        &self,
-        table: &SymbolTable,
-        aliases: &std::collections::HashMap<String, String>,
-    ) -> Result<()> {
-        for (child, parent) in &table.extends {
-            // Parent name is whatever the source wrote: a bare name, a
-            // local alias, or a qualified path. Run it through the
-            // alias map first (so `class X extends Foo` after
-            // `import { Foo } from 'lib'` routes to `lib::Foo`); fall
-            // back to the raw text otherwise. Unknown parents still
-            // show up in the graph — downstream readers can tell they
-            // are unresolved because `Graph::get(&to)` returns None.
-            let resolved = aliases.get(parent).cloned().unwrap_or_else(|| parent.clone());
-            if resolved.is_empty() {
-                continue;
-            }
-            self.graph
-                .upsert_edge(Edge {
-                    from: child.clone(),
-                    to: resolved,
-                    kind: EdgeKind::Extends,
-                })
-                .await?;
-        }
-        Ok(())
-    }
 }
 
 // ---- helpers ---------------------------------------------------------------

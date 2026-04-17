@@ -34,8 +34,14 @@ use uuid::Uuid;
 
 use crate::indexer::{chunk_id, read_span};
 
-/// Reciprocal-Rank-Fusion constant. 60 is the Cormack/Clarke default.
-const RRF_K: f32 = 60.0;
+/// Reciprocal-Rank-Fusion constant. The classic Cormack/Clarke default is
+/// 60, designed for web-scale result lists (100s of candidates per source).
+/// Thoth's per-source stages typically return < 20 candidates, so K=60
+/// compresses all single-stage hits into a ~0.3% score band (0.0164→0.0154),
+/// making ranking effectively random. K=10 gives a ~9% spread per rank step,
+/// which lets multi-stage hits stand out clearly while still dampening
+/// outlier ranks in larger result sets.
+const RRF_K: f32 = 10.0;
 
 /// Top-level retrieval orchestrator.
 ///
@@ -47,6 +53,12 @@ pub struct Retriever {
     vectors: Option<VectorStore>,
     embedder: Option<Arc<dyn Embedder>>,
     synthesizer: Option<Arc<dyn Synthesizer>>,
+    /// Multiplier applied to the fused score of every
+    /// `RetrievalSource::Markdown` hit after RRF, before top-K selection.
+    /// `1.0` is the identity (no boost). Set via
+    /// [`Retriever::with_markdown_boost`] or the `[retrieve]
+    /// rerank_markdown_boost` config key.
+    markdown_boost: f32,
 }
 
 impl Retriever {
@@ -59,6 +71,7 @@ impl Retriever {
             vectors: None,
             embedder: None,
             synthesizer: None,
+            markdown_boost: 1.0,
         }
     }
 
@@ -77,7 +90,20 @@ impl Retriever {
             vectors,
             embedder,
             synthesizer,
+            markdown_boost: 1.0,
         }
+    }
+
+    /// Set the post-RRF multiplier applied to Markdown-sourced hits.
+    ///
+    /// Useful when a fact or lesson in `MEMORY.md` / `LESSONS.md` ranks
+    /// below code chunks for queries whose tokens also appear literally
+    /// in source (e.g. identifier-heavy phrasing). Mirrors the
+    /// `[retrieve] rerank_markdown_boost` config knob. Values are taken
+    /// as-is — the config loader already clamps into `[0.0, 10.0]`.
+    pub fn with_markdown_boost(mut self, boost: f32) -> Self {
+        self.markdown_boost = boost;
+        self
     }
 
     /// Mode::Zero recall. Runs each local source, then fuses with RRF.
@@ -174,8 +200,20 @@ impl Retriever {
             }
         }
 
-        // Sort by fused score, take top-k.
+        // Apply the Markdown rerank boost before sorting so boosted
+        // lessons/facts get the full benefit against code hits. Skipped
+        // (as a micro-opt) when the boost is the identity — avoids
+        // touching the score array in the overwhelmingly common case.
         let mut ranked: Vec<FusedRow> = fused.into_values().collect();
+        if (self.markdown_boost - 1.0).abs() > f32::EPSILON {
+            for row in ranked.iter_mut() {
+                if matches!(row.cand.source, RetrievalSource::Markdown) {
+                    row.score *= self.markdown_boost;
+                }
+            }
+        }
+
+        // Sort by fused score, take top-k.
         ranked.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)

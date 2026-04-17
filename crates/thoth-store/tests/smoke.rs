@@ -242,6 +242,28 @@ async fn markdown_facts_and_lessons_roundtrip() {
     assert_eq!(lessons.len(), 1);
     assert_eq!(lessons[0].trigger, "when editing migrations");
     assert!(lessons[0].advice.contains("sqlx prepare"));
+
+    // Regression guard (2026-04-17): canonical append_fact + append_lesson
+    // MUST write an `op="append"` entry to memory-history.jsonl. Without
+    // this, the reflection-debt counter in thoth-memory silently hides
+    // every auto-mode remember, so debt monotonically grows until the
+    // gate hard-blocks the agent for "0 remembers" even when it has
+    // remembered plenty. Verify both kinds landed in the log.
+    let history = md.read_history().await.unwrap();
+    let append_entries: Vec<_> = history.iter().filter(|h| h.op == "append").collect();
+    assert_eq!(
+        append_entries.len(),
+        2,
+        "expected 1 append for fact + 1 for lesson, got: {history:?}"
+    );
+    assert!(
+        append_entries.iter().any(|h| h.kind == "fact"),
+        "missing fact-append history entry: {history:?}"
+    );
+    assert!(
+        append_entries.iter().any(|h| h.kind == "lesson"),
+        "missing lesson-append history entry: {history:?}"
+    );
 }
 
 #[tokio::test]

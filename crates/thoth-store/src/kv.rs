@@ -186,6 +186,29 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Insert many symbol rows in a single redb transaction.
+    pub async fn put_symbols_batch(&self, rows: Vec<SymbolRow>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let wtxn = db.begin_write().map_err(store)?;
+            {
+                let mut t = wtxn.open_table(SYMBOLS).map_err(store)?;
+                for row in &rows {
+                    let bytes = serde_json::to_vec(row)?;
+                    t.insert(row.fqn.as_str(), bytes.as_slice())
+                        .map_err(store)?;
+                }
+            }
+            wtxn.commit().map_err(store)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Fetch a symbol row by FQN.
     pub async fn get_symbol(&self, fqn: impl Into<String>) -> Result<Option<SymbolRow>> {
         let db = self.db.clone();
@@ -254,6 +277,51 @@ impl KvStore {
             {
                 let mut t = wtxn.open_table(EDGES).map_err(store)?;
                 t.insert(key.as_str(), bytes.as_slice()).map_err(store)?;
+            }
+            wtxn.commit().map_err(store)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Insert many graph nodes in a single redb transaction.
+    pub async fn put_nodes_batch(&self, rows: Vec<NodeRow>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let wtxn = db.begin_write().map_err(store)?;
+            {
+                let mut t = wtxn.open_table(NODES).map_err(store)?;
+                for row in &rows {
+                    let bytes = serde_json::to_vec(row)?;
+                    t.insert(row.id.as_str(), bytes.as_slice()).map_err(store)?;
+                }
+            }
+            wtxn.commit().map_err(store)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Insert many graph edges in a single redb transaction.
+    pub async fn put_edges_batch(&self, rows: Vec<EdgeRow>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let wtxn = db.begin_write().map_err(store)?;
+            {
+                let mut t = wtxn.open_table(EDGES).map_err(store)?;
+                for row in &rows {
+                    let key = format!("{}|{}|{}", row.src, row.kind, row.dst);
+                    let bytes = serde_json::to_vec(row)?;
+                    t.insert(key.as_str(), bytes.as_slice()).map_err(store)?;
+                }
             }
             wtxn.commit().map_err(store)?;
             Ok(())

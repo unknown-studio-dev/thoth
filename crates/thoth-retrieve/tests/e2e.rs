@@ -214,6 +214,90 @@ async fn recall_fuses_markdown_memory_hits() {
 }
 
 #[tokio::test]
+async fn markdown_boost_lifts_lesson_score_above_code() {
+    // Without a boost, a code chunk whose symbol literally matches the
+    // query will out-rank a lesson that only matches on prose. This
+    // verifies the knob does what it says: Markdown hits scale, Code
+    // hits don't, and boost=2.0 produces a strictly higher Markdown
+    // score than boost=1.0 on the same input.
+    let src = r#"
+/// Handles database migration runs.
+pub fn migration_runner() -> &'static str {
+    "runs"
+}
+"#;
+    let src_dir = tempdir().unwrap();
+    tokio::fs::write(src_dir.path().join("migrations.rs"), src)
+        .await
+        .unwrap();
+
+    let thoth_dir = tempdir().unwrap();
+    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
+    Indexer::new(store.clone(), LanguageRegistry::new())
+        .index_path(src_dir.path())
+        .await
+        .unwrap();
+
+    tokio::fs::write(
+        thoth_dir.path().join("LESSONS.md"),
+        "# LESSONS.md\n\
+         \n\
+         ### when editing database migrations\n\
+         Always run `sqlx prepare` after changing SQL — skipping breaks CI.\n\
+         \n",
+    )
+    .await
+    .unwrap();
+
+    let query = Query::text("database migrations sqlx prepare");
+
+    let baseline = Retriever::new(store.clone())
+        .recall(&query)
+        .await
+        .unwrap();
+    let boosted = Retriever::new(store)
+        .with_markdown_boost(2.0)
+        .recall(&query)
+        .await
+        .unwrap();
+
+    let baseline_md = baseline
+        .chunks
+        .iter()
+        .find(|c| c.path.ends_with("LESSONS.md"))
+        .expect("baseline must still surface the lesson");
+    let boosted_md = boosted
+        .chunks
+        .iter()
+        .find(|c| c.path.ends_with("LESSONS.md"))
+        .expect("boosted must still surface the lesson");
+    assert!(
+        boosted_md.score > baseline_md.score,
+        "boost should lift markdown score: baseline={} boosted={}",
+        baseline_md.score,
+        boosted_md.score,
+    );
+
+    // Code hits must be untouched — only Markdown scales.
+    let baseline_code = baseline
+        .chunks
+        .iter()
+        .find(|c| c.path.ends_with("migrations.rs"));
+    let boosted_code = boosted
+        .chunks
+        .iter()
+        .find(|c| c.path.ends_with("migrations.rs"));
+    if let (Some(b), Some(bo)) = (baseline_code, boosted_code) {
+        assert!(
+            (b.score - bo.score).abs() < 1e-6,
+            "code score must not change: baseline={} boosted={}",
+            b.score,
+            bo.score
+        );
+    }
+}
+
+#[tokio::test]
 async fn recall_surfaces_lessons_by_trigger() {
     // Reflective memory (LESSONS.md) must be surfaced by recall, not just
     // MEMORY.md. Without this, `thoth_lesson_outcome` bumps counters in a

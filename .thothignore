@@ -1,0 +1,15 @@
+# .thothignore — Thoth-specific ignore rules (gitignore syntax).
+# Layered on top of .gitignore. Edit freely.
+
+# Thoth data (always ignored by the watcher, but explicit here too)
+.thoth/
+
+# Rust
+target/
+Cargo.lock
+
+# Common generated / large files
+*.generated.*
+*.min.css
+*.map
+*.pb.rs

@@ -25,7 +25,7 @@ pub mod enrich;
 pub mod indexer;
 pub mod retriever;
 
-pub use config::{IndexConfig, OutputConfig};
+pub use config::{IndexConfig, OutputConfig, RetrieveConfig, WatchConfig};
 pub use enrich::{enrich_chunks, extract_docstring};
 pub use indexer::{IndexProgress, IndexStats, Indexer, chunk_id, read_span};
 pub use retriever::Retriever;
@@ -43,8 +43,14 @@ use thoth_store::{StoreRoot, VectorStore};
 /// the caller-supplied embedder / synthesizer are plugged into the
 /// retriever.
 pub async fn recall(store: StoreRoot, q: Query, mode: Mode) -> Result<Retrieval> {
+    let retrieve_cfg = RetrieveConfig::load_or_default(&store.path).await;
     match mode {
-        Mode::Zero => Retriever::new(store).recall(&q).await,
+        Mode::Zero => {
+            Retriever::new(store)
+                .with_markdown_boost(retrieve_cfg.rerank_markdown_boost)
+                .recall(&q)
+                .await
+        }
         Mode::Full {
             embedder,
             synthesizer,
@@ -54,6 +60,7 @@ pub async fn recall(store: StoreRoot, q: Query, mode: Mode) -> Result<Retrieval>
             let embedder: Option<Arc<dyn Embedder>> = embedder.map(Arc::from);
             let synth: Option<Arc<dyn Synthesizer>> = synthesizer.map(Arc::from);
             Retriever::with_full(store, Some(vectors), embedder, synth)
+                .with_markdown_boost(retrieve_cfg.rerank_markdown_boost)
                 .recall_full(&q)
                 .await
         }

@@ -533,7 +533,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Init => cmd_init(&cli.root).await?,
         Cmd::Setup { status, yes } => setup::run(&cli.root, status, yes).await?,
-        Cmd::Index { path } => cmd_index(&cli.root, &path, cli.embedder).await?,
+        Cmd::Index { path } => cmd_index(&cli.root, &path, cli.json, cli.embedder).await?,
         Cmd::Query { text, top_k } => {
             cmd_query(
                 &cli.root,
@@ -883,6 +883,7 @@ const DEFAULT_CONFIG_TOML: &str = r#"# Thoth config. All fields are optional; de
 async fn cmd_index(
     root: &std::path::Path,
     src: &std::path::Path,
+    json: bool,
     embedder_kind: Option<EmbedderKind>,
 ) -> anyhow::Result<()> {
     // Try forwarding to a running MCP daemon first (avoids redb lock).
@@ -900,7 +901,14 @@ async fn cmd_index(
         if daemon::tool_is_error(&result) {
             anyhow::bail!("{}", daemon::tool_text(&result));
         }
-        println!("{}", daemon::tool_text(&result));
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&daemon::tool_data(&result))?
+            );
+        } else {
+            println!("{}", daemon::tool_text(&result));
+        }
         return Ok(());
     }
 
@@ -916,13 +924,28 @@ async fn cmd_index(
     idx = idx.with_progress(make_progress_bar());
 
     let stats = idx.index_path(src).await?;
-    println!("✓ indexed {}", src.display());
-    println!(
-        "  {} files · {} chunks · {} symbols · {} calls · {} imports",
-        stats.files, stats.chunks, stats.symbols, stats.calls, stats.imports,
-    );
-    if stats.embedded > 0 {
-        println!("  {} chunks embedded", stats.embedded);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": src.display().to_string(),
+                "files": stats.files,
+                "chunks": stats.chunks,
+                "symbols": stats.symbols,
+                "calls": stats.calls,
+                "imports": stats.imports,
+                "embedded": stats.embedded,
+            }))?
+        );
+    } else {
+        println!("✓ indexed {}", src.display());
+        println!(
+            "  {} files · {} chunks · {} symbols · {} calls · {} imports",
+            stats.files, stats.chunks, stats.symbols, stats.calls, stats.imports,
+        );
+        if stats.embedded > 0 {
+            println!("  {} chunks embedded", stats.embedded);
+        }
     }
     Ok(())
 }

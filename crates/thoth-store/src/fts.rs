@@ -156,6 +156,37 @@ impl FtsIndex {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Index many chunks in a single `spawn_blocking` call (no commit).
+    pub async fn index_chunks_batch(&self, chunks: Vec<ChunkDoc>) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let writer = self.writer.clone();
+        let fields = self.fields.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let w = writer.lock();
+            for chunk in chunks {
+                let id_term = tantivy::Term::from_field_text(fields.id, &chunk.id);
+                w.delete_term(id_term);
+                let mut d = doc!(
+                    fields.id         => chunk.id,
+                    fields.path       => chunk.path,
+                    fields.body       => chunk.body,
+                    fields.start_line => chunk.start_line as u64,
+                    fields.end_line   => chunk.end_line as u64,
+                    fields.language   => chunk.language,
+                );
+                if let Some(sym) = chunk.symbol {
+                    d.add_text(fields.symbol, &sym);
+                }
+                w.add_document(d).map_err(store)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Delete every document whose `path` field matches `path`.
     ///
     /// Keyed on the STRING `path` field so a full file can be purged without

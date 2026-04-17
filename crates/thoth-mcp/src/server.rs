@@ -11,12 +11,14 @@ use serde_json::{Value, json};
 use thoth_core::{Event, Fact, Lesson, MemoryKind, MemoryMeta, Outcome, Query, UserSignal};
 use thoth_memory::{DisciplineConfig, MemoryManager};
 use thoth_parse::LanguageRegistry;
-use thoth_retrieve::{Indexer, Retriever};
+use thoth_retrieve::{Indexer, RetrieveConfig, Retriever};
 use thoth_store::StoreRoot;
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+use thoth_retrieve::WatchConfig;
 
 use crate::proto::{
     CallToolResult, Capabilities, ContentBlock, GetPromptResult, InitializeResult,
@@ -53,7 +55,9 @@ impl Server {
         let root = path.as_ref().to_path_buf();
         let store = StoreRoot::open(&root).await?;
         let indexer = Indexer::new(store.clone(), LanguageRegistry::new());
-        let retriever = Retriever::new(store.clone());
+        let retrieve_cfg = RetrieveConfig::load_or_default(&root).await;
+        let retriever = Retriever::new(store.clone())
+            .with_markdown_boost(retrieve_cfg.rerank_markdown_boost);
         let graph = thoth_graph::Graph::new(store.kv.clone());
         Ok(Self {
             inner: Arc::new(Inner {
@@ -64,6 +68,28 @@ impl Server {
                 graph,
             }),
         })
+    }
+
+    /// Spawn a background file watcher if `[watch] enabled = true` in
+    /// `config.toml`. The watcher reuses the server's `Indexer` so there
+    /// is no lock contention with the MCP daemon. Returns `true` if a
+    /// watcher was spawned.
+    ///
+    /// `src` is the source tree to watch (typically the project root,
+    /// i.e. the parent of `.thoth/`).
+    pub async fn spawn_watcher(&self, src: PathBuf) -> bool {
+        let cfg = WatchConfig::load_or_default(&self.inner.root).await;
+        if !cfg.enabled {
+            return false;
+        }
+        let debounce = std::time::Duration::from_millis(cfg.debounce_ms);
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            if let Err(e) = run_watcher(inner, src, debounce).await {
+                warn!(error = %e, "background watcher exited");
+            }
+        });
+        true
     }
 
     /// Dispatch a single request. Returns `Ok(None)` for notifications.
@@ -1967,6 +1993,79 @@ async fn render_retrieval(r: &thoth_core::Retrieval, root: &Path) -> String {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
+}
+
+// ===========================================================================
+// Background file watcher
+// ===========================================================================
+
+/// Watch `src` for file changes and reindex through `inner.indexer`.
+///
+/// Mirrors the debounce + batch logic in `cmd_watch` but runs in-process
+/// alongside the MCP daemon, sharing the same `Indexer` (and therefore the
+/// same redb write lock). This avoids the "daemon is running" conflict
+/// that blocks the standalone `thoth watch`.
+async fn run_watcher(
+    inner: Arc<Inner>,
+    src: PathBuf,
+    debounce: std::time::Duration,
+) -> anyhow::Result<()> {
+    use thoth_parse::watch::Watcher;
+
+    let mut w = Watcher::watch(&src, 1024)?;
+    debug!(path = %src.display(), "background watcher started");
+
+    loop {
+        let Some(ev) = w.recv().await else {
+            debug!("watcher channel closed");
+            break;
+        };
+
+        // Debounce: drain events arriving within the window.
+        let mut batch = vec![ev];
+        let deadline = tokio::time::Instant::now() + debounce;
+        while let Ok(Some(extra)) = tokio::time::timeout_at(deadline, w.recv()).await {
+            batch.push(extra);
+        }
+
+        let mut changed = std::collections::HashSet::new();
+        let mut deleted = std::collections::HashSet::new();
+        for ev in batch {
+            match ev {
+                thoth_core::Event::FileChanged { path, .. } => {
+                    deleted.remove(&path);
+                    changed.insert(path);
+                }
+                thoth_core::Event::FileDeleted { path, .. } => {
+                    changed.remove(&path);
+                    deleted.insert(path);
+                }
+                _ => {}
+            }
+        }
+
+        let changed_n = changed.len();
+        let deleted_n = deleted.len();
+
+        for path in deleted {
+            if let Err(e) = inner.indexer.purge_path(&path).await {
+                warn!(?path, error = %e, "watcher: purge failed");
+            }
+        }
+        for path in changed {
+            if let Err(e) = inner.indexer.index_file(&path).await {
+                warn!(?path, error = %e, "watcher: re-index failed");
+            }
+        }
+
+        if changed_n + deleted_n > 0 {
+            if let Err(e) = inner.indexer.commit().await {
+                warn!(error = %e, "watcher: fts commit failed");
+            }
+            debug!(changed = changed_n, deleted = deleted_n, "watcher: reindexed");
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================
