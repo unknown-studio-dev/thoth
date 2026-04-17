@@ -985,15 +985,18 @@ pub enum HookEvent {
 /// hook must never block the agent.
 pub async fn exec(event: HookEvent, root: &Path) -> anyhow::Result<()> {
     let payload = read_stdin_json().await.unwrap_or_else(|_| json!({}));
+    let mut buf = String::new();
     let result = match event {
-        HookEvent::SessionStart => run_session_start(root).await,
-        HookEvent::UserPromptSubmit => run_user_prompt(root, &payload).await,
-        HookEvent::PostToolUse => run_post_tool(root, &payload).await,
+        HookEvent::SessionStart => run_session_start(root, &mut buf).await,
+        HookEvent::UserPromptSubmit => run_user_prompt(root, &payload, &mut buf).await,
+        HookEvent::PostToolUse => run_post_tool(root, &payload, &mut buf).await,
         HookEvent::Stop => run_stop(root, &payload).await,
     };
     if let Err(e) = result {
         eprintln!("thoth: hook error: {e}");
     }
+    // Output JSON for Claude Code's `"output": "json"` hook mode.
+    println!("{}", json!({"result": buf}));
     Ok(())
 }
 
@@ -1008,7 +1011,8 @@ async fn read_stdin_json() -> anyhow::Result<Value> {
     Ok(serde_json::from_str(&buf).unwrap_or(Value::Null))
 }
 
-async fn run_session_start(root: &Path) -> anyhow::Result<()> {
+async fn run_session_start(root: &Path, buf: &mut String) -> anyhow::Result<()> {
+    use std::fmt::Write;
     if !root.exists() {
         return Ok(());
     }
@@ -1027,24 +1031,27 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
     // (no MEMORY/LESSONS content) has no in-context pointer to Thoth
     // until the PreToolUse gate blocks — which happens after the agent
     // has already tried the wrong path.
-    println!("### Thoth memory policy");
-    println!("This project uses Thoth MCP as its long-term memory.");
-    println!(
+    let _ = writeln!(buf, "### Thoth memory policy");
+    let _ = writeln!(buf, "This project uses Thoth MCP as its long-term memory.");
+    let _ = writeln!(
+        buf,
         "- Persist facts via `mcp__thoth__thoth_remember_fact`; lessons via \
          `mcp__thoth__thoth_remember_lesson`. These write to \
          ./.thoth/MEMORY.md and ./.thoth/LESSONS.md — the single source of truth."
     );
-    println!("- Do NOT write to auto-memory paths outside `.thoth/`.");
-    println!(
+    let _ = writeln!(buf, "- Do NOT write to auto-memory paths outside `.thoth/`.");
+    let _ = writeln!(
+        buf,
         "- Before any Write/Edit/Bash: a `thoth_recall` must have been logged \
          within the gate window (strict mode blocks otherwise)."
     );
-    println!(
+    let _ = writeln!(
+        buf,
         "  The UserPromptSubmit hook auto-recalls for each user prompt, so the \
          first tool call after a prompt usually passes. Call \
          `mcp__thoth__thoth_recall` explicitly when switching topic mid-session."
     );
-    println!();
+    let _ = writeln!(buf);
 
     // Carry-over nag: if the previous session left reflection debt
     // that crossed the nudge threshold, run_stop wrote a marker into
@@ -1054,9 +1061,9 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
     if let Some(body) = thoth_memory::reflection::take_nag(root).await {
         let trimmed = body.trim();
         if !trimmed.is_empty() {
-            println!("### Reflection debt from the previous session");
-            println!("{trimmed}");
-            println!();
+            let _ = writeln!(buf, "### Reflection debt from the previous session");
+            let _ = writeln!(buf, "{trimmed}");
+            let _ = writeln!(buf);
         }
     }
 
@@ -1071,16 +1078,16 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        println!("### {name}");
-        println!("{trimmed}");
-        println!();
+        let _ = writeln!(buf, "### {name}");
+        let _ = writeln!(buf, "{trimmed}");
+        let _ = writeln!(buf);
     }
 
     // Curator pass. Equivalent to invoking `thoth curate --quiet`
     // directly, but inlined so we don't re-exec the binary from its
     // own hook (costly on cold start). Any findings are printed to
     // stdout → Claude Code injects them as banner context.
-    if let Err(e) = curate_quiet(root).await {
+    if let Err(e) = curate_quiet(root, buf).await {
         tracing::warn!(error = %e, "curate_quiet failed");
     }
 
@@ -1095,7 +1102,8 @@ async fn run_session_start(root: &Path) -> anyhow::Result<()> {
 /// A forget pass that dropped zero episodes isn't a finding — surfacing
 /// it every session would pollute the banner and teach the agent to
 /// ignore the whole "Curator findings" block.
-async fn curate_quiet(root: &Path) -> anyhow::Result<()> {
+async fn curate_quiet(root: &Path, buf: &mut String) -> anyhow::Result<()> {
+    use std::fmt::Write;
     let mut findings: Vec<String> = Vec::new();
 
     // Forget pass via daemon if alive; otherwise skip silently — the
@@ -1127,17 +1135,18 @@ async fn curate_quiet(root: &Path) -> anyhow::Result<()> {
     }
 
     if !findings.is_empty() {
-        println!("### Curator findings");
+        let _ = writeln!(buf, "### Curator findings");
         for f in &findings {
-            println!("- {f}");
+            let _ = writeln!(buf, "- {f}");
         }
-        println!();
+        let _ = writeln!(buf);
     }
     Ok(())
 }
 
 
-async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
+async fn run_user_prompt(root: &Path, payload: &Value, buf: &mut String) -> anyhow::Result<()> {
+    use std::fmt::Write;
     if !root.exists() {
         return Ok(());
     }
@@ -1162,9 +1171,9 @@ async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
     let discipline = thoth_memory::DisciplineConfig::load_or_default(root).await;
     let debt = thoth_memory::ReflectionDebt::compute(root).await;
     if debt.should_nudge(&discipline) {
-        println!("### Reflection debt");
-        println!("{}", debt.render());
-        println!();
+        let _ = writeln!(buf, "### Reflection debt");
+        let _ = writeln!(buf, "{}", debt.render());
+        let _ = writeln!(buf);
     }
 
     // Prefer the running MCP daemon. `thoth-mcp` holds an exclusive redb
@@ -1197,8 +1206,8 @@ async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
             // picks it up as context — same surface as the direct path.
             let text = crate::daemon::tool_text(&result);
             if !text.trim().is_empty() {
-                println!("### thoth recall");
-                println!("{text}");
+                let _ = writeln!(buf, "### thoth recall");
+                let _ = writeln!(buf, "{text}");
             }
         }
         return Ok(());
@@ -1221,10 +1230,11 @@ async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
     if out.chunks.is_empty() {
         return Ok(());
     }
-    println!("### thoth recall (top {})", out.chunks.len());
+    let _ = writeln!(buf, "### thoth recall (top {})", out.chunks.len());
     for c in out.chunks.iter() {
         let sym = c.symbol.as_deref().unwrap_or("-");
-        println!(
+        let _ = writeln!(
+            buf,
             "- {}:{}-{}  [{}]  {}",
             c.path.display(),
             c.span.0,
@@ -1236,16 +1246,17 @@ async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_post_tool(root: &Path, payload: &Value) -> anyhow::Result<()> {
+async fn run_post_tool(root: &Path, payload: &Value, buf: &mut String) -> anyhow::Result<()> {
+    use std::fmt::Write;
     if !root.exists() {
         return Ok(());
     }
 
-    // Cadence heartbeat. Prints the debt nag on stdout (picked up by
+    // Cadence heartbeat. Writes the debt nag to the buffer (picked up by
     // Claude Code as additional context) when the user has opted into
     // `reflect_cadence = "every"`. `"end"` (the default) short-circuits.
     if let Some(msg) = cadence_heartbeat(root).await {
-        println!("{msg}");
+        let _ = writeln!(buf, "{msg}");
     }
 
     // Background review trigger. Spawn a detached `thoth review`

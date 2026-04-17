@@ -6,7 +6,8 @@
         {
           "type": "command",
           "command": "thoth --root {THOTH_ROOT} hooks exec session-start",
-          "timeout": 10
+          "timeout": 10,
+          "output": "json"
         }
       ]
     }
@@ -18,7 +19,8 @@
         {
           "type": "command",
           "command": "thoth --root {THOTH_ROOT} hooks exec user-prompt-submit",
-          "timeout": 10
+          "timeout": 10,
+          "output": "json"
         }
       ]
     }
@@ -30,7 +32,8 @@
         {
           "type": "command",
           "command": "thoth-gate",
-          "timeout": 15
+          "timeout": 15,
+          "output": "json"
         }
       ]
     },
@@ -40,7 +43,21 @@
         {
           "type": "command",
           "command": "thoth-gate",
-          "timeout": 15
+          "timeout": 15,
+          "output": "json"
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Bash|Write|Edit|NotebookEdit",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "thoth --root {THOTH_ROOT} hooks exec post-tool-use",
+          "timeout": 10,
+          "output": "json"
         }
       ]
     }
@@ -52,7 +69,8 @@
         {
           "type": "command",
           "command": "thoth --root {THOTH_ROOT} hooks exec stop",
-          "timeout": 15
+          "timeout": 15,
+          "output": "json"
         }
       ]
     }
