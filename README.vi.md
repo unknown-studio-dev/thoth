@@ -181,6 +181,59 @@ vẫn parse được để giữ backward compat — `soft` map sang `nudge`,
 `gate_window_secs` thành `window_short_secs`, `gate_require_nudge` in
 deprecation hint. Chạy lại `thoth setup` để migrate sang schema v2.
 
+## Background review
+
+Thoth tự động review session coding và lưu facts/lessons/skills — không
+cần bạn yêu cầu. Lấy cảm hứng từ
+[Hermes Agent](https://github.com/nousresearch/hermes-agent), nhưng tiết
+kiệm token hơn ~10 lần: Thoth build context từ event log có cấu trúc
+(~1k token) thay vì copy toàn bộ hội thoại (~5-50k token).
+
+**Cách hoạt động:**
+
+1. Hook `PostToolUse` đếm mutations (Write/Edit) kể từ lần review cuối.
+2. Khi đạt `background_review_interval`, spawn process `thoth review` ngầm.
+3. `thoth review` tổng hợp context từ `episodes.db`, `gate.jsonl`,
+   `git diff --stat`, và `MEMORY.md` / `LESSONS.md` hiện tại.
+4. Một lần gọi LLM duy nhất (qua `claude` CLI hoặc Anthropic API) trả
+   về JSON chứa facts/lessons/skills.
+5. Kết quả được dedup với memory hiện tại rồi ghi vào.
+6. Watermark `.last-review` reset bộ đếm mutation.
+
+**Bật trong `config.toml`:**
+
+```toml
+[discipline]
+background_review          = true   # opt-in (mặc định false)
+background_review_interval = 10     # số mutations giữa các lần review
+background_review_backend  = "auto" # "auto" | "cli" | "api"
+gate_telemetry_enabled     = true   # bắt buộc (đếm mutation từ gate.jsonl)
+```
+
+| Backend | Cách | Khi nào |
+|---------|------|---------|
+| `cli`   | `claude --print` qua stdin | Mặc định — dùng subscription Claude |
+| `api`   | POST trực tiếp tới `api.anthropic.com` | Khi có `ANTHROPIC_API_KEY` |
+| `auto`  | API nếu có key, ngược lại CLI | Khuyến nghị |
+
+Chạy thủ công: `thoth review --backend cli`
+
+## Status line
+
+`thoth setup` cài status line vào Claude Code hiển thị:
+
+```
+⚡ debt:5 | 📝 12F/8L | 🔄 2m ago
+```
+
+| Mục | Ý nghĩa |
+|-----|---------|
+| `debt:N` | Reflection debt trong session (mutations trừ remembers) |
+| `NF/NL` | Tổng facts trong MEMORY.md / lessons trong LESSONS.md |
+| `🔄 Xm ago` | Thời gian từ lần background review cuối (hoặc "never") |
+
+Script nằm ở `.claude/thoth-statusline.sh`, refresh mỗi 5 giây.
+
 ## Kiến trúc
 
 ```
@@ -297,8 +350,13 @@ thoth domain sync --source notion     --project-id <database-id>  # cần NOTION
 thoth domain sync --source asana      --project-id <gid>          # cần ASANA_TOKEN
 thoth domain sync --source notebooklm                             # stub; export → file
 
+# background review
+thoth review                              # chạy 1 lần (auto backend)
+thoth review --backend cli                # ép dùng claude CLI (subscription)
+thoth review --backend api                # ép dùng Anthropic API (cần key)
+
 # Claude Code
-thoth install
+thoth install                             # skills + hooks + MCP + statusline
 thoth install --scope user
 thoth uninstall
 

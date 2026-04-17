@@ -73,6 +73,18 @@ pub struct SetupAnswers {
     pub nudge_before_write: bool,
     pub global_fallback: bool,
     pub ignore: Vec<String>,
+    /// Auto-watch source tree for changes and reindex in-process within
+    /// the MCP daemon. Removes the need for a separate `thoth watch`.
+    pub watch_enabled: bool,
+    /// Debounce window for the auto-watcher (milliseconds).
+    pub watch_debounce_ms: u64,
+    /// Spawn a background `thoth review` every N mutations to
+    /// auto-persist facts/lessons. Requires gate_telemetry_enabled.
+    pub background_review: bool,
+    /// Mutations between background reviews.
+    pub background_review_interval: u32,
+    /// Backend: "auto", "cli", or "api".
+    pub background_review_backend: String,
 }
 
 impl Default for SetupAnswers {
@@ -91,6 +103,11 @@ impl Default for SetupAnswers {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            watch_enabled: false,
+            watch_debounce_ms: 300,
+            background_review: false,
+            background_review_interval: 10,
+            background_review_backend: "auto".to_string(),
         }
     }
 }
@@ -105,6 +122,7 @@ struct InstallState {
     hooks_installed: bool,
     mcp_installed: bool,
     skills_installed: Vec<String>,
+    watch_enabled: bool,
 }
 
 impl InstallState {
@@ -171,9 +189,10 @@ pub async fn run(root: &Path, status: bool, accept_defaults: bool) -> Result<()>
         prompt_interactive(&state)?
     };
 
-    // Write config, seed markdown, then wire the integration.
+    // Write config, seed markdown + .thothignore, then wire the integration.
     write_config(root, &answers).await?;
     seed_markdown(root).await?;
+    seed_thothignore(root).await?;
     install_integration(root).await?;
 
     print_summary(root, &answers);
@@ -189,6 +208,8 @@ async fn detect_state(root: &Path) -> Result<InstallState> {
     let cfg = root.join("config.toml");
     if cfg.exists() {
         s.config_path = Some(cfg);
+        let watch_cfg = thoth_retrieve::WatchConfig::load_or_default(root).await;
+        s.watch_enabled = watch_cfg.enabled;
     }
     s.memory_exists = root.join("MEMORY.md").exists();
     s.lessons_exists = root.join("LESSONS.md").exists();
@@ -297,6 +318,14 @@ fn print_status(root: &Path, s: &InstallState) {
             s.skills_installed.join(", ")
         }
     );
+    println!(
+        "  auto-watch    : {}",
+        if s.watch_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 }
 
 // -------------------------------------------------------------- wizard
@@ -398,6 +427,41 @@ fn prompt_interactive(state: &InstallState) -> Result<SetupAnswers> {
         parse_ignore_csv(&raw)
     };
 
+    // Auto-watch: reindex source changes in the MCP daemon background.
+    let watch_enabled = Confirm::with_theme(&theme)
+        .with_prompt("Auto-watch source tree? (reindex on file change, no separate `thoth watch`)")
+        .default(false)
+        .interact()?;
+
+    // Background review: Hermes-style auto-persist of facts/lessons.
+    let background_review = Confirm::with_theme(&theme)
+        .with_prompt("Enable background review? (auto-persist facts/lessons via claude CLI or API)")
+        .default(false)
+        .interact()?;
+
+    // If background review is on, gate telemetry must be on too
+    // (the mutation counter reads gate.jsonl).
+    let gate_telemetry_enabled = if background_review && !gate_telemetry_enabled {
+        println!("  (gate telemetry auto-enabled — required by background review)");
+        true
+    } else {
+        gate_telemetry_enabled
+    };
+
+    let (background_review_interval, background_review_backend) = if background_review {
+        let interval: u32 = Input::with_theme(&theme)
+            .with_prompt("Mutations between reviews")
+            .default(10u32)
+            .interact_text()?;
+        let backend: String = Input::with_theme(&theme)
+            .with_prompt("Review backend (auto / cli / api)")
+            .default("auto".to_string())
+            .interact_text()?;
+        (interval, backend)
+    } else {
+        (10, "auto".to_string())
+    };
+
     // Small courtesy — if skills from a previous install are still there,
     // warn that the setup will leave them in place.
     if !state.skills_installed.is_empty() {
@@ -418,6 +482,11 @@ fn prompt_interactive(state: &InstallState) -> Result<SetupAnswers> {
         nudge_before_write,
         global_fallback,
         ignore,
+        watch_enabled,
+        watch_debounce_ms: 300,
+        background_review,
+        background_review_interval,
+        background_review_backend,
     })
 }
 
@@ -529,7 +598,24 @@ fn render_toml(a: &SetupAnswers) -> String {
          #\n\
          # [[discipline.policies]]\n\
          # actor = \"ci-*\"                 # automation — trust it\n\
-         # mode = \"off\"\n",
+         # mode = \"off\"\n\
+         \n\
+         # --- background review ------------------------------------------------\n\
+         # Hermes-style auto-persist: spawn `thoth review` every N mutations\n\
+         # to analyze the session and save durable facts/lessons/skills.\n\
+         # Requires gate_telemetry_enabled = true (counter reads gate.jsonl).\n\
+         background_review              = {background_review}\n\
+         background_review_interval     = {background_review_interval}\n\
+         # Backend: \"auto\" (API key → api, else cli), \"cli\", or \"api\".\n\
+         background_review_backend      = \"{background_review_backend}\"\n\
+         \n\
+         [watch]\n\
+         # Auto-watch the source tree for changes and reindex in the MCP\n\
+         # daemon background. Removes the need for `thoth watch`.\n\
+         enabled      = {watch_enabled}\n\
+         # Debounce window (ms). Events within this window after the first\n\
+         # change are batched into a single reindex pass.\n\
+         debounce_ms  = {watch_debounce_ms}\n",
         ignore_block = ignore_block,
         mode = a.mode,
         memory_mode = a.memory_mode,
@@ -540,6 +626,11 @@ fn render_toml(a: &SetupAnswers) -> String {
         gate_telemetry_enabled = a.gate_telemetry_enabled,
         nudge_before_write = a.nudge_before_write,
         global_fallback = a.global_fallback,
+        watch_enabled = a.watch_enabled,
+        watch_debounce_ms = a.watch_debounce_ms,
+        background_review = a.background_review,
+        background_review_interval = a.background_review_interval,
+        background_review_backend = a.background_review_backend,
     )
 }
 
@@ -602,6 +693,90 @@ fn render_memory_seed(date: &str) -> String {
     )
 }
 
+/// Seed a `.thothignore` in the project root (parent of `.thoth/`) if one
+/// doesn't exist. Detects the project's language stack from common marker
+/// files and emits language-appropriate ignore patterns. Never overwrites
+/// — the user's edits win.
+async fn seed_thothignore(root: &Path) -> Result<()> {
+    // `.thothignore` lives in the project root, not inside `.thoth/`.
+    let project_root = root.parent().unwrap_or(Path::new("."));
+    let path = project_root.join(".thothignore");
+    if path.exists() {
+        return Ok(());
+    }
+
+    let body = render_thothignore(project_root);
+    tokio::fs::write(&path, body)
+        .await
+        .with_context(|| format!("write {}", path.display()))?;
+    println!("✓ Seeded {}", path.display());
+    Ok(())
+}
+
+/// Detect languages from marker files and render a `.thothignore` body.
+fn render_thothignore(project_root: &Path) -> String {
+    let mut lines = vec![
+        "# .thothignore — Thoth-specific ignore rules (gitignore syntax).",
+        "# Layered on top of .gitignore. Edit freely.",
+        "",
+        "# Thoth data (always ignored by the watcher, but explicit here too)",
+        ".thoth/",
+        "",
+    ];
+
+    // Detect languages and add relevant patterns.
+    let has = |name: &str| project_root.join(name).exists();
+
+    // Rust
+    if has("Cargo.toml") {
+        lines.push("# Rust");
+        lines.push("target/");
+        lines.push("Cargo.lock");
+        lines.push("");
+    }
+
+    // Node / JS / TS
+    if has("package.json") {
+        lines.push("# Node / JS / TS");
+        lines.push("node_modules/");
+        lines.push("dist/");
+        lines.push("build/");
+        lines.push(".next/");
+        lines.push(".nuxt/");
+        lines.push("coverage/");
+        lines.push("*.min.js");
+        lines.push("*.bundle.js");
+        lines.push("package-lock.json");
+        lines.push("yarn.lock");
+        lines.push("pnpm-lock.yaml");
+        lines.push("");
+    }
+
+    // Python
+    if has("pyproject.toml") || has("setup.py") || has("requirements.txt") || has("Pipfile") {
+        lines.push("# Python");
+        lines.push("__pycache__/");
+        lines.push("*.pyc");
+        lines.push(".venv/");
+        lines.push("venv/");
+        lines.push(".eggs/");
+        lines.push("*.egg-info/");
+        lines.push(".mypy_cache/");
+        lines.push(".pytest_cache/");
+        lines.push("");
+    }
+
+    // Common generated / large files
+    lines.push("# Common generated / large files");
+    lines.push("*.generated.*");
+    lines.push("*.min.css");
+    lines.push("*.map");
+    lines.push("*.pb.rs");
+    lines.push("");
+
+    lines.join("\n")
+}
+
 // -------------------------------------------------- integration wiring
 
 /// Full install — hooks + skills + MCP — into `./.claude/settings.json`.
@@ -631,6 +806,12 @@ fn print_summary(root: &Path, a: &SetupAnswers) {
         a.gate_relevance_threshold
     );
     println!("  gate_telemetry_enabled   = {}", a.gate_telemetry_enabled);
+    println!("  watch.enabled            = {}", a.watch_enabled);
+    println!("  background_review        = {}", a.background_review);
+    if a.background_review {
+        println!("  background_review_interval = {}", a.background_review_interval);
+        println!("  background_review_backend  = {}", a.background_review_backend);
+    }
     println!("  ignore patterns          = {}", a.ignore.len());
 }
 

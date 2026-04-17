@@ -71,6 +71,71 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Short kind label for display (e.g. `"file_changed"`).
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Event::FileChanged { .. } => "file_changed",
+            Event::FileDeleted { .. } => "file_deleted",
+            Event::QueryIssued { .. } => "query_issued",
+            Event::AnswerReturned { .. } => "answer_returned",
+            Event::OutcomeObserved { .. } => "outcome_observed",
+            Event::NudgeInvoked { .. } => "nudge_invoked",
+        }
+    }
+
+    /// One-line human-readable summary for the background review prompt.
+    pub fn one_line_summary(&self) -> String {
+        match self {
+            Event::FileChanged { path, .. } => {
+                format!("{}", path.display())
+            }
+            Event::FileDeleted { path, .. } => {
+                format!("deleted {}", path.display())
+            }
+            Event::QueryIssued { text, .. } => {
+                let short: String = text.chars().take(80).collect();
+                format!("query: {short}")
+            }
+            Event::AnswerReturned {
+                chunk_ids,
+                synthesized,
+                ..
+            } => {
+                format!(
+                    "{} chunks, synth={}",
+                    chunk_ids.len(),
+                    synthesized,
+                )
+            }
+            Event::OutcomeObserved { outcome, .. } => match outcome {
+                Outcome::Test { passed, suite } => {
+                    format!("test {suite}: {}", if *passed { "pass" } else { "FAIL" })
+                }
+                Outcome::Commit { sha, files } => {
+                    format!("commit {} ({} files)", &sha[..7.min(sha.len())], files.len())
+                }
+                Outcome::Revert { sha, .. } => format!("revert {}", &sha[..7.min(sha.len())]),
+                Outcome::UserFeedback { signal, note } => {
+                    let s = match signal {
+                        UserSignal::Accept => "accept",
+                        UserSignal::Edit => "edit",
+                        UserSignal::Reject => "reject",
+                    };
+                    match note {
+                        Some(n) => format!("feedback: {s} — {n}"),
+                        None => format!("feedback: {s}"),
+                    }
+                }
+                Outcome::Error { summary, .. } => format!("error: {summary}"),
+            },
+            Event::NudgeInvoked { intent, .. } => {
+                format!("nudge: {intent}")
+            }
+        }
+    }
+}
+
 /// Outcome of applying an answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

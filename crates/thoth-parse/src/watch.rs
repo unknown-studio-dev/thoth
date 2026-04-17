@@ -5,14 +5,79 @@
 //!
 //! Debouncing and deletion handling are intentionally simple here; the
 //! orchestrator is responsible for batching changes into index deltas.
+//!
+//! Events inside ignored paths are silently dropped. The ignore rules
+//! are: `.gitignore` + `.thothignore` + a small hardcoded set of dirs
+//! that Thoth itself writes to (`.thoth/`, `.git/`). This prevents the
+//! infinite-loop scenario where reindexing writes to `.thoth/`, which
+//! re-triggers the watcher.
 
 use std::path::Path;
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use thoth_core::{Error, Event, Result};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+use crate::walk::THOTH_IGNORE_FILE;
+
+/// Directories that the watcher always ignores, regardless of
+/// `.gitignore` / `.thothignore` content. These are paths that Thoth
+/// (or its host) writes to during indexing — without this hardcoded
+/// list, the watcher would infinite-loop on its own output.
+const ALWAYS_IGNORED_DIRS: &[&str] = &[".thoth", ".git"];
+
+/// Build a combined ignore matcher from `.gitignore` + `.thothignore`
+/// rooted at `root`. Returns `None` if neither file exists or both are
+/// empty. The matcher is used in the `notify` callback to drop events
+/// before they hit the channel.
+fn build_ignore(root: &Path) -> Option<Gitignore> {
+    let mut gb = GitignoreBuilder::new(root);
+    let mut added = false;
+
+    // `.gitignore`
+    let gitignore = root.join(".gitignore");
+    if gitignore.is_file() {
+        if let Some(e) = gb.add(&gitignore) {
+            warn!(error = %e, "watcher: failed to parse .gitignore");
+        } else {
+            added = true;
+        }
+    }
+
+    // `.thothignore`
+    let thothignore = root.join(THOTH_IGNORE_FILE);
+    if thothignore.is_file() {
+        if let Some(e) = gb.add(&thothignore) {
+            warn!(error = %e, "watcher: failed to parse .thothignore");
+        } else {
+            added = true;
+        }
+    }
+
+    if !added {
+        return None;
+    }
+    match gb.build() {
+        Ok(gi) => Some(gi),
+        Err(e) => {
+            warn!(error = %e, "watcher: failed to build ignore rules");
+            None
+        }
+    }
+}
+
+/// Returns `true` if `path` is inside one of the [`ALWAYS_IGNORED_DIRS`].
+fn in_always_ignored(path: &Path) -> bool {
+    path.components().any(|c| {
+        if let std::path::Component::Normal(s) = c && let Some(s) = s.to_str() {
+                return ALWAYS_IGNORED_DIRS.contains(&s);
+        }
+        false
+    })
+}
 
 /// A running file watcher.
 ///
@@ -29,7 +94,17 @@ impl Watcher {
     ///
     /// `buffer` is the size of the internal mpsc channel; bursty workloads
     /// may want something generous (e.g. 1024).
+    ///
+    /// Events matching `.gitignore`, `.thothignore`, or the hardcoded
+    /// always-ignored dirs (`.thoth/`, `.git/`) are silently dropped.
     pub fn watch(root: impl AsRef<Path>, buffer: usize) -> Result<Self> {
+        // Canonicalize the root so that ignore-rule matching doesn't
+        // panic when `notify` returns absolute/canonical paths (macOS
+        // fsevents always does) but root was passed as a relative path.
+        let root_path = std::fs::canonicalize(root.as_ref())
+            .unwrap_or_else(|_| root.as_ref().to_path_buf());
+        let ignore = build_ignore(&root_path);
+
         let (tx, rx) = mpsc::channel::<Event>(buffer);
         let tx_for_cb = tx.clone();
 
@@ -43,6 +118,20 @@ impl Watcher {
                     }
                 };
                 for path in ev.paths {
+                    // Always-ignored dirs (prevents infinite loop).
+                    if in_always_ignored(&path) {
+                        continue;
+                    }
+                    // .gitignore + .thothignore rules. The `ignore` crate
+                    // panics if the path isn't under the gitignore root, so
+                    // we guard with `strip_prefix` first.
+                    if let Some(gi) = ignore.as_ref() && path.strip_prefix(&root_path).is_ok() {
+                            let is_dir = path.is_dir();
+                            if gi.matched_path_or_any_parents(&path, is_dir).is_ignore() {
+                                continue;
+                            }
+                    }
+
                     let now = OffsetDateTime::now_utc();
                     let mapped = match ev.kind {
                         EventKind::Remove(_) => Some(Event::FileDeleted { path, at: now }),

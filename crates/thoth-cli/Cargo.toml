@@ -19,7 +19,7 @@ default   = []
 voyage    = ["thoth-embed/voyage"]
 openai    = ["thoth-embed/openai"]
 cohere    = ["thoth-embed/cohere"]
-anthropic = ["thoth-synth/anthropic"]
+anthropic = ["thoth-synth/anthropic", "dep:reqwest"]
 # Domain-memory adapters. The `file` ingestor is always on — it ships
 # in the base crate and powers the `thoth domain sync --source file`
 # path that air-gapped users and tests rely on.
@@ -53,6 +53,7 @@ time                 = { workspace = true }
 clap                 = { workspace = true }
 indicatif            = "0.17"
 dialoguer            = { version = "0.11", default-features = false, features = ["fuzzy-select"] }
+reqwest              = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

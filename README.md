@@ -147,6 +147,17 @@ reflect_cadence          = "end"
 # `review` stages to *.pending.md — user must promote/reject.
 memory_mode              = "auto"
 
+# --- reflection debt -------------------------------------------------
+# Soft nudge threshold: once `mutations - remembers` crosses this, the
+# Stop hook drops a nag marker, UserPromptSubmit prefixes every prompt
+# with a "### Reflection debt" block, and `thoth curate` surfaces it.
+# Set to 0 to disable the soft reminder.
+reflect_debt_nudge       = 10
+# Hard block threshold: PreToolUse gate returns `{"decision":"block"}`
+# on Write/Edit/Bash when debt crosses this. Bypass one session with
+# `THOTH_DEFER_REFLECT=1` or lower the threshold. Set to 0 to disable.
+reflect_debt_block       = 20
+
 # --- gate v2 ---------------------------------------------------------
 # Verdict on a relevance miss:
 #   "off"    — disable the gate (pass silently).
@@ -203,6 +214,61 @@ quarantine_min_attempts  = 5
 `soft` maps to `nudge`, `gate_window_secs` becomes `window_short_secs`,
 and `gate_require_nudge` emits a deprecation hint. Re-run `thoth setup`
 to migrate to the v2 schema.
+
+## Background review
+
+Thoth can automatically review your coding session and persist durable
+facts, lessons, and skill proposals — without you asking. Inspired by
+[Hermes Agent](https://github.com/nousresearch/hermes-agent)'s
+background review fork, but ~10x more token-efficient: Thoth builds
+context from structured event logs (~1k tokens) instead of copying the
+full conversation (~5-50k tokens).
+
+**How it works:**
+
+1. The `PostToolUse` hook counts mutations (Write/Edit) since the last review.
+2. When the count crosses `background_review_interval`, a detached
+   `thoth review` process is spawned.
+3. `thoth review` assembles context from `episodes.db`, `gate.jsonl`,
+   `git diff --stat`, and current `MEMORY.md` / `LESSONS.md`.
+4. A single LLM call (via `claude` CLI or Anthropic API) produces
+   structured JSON with facts/lessons/skills.
+5. Results are deduped against existing memory and persisted.
+6. A `.last-review` watermark resets the mutation counter.
+
+**Enable in `config.toml`:**
+
+```toml
+[discipline]
+background_review          = true   # opt-in (default false)
+background_review_interval = 10     # mutations between reviews
+background_review_backend  = "auto" # "auto" | "cli" | "api"
+gate_telemetry_enabled     = true   # required (counter reads gate.jsonl)
+```
+
+| Backend | How | When |
+|---------|-----|------|
+| `cli`   | `claude --print --dangerously-skip-permissions` via stdin | Default — uses your Claude subscription |
+| `api`   | Direct POST to `api.anthropic.com/v1/messages` | When `ANTHROPIC_API_KEY` is set |
+| `auto`  | API if key is set, else CLI | Recommended default |
+
+Run manually: `thoth review --backend cli`
+
+## Status line
+
+`thoth setup` installs a status line into Claude Code that shows:
+
+```
+⚡ debt:5 | 📝 12F/8L | 🔄 2m ago
+```
+
+| Segment | Meaning |
+|---------|---------|
+| `debt:N` | Session-scoped reflection debt (mutations minus remembers) |
+| `NF/NL` | Total facts in MEMORY.md / lessons in LESSONS.md |
+| `🔄 Xm ago` | Time since last background review (or "never") |
+
+The script lives at `.claude/thoth-statusline.sh` and refreshes every 5 seconds.
 
 ## Architecture
 
@@ -291,6 +357,57 @@ a broken gate never bricks your editor — at the cost of silently
 reverting to `nudge` mode. Check stderr if the gate feels weaker than
 expected.
 
+### Reflection debt
+
+Pre-action recall (gated by `thoth-gate`) is one half of the loop.
+The other half — *post-action reflection* — used to be a prompt
+contract only, so agents drifted. Since 2026-04-17 reflection is
+an enforced counter in its own right.
+
+**Definition.** `debt = mutations - remembers` within the current
+session, clamped at zero. Mutations are `Write`/`Edit`/`NotebookEdit`
+tool calls that the gate passed (read from `.thoth/gate.jsonl`).
+Remembers are `thoth_remember_fact` / `thoth_remember_lesson` calls
+(read from `.thoth/memory-history.jsonl`). Session boundary comes
+from `.thoth/.session-start`, bumped by the SessionStart hook.
+
+**Three enforcement tiers.** All use the same debt number, differ
+only in where they fire:
+
+| Tier | Hook               | Fires when        | Effect                                                          |
+|------|--------------------|-------------------|-----------------------------------------------------------------|
+| 1    | Stop               | `debt ≥ nudge`    | stderr nag + `.thoth/.reflect-nag` marker for next SessionStart |
+| 2    | UserPromptSubmit   | `debt ≥ nudge`    | `### Reflection debt` banner injected into every prompt         |
+| 2b   | PostToolUse        | `cadence=every`¹  | Same banner, fires after every mutation                         |
+| 3    | PreToolUse (gate)  | `debt ≥ block`    | Hard `block` on Write/Edit/Bash until the agent remembers       |
+
+¹ Only when `[discipline] reflect_cadence = "every"`. The default
+`"end"` wires only tiers 1–3.
+
+**Tuning.** `reflect_debt_nudge` (default `10`) and `reflect_debt_block`
+(default `20`) are both in `[discipline]`. Setting either to `0`
+disables that tier. Lower `nudge` for tighter loops, raise `block`
+(or set to `0`) if your workflow genuinely batches many edits per
+reflection.
+
+**Escape hatches.**
+
+- `THOTH_DEFER_REFLECT=1` — bypass tier 3 for one process. Use
+  sparingly; it's a temporary release valve, not a default.
+- `thoth_remember_fact` with `stage: true` — writes to
+  `MEMORY.pending.md` and still counts as a remember, so agents who
+  need to drain debt mid-task without committing canonical facts
+  have a graceful path. Clean up later via `thoth memory reject` (or
+  `thoth memory promote` to accept).
+- `thoth curate` — same debt report, on demand, plus the forget pass
+  and lesson-cluster detector. Whitelisted in the gate's readonly
+  prefix list so it keeps working even under a tier-3 block.
+
+**Why it works.** The counter is cheap (two JSONL tail reads, a few
+ms on a session-sized log), the trigger is one user-visible number,
+and every tier emits a recoverable message. No silent drift, no
+guessing.
+
 ## CLI cheatsheet
 
 ```bash
@@ -325,8 +442,13 @@ thoth domain sync --source notion     --project-id <database-id>  # needs NOTION
 thoth domain sync --source asana      --project-id <gid>          # needs ASANA_TOKEN
 thoth domain sync --source notebooklm                          # stub; export → file
 
+# background review
+thoth review                              # run once (auto backend)
+thoth review --backend cli                # force claude CLI (subscription)
+thoth review --backend api                # force Anthropic API (needs key)
+
 # Claude Code wiring
-thoth install                             # skills + hooks + MCP, project scope
+thoth install                             # skills + hooks + MCP + statusline
 thoth install --scope user                # global
 thoth uninstall                           # remove in that scope
 

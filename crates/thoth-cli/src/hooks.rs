@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
 use thoth_parse::LanguageRegistry;
-use thoth_retrieve::{Indexer, Retriever};
+use thoth_retrieve::{Indexer, RetrieveConfig, Retriever};
 use thoth_store::StoreRoot;
 
 // -------------------------------------------------------------- asset bundle
@@ -96,6 +96,9 @@ const BUNDLE_SKILLS: &[(&str, &str)] = &[
 /// Trip-wire: we always ship at least one skill. Compile-time so dropping
 /// the slice to zero fails the build, not the test suite.
 const _: () = assert!(!BUNDLE_SKILLS.is_empty());
+
+/// Bundled statusline script for Claude Code.
+const BUNDLE_STATUSLINE: &str = include_str!("../assets/thoth-statusline.sh");
 
 /// Sentinel field added to every hook entry the CLI writes into
 /// `.claude/settings.json`. Lets `thoth uninstall` strip exactly what it
@@ -876,12 +879,60 @@ async fn read_mcp_config(path: &Path) -> anyhow::Result<Value> {
     read_settings(path).await
 }
 
+// -------------------------------------------------------- statusline install
+
+/// Install the Thoth statusline script and merge the `statusLine` key
+/// into `.claude/settings.json`.
+pub async fn statusline_install(scope: Scope) -> anyhow::Result<()> {
+    let settings_path = scope.settings_path()?;
+    let claude_dir = settings_path.parent().unwrap();
+    let script_path = claude_dir.join("thoth-statusline.sh");
+
+    // Write the bundled script.
+    tokio::fs::create_dir_all(claude_dir).await?;
+    tokio::fs::write(&script_path, BUNDLE_STATUSLINE).await?;
+
+    // Merge statusLine into settings.json.
+    let mut settings = read_settings(&settings_path).await?;
+    settings["statusLine"] = serde_json::json!({
+        "type": "command",
+        "command": format!("sh {}", script_path.display()),
+        "refreshInterval": 5,
+    });
+    write_settings(&settings_path, &settings).await?;
+
+    println!(
+        "✓ statusline installed: {}",
+        script_path.display()
+    );
+    Ok(())
+}
+
+/// Remove the Thoth statusline from settings.json and delete the script.
+pub async fn statusline_uninstall(scope: Scope) -> anyhow::Result<()> {
+    let settings_path = scope.settings_path()?;
+
+    // Remove statusLine key from settings.json.
+    let mut settings = read_settings(&settings_path).await?;
+    if let Some(obj) = settings.as_object_mut() {
+        obj.remove("statusLine");
+    }
+    write_settings(&settings_path, &settings).await?;
+
+    // Delete the script file.
+    let script_path = settings_path.parent().unwrap().join("thoth-statusline.sh");
+    let _ = tokio::fs::remove_file(&script_path).await;
+
+    Ok(())
+}
+
 /// `thoth install` — convenience one-shot: skill + hooks + mcp, all in the
 /// same scope. Idempotent; safe to re-run.
 pub async fn install_all(scope: Scope, root: &Path) -> anyhow::Result<()> {
     skills_install(scope, root).await?;
     install(scope, root).await?;
     mcp_install(scope, root).await?;
+    statusline_install(scope).await?;
     // Project-scope only: write the CLAUDE.md policy block. This is the
     // one artifact Claude Code re-loads after `/clear` and `/compact`, so
     // it's what teaches the agent that Thoth owns long-term memory on a
@@ -906,6 +957,7 @@ pub async fn uninstall_all(scope: Scope, root: &Path) -> anyhow::Result<()> {
     }
     uninstall(scope).await?;
     mcp_uninstall(scope).await?;
+    statusline_uninstall(scope).await?;
     claude_md_uninstall(scope).await?;
     Ok(())
 }
@@ -1158,7 +1210,8 @@ async fn run_user_prompt(root: &Path, payload: &Value) -> anyhow::Result<()> {
     // context only; we deliberately do NOT log `QueryIssued` here, for
     // the same reason as the daemon path above.
     let store = StoreRoot::open(root).await?;
-    let retriever = Retriever::new(store);
+    let retrieve_cfg = RetrieveConfig::load_or_default(root).await;
+    let retriever = Retriever::new(store).with_markdown_boost(retrieve_cfg.rerank_markdown_boost);
     let q = thoth_core::Query {
         text: prompt,
         top_k: 5,
@@ -1187,6 +1240,20 @@ async fn run_post_tool(root: &Path, payload: &Value) -> anyhow::Result<()> {
     if !root.exists() {
         return Ok(());
     }
+
+    // Cadence heartbeat. Prints the debt nag on stdout (picked up by
+    // Claude Code as additional context) when the user has opted into
+    // `reflect_cadence = "every"`. `"end"` (the default) short-circuits.
+    if let Some(msg) = cadence_heartbeat(root).await {
+        println!("{msg}");
+    }
+
+    // Background review trigger. Spawn a detached `thoth review`
+    // process when mutations since the last review cross the
+    // configured interval. Fire-and-forget — the spawned process
+    // outlives this hook invocation.
+    maybe_spawn_background_review(root).await;
+
     // Expected shape: { "tool_name": "Edit", "tool_input": { "file_path": "..." } }
     let file = payload
         .get("tool_input")
@@ -1222,6 +1289,51 @@ async fn run_post_tool(root: &Path, payload: &Value) -> anyhow::Result<()> {
     let _ = idx.index_file(p).await;
     let _ = idx.commit().await;
     Ok(())
+}
+
+/// Spawn a detached `thoth review` when the mutation count since the
+/// last review crosses the configured interval. Uses
+/// `std::process::Command` (not tokio) so the child outlives the hook
+/// process.
+async fn maybe_spawn_background_review(root: &Path) {
+    let disc = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    if !disc.background_review || disc.background_review_interval == 0 {
+        return;
+    }
+    // gate.jsonl is the mutation-counter source — if gate telemetry is
+    // off, the count is always 0 and the review never fires.
+    if !disc.gate_telemetry_enabled {
+        return;
+    }
+
+    let mutations = thoth_memory::mutations_since_last_review(root).await;
+    if mutations < disc.background_review_interval {
+        return;
+    }
+
+    // Resolve the thoth binary path — prefer the same binary that's
+    // running now (so cargo-installed dev builds work), else fall back
+    // to "thoth" on PATH.
+    let thoth_bin = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("thoth"));
+
+    let backend = &disc.background_review_backend;
+
+    match std::process::Command::new(&thoth_bin)
+        .args([
+            "--root",
+            &root.to_string_lossy(),
+            "review",
+            "--backend",
+            backend,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => tracing::debug!("background-review: spawned detached process"),
+        Err(e) => tracing::warn!(error = %e, "background-review: failed to spawn"),
+    }
 }
 
 async fn run_stop(root: &Path, _payload: &Value) -> anyhow::Result<()> {
@@ -1300,6 +1412,36 @@ async fn run_stop(root: &Path, _payload: &Value) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Return the `reflect_cadence = "every"` heartbeat message if one
+/// should fire at this PostToolUse event, else `None`.
+///
+/// Separated from [`run_post_tool`] so the logic (a) has a test seam
+/// without needing to capture stdout and (b) can be called from any
+/// other per-tool hook path in the future (e.g. a PreToolUse variant).
+///
+/// Returns `None` when:
+/// - the root is missing or the config can't be read (tolerant — a
+///   broken config must never silence a hook that just indexes files)
+/// - `reflect_cadence` is anything other than `"every"` (case-insensitive)
+/// - debt is below the nudge threshold
+pub(crate) async fn cadence_heartbeat(root: &Path) -> Option<String> {
+    if !root.exists() {
+        return None;
+    }
+    let discipline = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    if !discipline.reflect_cadence.eq_ignore_ascii_case("every") {
+        return None;
+    }
+    let debt = thoth_memory::ReflectionDebt::compute(root).await;
+    if !debt.should_nudge(&discipline) {
+        return None;
+    }
+    Some(format!(
+        "### Reflection debt (cadence=every)\n{}\n",
+        debt.render()
+    ))
 }
 
 /// `true` if the `thoth_memory_forget` response's `data` shows at
@@ -1460,19 +1602,27 @@ mod tests {
     #[test]
     fn merge_self_heals_when_bundle_drops_event() {
         // Regression: older thoth versions shipped `PostToolUse` prompt
-        // hooks which were later removed from the bundle entirely. A
-        // per-event strip left those orphaned forever because the loop
-        // only visited events present in the new bundle. Re-install
-        // must purge thoth-managed entries under *any* event, not just
-        // the ones the current bundle targets.
+        // hooks which were later removed from the bundle entirely
+        // (before being re-added for `reflect_cadence = "every"` —
+        // which is why the event name this test uses has to be one
+        // the current bundle does *not* ship, so we detect the actual
+        // regression rather than the heartbeat entry). A per-event
+        // strip left those orphaned forever because the loop only
+        // visited events present in the new bundle. Re-install must
+        // purge thoth-managed entries under *any* event, not just the
+        // ones the current bundle targets.
         let bundle = bundle_hooks();
+        // Any event name guaranteed to be absent from the bundle works;
+        // `SubagentStop` is a real Claude Code event the bundle has
+        // never claimed.
+        let dropped_event = "SubagentStop";
         assert!(
-            bundle.get("PostToolUse").is_none(),
-            "this test assumes the current bundle has no PostToolUse"
+            bundle.get(dropped_event).is_none(),
+            "this test assumes the current bundle has no {dropped_event}"
         );
         let mut settings = json!({
             "hooks": {
-                "PostToolUse": [{
+                dropped_event: [{
                     "matcher": "Bash",
                     "hooks": [{"type": "prompt", "prompt": "legacy"}],
                     "_thoth_managed": true,
@@ -1483,7 +1633,7 @@ mod tests {
         assert!(
             settings
                 .get("hooks")
-                .and_then(|h| h.get("PostToolUse"))
+                .and_then(|h| h.get(dropped_event))
                 .is_none(),
             "stale thoth-managed entry under a dropped event must be purged: {settings:?}",
         );
@@ -1716,6 +1866,106 @@ mod tests {
         // as "delete the file" — we just confirm the string is empty here.
         let stripped = strip_claude_md(&block);
         assert!(stripped.trim().is_empty());
+    }
+
+    #[test]
+    fn bundle_ships_post_tool_use_hook() {
+        // Regression: `reflect_cadence = "every"` only works if the
+        // PostToolUse hook is actually wired into settings.json.
+        // Without this entry, the cadence heartbeat logic in
+        // `run_post_tool` never runs and the "every" setting is silent.
+        let bundle = bundle_hooks();
+        let entries = bundle
+            .get("PostToolUse")
+            .and_then(Value::as_array)
+            .expect("bundle must declare PostToolUse");
+        assert!(!entries.is_empty(), "PostToolUse entries must not be empty");
+        // The matcher must at least include mutation tools — indexing
+        // and cadence both hinge on those. An over-permissive matcher
+        // is fine; an over-restrictive one is the regression.
+        let matcher = entries[0]
+            .get("matcher")
+            .and_then(Value::as_str)
+            .expect("matcher required");
+        for needed in ["Write", "Edit"] {
+            assert!(
+                matcher.contains(needed),
+                "PostToolUse matcher must include {needed}: {matcher:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cadence_heartbeat_off_by_default() {
+        // Default config → `reflect_cadence = "end"`. The heartbeat
+        // helper must NOT emit anything, regardless of debt. Keeps
+        // PostToolUse silent for the overwhelming majority of users
+        // who never touched the cadence knob.
+        let tmp = tempfile::tempdir().unwrap();
+        // Plenty of mutations, zero remembers — would trigger the
+        // nudge threshold if cadence were "every".
+        tokio::fs::write(
+            tmp.path().join("gate.jsonl"),
+            (0..15)
+                .map(|_| r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .await
+        .unwrap();
+
+        let msg = cadence_heartbeat(tmp.path()).await;
+        assert!(msg.is_none(), "default cadence must stay quiet: {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn cadence_heartbeat_fires_on_every_plus_debt() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[discipline]
+reflect_cadence = "every"
+reflect_debt_nudge = 3
+reflect_debt_block = 100
+"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("gate.jsonl"),
+            (0..5)
+                .map(|_| r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .await
+        .unwrap();
+
+        let msg = cadence_heartbeat(tmp.path())
+            .await
+            .expect("should fire when cadence=every and debt ≥ nudge");
+        assert!(msg.contains("cadence=every"), "banner missing tag: {msg}");
+        assert!(msg.contains("reflection debt"), "body missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn cadence_heartbeat_silent_when_debt_below_threshold() {
+        // Cadence=every with zero mutations must still stay quiet —
+        // the heartbeat is a reminder, not an always-on banner.
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[discipline]
+reflect_cadence = "every"
+reflect_debt_nudge = 3
+"#,
+        )
+        .await
+        .unwrap();
+        let msg = cadence_heartbeat(tmp.path()).await;
+        assert!(msg.is_none(), "no debt → no nag: {msg:?}");
     }
 
     #[test]

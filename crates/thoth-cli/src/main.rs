@@ -47,13 +47,14 @@ use indicatif::{ProgressBar, ProgressStyle};
 use thoth_core::{Embedder, Fact, Lesson, MemoryKind, MemoryMeta, Query, Synthesizer};
 use thoth_memory::MemoryManager;
 use thoth_parse::{LanguageRegistry, watch::Watcher};
-use thoth_retrieve::{IndexProgress, Indexer, Retriever};
+use thoth_retrieve::{IndexProgress, Indexer, RetrieveConfig, Retriever};
 use thoth_store::markdown::MarkdownStore;
 use thoth_store::{StoreRoot, VectorStore};
 use tracing::warn;
 
 mod daemon;
 mod hooks;
+mod review;
 mod setup;
 
 // ------------------------------------------------------------------ CLI spec
@@ -300,6 +301,17 @@ enum Cmd {
         /// SessionStart hook so a clean session emits no banner noise.
         #[arg(long)]
         quiet: bool,
+    },
+
+    /// Run a background memory review. Spawns an LLM call (via
+    /// `claude` CLI or the Anthropic API) to analyze the session's
+    /// recent activity and auto-persist durable facts, lessons, and
+    /// skill proposals. Normally triggered automatically by the
+    /// PostToolUse hook when `background_review = true` in config.
+    Review {
+        /// Backend for the LLM call: `auto` (default), `cli`, or `api`.
+        #[arg(long, default_value = "auto")]
+        backend: String,
     },
 }
 
@@ -610,6 +622,7 @@ async fn main() -> anyhow::Result<()> {
             cmd_changes(&cli.root, from.as_deref(), depth, cli.json).await?
         }
         Cmd::Curate { quiet } => cmd_curate(&cli.root, quiet).await?,
+        Cmd::Review { backend } => cmd_review(&cli.root, &backend).await?,
         Cmd::Domain { cmd } => match cmd {
             DomainCmd::Sync {
                 source,
@@ -1017,10 +1030,12 @@ async fn cmd_query(
         None
     };
 
+    let retrieve_cfg = RetrieveConfig::load_or_default(root).await;
     let r = if is_full {
         Retriever::with_full(store, vectors, embedder, synth)
+            .with_markdown_boost(retrieve_cfg.rerank_markdown_boost)
     } else {
-        Retriever::new(store)
+        Retriever::new(store).with_markdown_boost(retrieve_cfg.rerank_markdown_boost)
     };
 
     let q = Query {
@@ -1059,18 +1074,25 @@ async fn cmd_watch(
     debounce: Duration,
     embedder_kind: Option<EmbedderKind>,
 ) -> anyhow::Result<()> {
-    // `watch` is long-running and needs its own Indexer + redb handle. We
-    // can't multiplex that through the daemon's socket (each request is a
-    // short-lived call). So if the daemon is up — meaning the store is
-    // locked — fail fast with a useful message rather than exploding on
-    // `StoreRoot::open`.
+    // If the MCP daemon is running it holds the redb exclusive lock.
+    // Instead of failing, fall back to a log-only mode: watch the
+    // filesystem and print what changed, but don't index (the daemon's
+    // auto-watch handles that when `[watch] enabled = true`).
     if daemon::DaemonClient::try_connect(root).await.is_some() {
-        anyhow::bail!(
-            "thoth-mcp daemon is running on {}; stop it before running `thoth watch` \
-             (they would fight for the redb exclusive lock). Either close Claude Code \
-             or run the re-index through the daemon with `thoth index .`.",
-            root.display()
-        );
+        let watch_cfg = thoth_retrieve::WatchConfig::load_or_default(root).await;
+        if watch_cfg.enabled {
+            println!(
+                "thoth-mcp daemon is running with auto-watch enabled — \
+                 showing live file-change log only."
+            );
+        } else {
+            println!(
+                "thoth-mcp daemon is running (auto-watch disabled). \
+                 Showing live file-change log. Tip: set `[watch] enabled = true` \
+                 in config.toml to auto-reindex inside the daemon."
+            );
+        }
+        return cmd_watch_log_only(src, debounce).await;
     }
 
     let store = StoreRoot::open(root).await?;
@@ -1161,6 +1183,55 @@ async fn cmd_watch(
                             if deleted_n == 1 { "" } else { "s" }
                         );
                     }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Log-only fallback for `thoth watch` when the MCP daemon holds the
+/// redb lock. Watches the filesystem and prints changes, but doesn't
+/// index — the daemon handles that.
+async fn cmd_watch_log_only(
+    src: &std::path::Path,
+    debounce: Duration,
+) -> anyhow::Result<()> {
+    let mut w = Watcher::watch(src, 1024)?;
+    println!("… watching {} (log only, ctrl-c to stop)", src.display());
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n✓ stopped");
+                break;
+            }
+            ev = w.recv() => {
+                let Some(ev) = ev else {
+                    warn!("watcher channel closed");
+                    break;
+                };
+                let mut batch = vec![ev];
+                let deadline = tokio::time::Instant::now() + debounce;
+                while let Ok(Some(extra)) = tokio::time::timeout_at(deadline, w.recv()).await {
+                    batch.push(extra);
+                }
+
+                let mut changed = Vec::new();
+                let mut deleted = Vec::new();
+                for ev in batch {
+                    match ev {
+                        thoth_core::Event::FileChanged { path, .. } => changed.push(path),
+                        thoth_core::Event::FileDeleted { path, .. } => deleted.push(path),
+                        _ => {}
+                    }
+                }
+
+                for p in &changed {
+                    println!("  ✎ {}", p.display());
+                }
+                for p in &deleted {
+                    println!("  ✗ {}", p.display());
                 }
             }
         }
@@ -1666,8 +1737,12 @@ async fn cmd_eval(
         None
     };
 
+    let retrieve_cfg = RetrieveConfig::load_or_default(root).await;
     let zero_retriever = if want_zero && daemon_for_zero.is_none() {
-        Some(Retriever::new(store.as_ref().unwrap().clone()))
+        Some(
+            Retriever::new(store.as_ref().unwrap().clone())
+                .with_markdown_boost(retrieve_cfg.rerank_markdown_boost),
+        )
     } else {
         None
     };
@@ -1680,12 +1755,15 @@ async fn cmd_eval(
         } else {
             None
         };
-        Some(Retriever::with_full(
-            store.as_ref().unwrap().clone(),
-            vectors,
-            embedder,
-            synth,
-        ))
+        Some(
+            Retriever::with_full(
+                store.as_ref().unwrap().clone(),
+                vectors,
+                embedder,
+                synth,
+            )
+            .with_markdown_boost(retrieve_cfg.rerank_markdown_boost),
+        )
     } else {
         None
     };
@@ -2062,6 +2140,56 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
         findings.push(debt.render());
     }
 
+    // Lesson-cluster detection. Five or more lessons that share enough
+    // trigger tokens (Jaccard ≥ 0.4) probably want to collapse into a
+    // single skill — we surface each cluster with a ready-to-paste
+    // `thoth_skill_propose` suggestion so the user can act on it.
+    // Best-effort: a read failure only degrades this pass; curate must
+    // still report debt + forget findings.
+    match thoth_store::markdown::MarkdownStore::open(root).await {
+        Ok(md) => match md.read_lessons().await {
+            Ok(lessons) => {
+                let clusters = thoth_memory::detect_clusters(
+                    &lessons,
+                    thoth_memory::DEFAULT_CLUSTER_MIN_SIZE,
+                    thoth_memory::DEFAULT_CLUSTER_JACCARD,
+                );
+                for c in clusters {
+                    // Shortened sample (first 2 triggers) so curate output
+                    // stays scannable on a ≥5-member cluster.
+                    let sample: Vec<String> = c
+                        .triggers
+                        .iter()
+                        .take(2)
+                        .map(|t| format!("\"{t}\""))
+                        .collect();
+                    let slug_hint = c
+                        .shared_tokens
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("-");
+                    let slug_hint = if slug_hint.is_empty() {
+                        "lesson-cluster".to_string()
+                    } else {
+                        slug_hint
+                    };
+                    findings.push(format!(
+                        "lesson cluster: {} lessons share triggers (e.g. {}). \
+                         Consider `thoth_skill_propose {{slug: \"{slug_hint}\", \
+                         source_triggers: [{}, …]}}`.",
+                        c.triggers.len(),
+                        sample.join(", "),
+                        sample.join(", ")
+                    ));
+                }
+            }
+            Err(e) => findings.push(format!("lesson-cluster read failed: {e}")),
+        },
+        Err(e) => findings.push(format!("lesson-cluster open failed: {e}")),
+    }
+
     if findings.is_empty() {
         if !quiet {
             println!("curate: nothing to flag (debt={}, no TTL work)", debt.debt());
@@ -2072,6 +2200,28 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
     println!("### Curator findings");
     for f in &findings {
         println!("- {f}");
+    }
+    Ok(())
+}
+
+async fn cmd_review(root: &std::path::Path, backend: &str) -> anyhow::Result<()> {
+    if !root.exists() {
+        println!("(no .thoth/ at {} — nothing to review)", root.display());
+        return Ok(());
+    }
+    match review::run_review(root, backend).await {
+        Ok(report) => {
+            let total = report.facts_added + report.lessons_added + report.skills_proposed;
+            if total > 0 {
+                eprintln!(
+                    "thoth: background review added {} facts, {} lessons, {} skill proposals",
+                    report.facts_added, report.lessons_added, report.skills_proposed,
+                );
+            } else {
+                eprintln!("thoth: background review — nothing worth saving");
+            }
+        }
+        Err(e) => eprintln!("thoth: background review failed: {e}"),
     }
     Ok(())
 }

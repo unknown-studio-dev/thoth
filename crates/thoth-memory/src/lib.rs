@@ -20,9 +20,14 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
+pub mod background_review;
+pub mod lesson_clusters;
 pub mod reflection;
 pub mod working;
-pub use reflection::{ReflectionDebt, mark_session_start};
+pub use lesson_clusters::{
+    DEFAULT_CLUSTER_JACCARD, DEFAULT_CLUSTER_MIN_SIZE, LessonCluster, detect_clusters,
+};
+pub use reflection::{ReflectionDebt, mark_last_review, mark_session_start, mutations_since_last_review};
 pub use working::{WorkingMemory, WorkingNote};
 
 use std::path::Path;
@@ -107,13 +112,14 @@ struct ConfigFile {
 /// `global_fallback = true` (default) lets the plugin fall back to the
 /// user-level `~/.thoth/` memory when no project-local `.thoth/` exists,
 /// so lessons travel across checkouts of scratch repos.
-// NOTE: no `deny_unknown_fields` here — the project-wide
-// `config.toml` also hosts gate-v2 keys (`gate_window_*`,
-// `gate_relevance_threshold`, `gate_telemetry_enabled`, …) that are
-// owned by `thoth-mcp/bin/gate.rs`'s own `DisciplineFile` struct. If
-// we enforced unknown-field rejection here, every project with a
-// normal config would silently fall back to hard-coded defaults —
-// masking the very thresholds (`reflect_debt_*`) this struct adds.
+// NOTE: `deny_unknown_fields` stays off. All gate-v2 keys
+// (`gate_window_*`, `gate_relevance_threshold`, `gate_telemetry_enabled`,
+// `gate_bash_readonly_prefixes`, `[[discipline.policies]]`) now live on
+// this struct — the previous two-loader-one-file split in 2026-04-17's
+// `thoth-mcp/bin/gate.rs::DisciplineFile` was the hazard that masked
+// `reflect_debt_*` when strictness was briefly enabled. Consolidating
+// here means the gate binary reads exactly what the rest of the world
+// sees; drift between the two is no longer possible.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct DisciplineConfig {
@@ -182,6 +188,90 @@ pub struct DisciplineConfig {
     ///
     /// Default `20`. Set to `0` to disable the hard block.
     pub reflect_debt_block: u32,
+
+    // ------------------------------------------------------------------
+    // Gate-v2 keys. Consumed by `thoth-mcp/bin/gate.rs` to decide
+    // pass / nudge / block on mutation tool calls. Owned here so the
+    // project's `config.toml` has a single parser; see the struct-level
+    // NOTE above for the hazard consolidation fixes.
+    // ------------------------------------------------------------------
+    /// Recency shortcut window (seconds). Any `query_issued` event
+    /// within this window passes the gate without a relevance check.
+    /// Accepts the legacy key name `gate_window_secs` via serde alias
+    /// so existing v1-era configs continue to parse. Default `60`.
+    #[serde(alias = "gate_window_secs")]
+    pub gate_window_short_secs: u64,
+    /// Relevance pool window (seconds). Past recalls up to this age
+    /// are scored by token overlap with the incoming edit; best score
+    /// ≥ `gate_relevance_threshold` passes. Default `1800` (30 min).
+    pub gate_window_long_secs: u64,
+    /// Containment ratio threshold in `[0.0, 1.0]`. `0.0` disables the
+    /// relevance check (recency-only behaviour). Default `0.30`.
+    pub gate_relevance_threshold: f64,
+    /// Append every gate decision to `<root>/gate.jsonl` when `true`.
+    /// Off by default — telemetry is opt-in. Consumed by the gate
+    /// binary and by `ReflectionDebt::compute` (for mutation counts).
+    pub gate_telemetry_enabled: bool,
+    /// Additional Bash command prefixes that bypass the gate.
+    /// Additive to the hard-coded built-ins (`cargo test`, `git status`,
+    /// `thoth curate`, …) — entries here *extend* the whitelist, they
+    /// don't replace it. Default empty.
+    pub gate_bash_readonly_prefixes: Vec<String>,
+    /// Actor-specific overrides. First entry whose `actor` glob matches
+    /// the `THOTH_ACTOR` env var wins; the default policy applies when
+    /// none match. Default empty.
+    pub policies: Vec<ActorPolicyConfig>,
+
+    // ------------------------------------------------------------------
+    // Background review. A lightweight fork of the Hermes-style
+    // "background review" that spawns `claude -p` (subscription) or
+    // calls the Anthropic API directly to auto-persist facts/lessons
+    // mid-session.
+    // ------------------------------------------------------------------
+    /// Enable periodic background reviews. When `true`, the PostToolUse
+    /// hook spawns a detached `thoth review` process every
+    /// [`Self::background_review_interval`] mutations. Default `false`
+    /// (opt-in).
+    pub background_review: bool,
+    /// Number of mutations (Write/Edit/NotebookEdit) between background
+    /// reviews. Default `10`.
+    pub background_review_interval: u32,
+    /// Backend for the review LLM call. `"auto"` checks
+    /// `ANTHROPIC_API_KEY` → API, else `claude` CLI (subscription).
+    /// `"cli"` forces the CLI path. `"api"` forces the API path.
+    /// Default `"auto"`.
+    pub background_review_backend: String,
+}
+
+/// Per-actor gate policy override. Missing fields inherit from the
+/// top-level [`DisciplineConfig`] defaults. Mirrors
+/// `[[discipline.policies]]` in `config.toml`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct ActorPolicyConfig {
+    /// Glob matching the `THOTH_ACTOR` env var (e.g. `"hoangsa/*"`,
+    /// `"ci-*"`, `"*"`). Empty string matches nothing.
+    pub actor: String,
+    /// Gate mode for this actor. `"off"` / `"nudge"` / `"strict"`. When
+    /// `None`, inherits [`DisciplineConfig::mode`] / the gate's default.
+    pub mode: Option<String>,
+    /// Recency window override in seconds. Inherits when `None`.
+    pub window_short_secs: Option<u64>,
+    /// Relevance window override in seconds. Inherits when `None`.
+    pub window_long_secs: Option<u64>,
+    /// Relevance threshold override in `[0.0, 1.0]`. Inherits when `None`.
+    pub relevance_threshold: Option<f64>,
+}
+
+/// Gate-v2 defaults, exposed so the gate binary and the config layer
+/// agree on concrete numbers without duplicating literals.
+pub mod gate_defaults {
+    /// Default recency shortcut window in seconds.
+    pub const WINDOW_SHORT_SECS: u64 = 60;
+    /// Default relevance pool window in seconds.
+    pub const WINDOW_LONG_SECS: u64 = 1800;
+    /// Default containment-ratio threshold.
+    pub const RELEVANCE_THRESHOLD: f64 = 0.30;
 }
 
 impl Default for DisciplineConfig {
@@ -198,6 +288,15 @@ impl Default for DisciplineConfig {
             quarantine_min_attempts: 5,
             reflect_debt_nudge: 10,
             reflect_debt_block: 20,
+            gate_window_short_secs: gate_defaults::WINDOW_SHORT_SECS,
+            gate_window_long_secs: gate_defaults::WINDOW_LONG_SECS,
+            gate_relevance_threshold: gate_defaults::RELEVANCE_THRESHOLD,
+            gate_telemetry_enabled: false,
+            gate_bash_readonly_prefixes: Vec::new(),
+            policies: Vec::new(),
+            background_review: false,
+            background_review_interval: 10,
+            background_review_backend: "auto".to_string(),
         }
     }
 }

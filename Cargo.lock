@@ -5595,6 +5595,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "indicatif",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

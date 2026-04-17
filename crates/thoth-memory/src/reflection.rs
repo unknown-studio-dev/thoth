@@ -39,6 +39,11 @@ const SESSION_MARK: &str = ".session-start";
 /// only on the user's terminal.
 pub const NAG_MARKER: &str = ".reflect-nag";
 
+/// Filename of the background-review watermark. Written after each
+/// successful background review so the PostToolUse hook can count
+/// mutations *since the last review* rather than since session start.
+const REVIEW_MARK: &str = ".last-review";
+
 /// Snapshot of how far the agent has drifted from reflection.
 #[derive(Debug, Clone, Default)]
 pub struct ReflectionDebt {
@@ -148,6 +153,48 @@ pub async fn take_nag(root: &Path) -> Option<String> {
     let body = tokio::fs::read_to_string(&path).await.ok()?;
     let _ = tokio::fs::remove_file(&path).await;
     Some(body)
+}
+
+// --------------------------------------------------------- background review
+
+/// Bump the background-review watermark. Called after a successful
+/// `thoth review` so the next PostToolUse counter windows off this
+/// point instead of session start.
+pub async fn mark_last_review(root: &Path) -> std::io::Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    tokio::fs::write(root.join(REVIEW_MARK), now.to_string().as_bytes()).await
+}
+
+/// Read the last-review watermark. Returns `None` if the file doesn't
+/// exist (no review has ever run in this root).
+pub async fn read_last_review(root: &Path) -> Option<i64> {
+    let text = tokio::fs::read_to_string(root.join(REVIEW_MARK))
+        .await
+        .ok()?;
+    text.trim().parse::<i64>().ok()
+}
+
+/// Sync twin of [`read_last_review`] for hook callers without a tokio
+/// runtime.
+pub fn read_last_review_sync(root: &Path) -> Option<i64> {
+    std::fs::read_to_string(root.join(REVIEW_MARK))
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+}
+
+/// Count mutations since the last background review (or session start
+/// if no review has run yet). Async variant.
+pub async fn mutations_since_last_review(root: &Path) -> u32 {
+    let since = match read_last_review(root).await {
+        Some(t) => Some(t),
+        None => read_session_start(root).await,
+    };
+    count_mutations(root, since).await
 }
 
 // --------------------------------------------------------------- internals
