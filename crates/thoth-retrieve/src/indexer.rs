@@ -215,18 +215,20 @@ impl Indexer {
         });
 
         // Phase A: fan-out parse + writes.
+        // Each task returns its own Vec<SourceChunk> to avoid Mutex contention
+        // on a shared accumulator. Results are collected via join_all and
+        // flattened after all tasks complete.
         let stats = Arc::new(Mutex::new(IndexStats::default()));
-        let pending: Arc<Mutex<Vec<SourceChunk>>> = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicUsize::new(0));
         let want_embed = self.embedder.is_some() && self.vectors.is_some();
 
-        stream::iter(files)
-            .for_each_concurrent(self.concurrency, |path| {
+        let tasks: Vec<_> = stream::iter(files)
+            .map(|path| {
                 let this = self.clone();
                 let stats = stats.clone();
-                let pending = pending.clone();
                 let done = done.clone();
                 async move {
+                    let mut local_chunks: Vec<SourceChunk> = Vec::new();
                     match this.index_file_no_embed(&path).await {
                         Ok((s, chunks)) => {
                             {
@@ -238,7 +240,7 @@ impl Indexer {
                                 st.imports += s.imports;
                             }
                             if want_embed {
-                                pending.lock().extend(chunks);
+                                local_chunks = chunks;
                             }
                         }
                         Err(e) => {
@@ -252,13 +254,16 @@ impl Indexer {
                         total,
                         path: Some(&path),
                     });
+                    local_chunks
                 }
             })
+            .buffer_unordered(self.concurrency)
+            .collect()
             .await;
 
         // Phase B: batch embedding (Mode::Full only).
         if want_embed {
-            let chunks: Vec<SourceChunk> = std::mem::take(&mut *pending.lock());
+            let chunks: Vec<SourceChunk> = tasks.into_iter().flatten().collect::<Vec<_>>();
             let total_embed = chunks.len();
             self.emit(IndexProgress {
                 stage: "embed",
