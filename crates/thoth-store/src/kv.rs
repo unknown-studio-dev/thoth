@@ -139,10 +139,7 @@ impl KvStore {
                 let _ = wtxn.open_table(META).map_err(store)?;
 
                 let meta = wtxn.open_table(META).map_err(store)?;
-                let already_backfilled = meta
-                    .get(REV_EDGES_BACKFILLED)
-                    .map_err(store)?
-                    .is_some();
+                let already_backfilled = meta.get(REV_EDGES_BACKFILLED).map_err(store)?.is_some();
                 drop(meta);
 
                 if !already_backfilled {

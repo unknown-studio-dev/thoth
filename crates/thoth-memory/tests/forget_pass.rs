@@ -13,6 +13,9 @@ fn lesson(trigger: &str, advice: &str, success: u64, failure: u64) -> Lesson {
         advice: advice.to_string(),
         success_count: success,
         failure_count: failure,
+        enforcement: Default::default(),
+        suggested_enforcement: None,
+        block_message: None,
     }
 }
 

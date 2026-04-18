@@ -42,6 +42,14 @@ uuid                 = { workspace = true }
 # (rather than a new crate) avoids another link step.
 rusqlite             = { workspace = true }
 toml                 = { workspace = true }
+# Used by `thoth-gate` rule dispatcher (T-16) to hash canonical tool-call JSON
+# for override matching. Keeping the dep narrow — only the gate binary needs it.
+sha2                 = "0.10"
 
 [dev-dependencies]
 tempfile             = { workspace = true }
+# Integration tests need to compute the same tool-call hash the gate
+# binary uses for override matching. Keep this aligned with the gate's
+# own sha2 dep above.
+sha2                 = "0.10"
+thoth-memory         = { workspace = true }

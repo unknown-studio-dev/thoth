@@ -158,6 +158,9 @@ mod tests {
             advice: "irrelevant for clustering".into(),
             success_count: 0,
             failure_count: 0,
+            enforcement: Default::default(),
+            suggested_enforcement: None,
+            block_message: None,
         }
     }
 

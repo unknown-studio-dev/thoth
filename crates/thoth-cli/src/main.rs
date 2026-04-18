@@ -56,8 +56,12 @@ mod compact;
 mod daemon;
 mod hooks;
 mod migrate;
+mod override_cmd;
 mod review;
+mod rule_cmd;
 mod setup;
+mod stats_cmd;
+mod workflow_cmd;
 
 // ------------------------------------------------------------------ CLI spec
 
@@ -245,6 +249,13 @@ enum Cmd {
         cmd: DomainCmd,
     },
 
+    /// Review / act on agent-filed override requests for enforced rules.
+    /// See DESIGN-SPEC §CLI override.
+    Override {
+        #[command(subcommand)]
+        cmd: OverrideCmd,
+    },
+
     /// Blast-radius analysis. Given an FQN, walk the graph to find every
     /// symbol reachable within `--depth` steps. Use this to answer
     /// "what breaks if I change X?" (default, `--direction up`) or
@@ -341,6 +352,123 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Inspect or reset workflow-gate state (Phase 4a, REQ-19).
+    Workflow {
+        #[command(subcommand)]
+        cmd: WorkflowCmd,
+    },
+    /// Inspect and edit the merged enforcement rule set. See
+    /// DESIGN-SPEC §CLI rule (REQ-21, REQ-22, REQ-25).
+    Rule {
+        #[command(subcommand)]
+        cmd: RuleCmd,
+    },
+    /// Enforcement telemetry: blocks, overrides, workflow violations,
+    /// repeated rule hits. See DESIGN-SPEC §CLI stats (REQ-27).
+    Stats {
+        /// Window in weeks. `0` = all-time.
+        #[arg(long, default_value_t = 1)]
+        weeks: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RuleCmd {
+    /// Show rules from a selected layer (default: `effective`).
+    List {
+        /// Which layer to print: `default`, `user`, `project`, or
+        /// `effective` (merged).
+        #[arg(long, value_enum, default_value_t = rule_cmd::LayerArg::Effective)]
+        layer: rule_cmd::LayerArg,
+    },
+    /// Set `disabled = true` for a rule in the user (or project) layer.
+    Disable {
+        /// Rule id.
+        #[arg(required = true)]
+        id: String,
+        /// Write the entry into the project layer instead of the user layer.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Clear `disabled = true` for a rule.
+    Enable {
+        #[arg(required = true)]
+        id: String,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Override a rule's enforcement tier in the user (or project) layer.
+    Override {
+        #[arg(required = true)]
+        id: String,
+        #[arg(long, value_enum)]
+        tier: rule_cmd::EnforcementArg,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Add a new user (or project) rule — either from a lesson id or
+    /// fully inline via flags.
+    Add {
+        /// Explicit rule id. Optional when `--from-lesson` is used.
+        #[arg(long)]
+        id: Option<String>,
+        /// Compile a rule from an existing LESSONS.md entry by id.
+        #[arg(long, conflicts_with = "inline")]
+        from_lesson: Option<String>,
+        /// Authoring mode: inline fields via `--tool`, `--path-glob`, ...
+        #[arg(long)]
+        inline: bool,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        path_glob: Option<String>,
+        #[arg(long)]
+        cmd_regex: Option<String>,
+        #[arg(long)]
+        content_regex: Option<String>,
+        #[arg(long)]
+        natural: Option<String>,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long, value_enum)]
+        enforcement: Option<rule_cmd::EnforcementArg>,
+        /// Write into the project layer instead of the user layer.
+        #[arg(long)]
+        project: bool,
+    },
+    /// Print every layer's contribution plus the final effective set.
+    Diff,
+    /// Simulate a tool call (`--tool Bash --cmd "rm -rf /tmp"`) or, with
+    /// no args, detect overlapping rules.
+    Check {
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        cmd: Option<String>,
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// Bake `.thoth/ignore` + lesson-derived rules into
+    /// `rules.project.toml`.
+    Compile,
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkflowCmd {
+    /// List every workflow session currently in `Active` state.
+    List,
+    /// Mark the session's workflow as abandoned and clear its accumulated
+    /// rows in `workflow-violations.jsonl` so the gate's violation
+    /// counter falls back below threshold.
+    Reset {
+        /// Claude Code session id (matches the filename under
+        /// `<root>/workflow/<session_id>.json`).
+        #[arg(required = true)]
+        session_id: String,
+    },
 }
 
 /// CLI-facing subset of [`thoth_graph::BlastDir`] so clap can derive
@@ -390,6 +518,36 @@ enum DomainCmd {
         /// Per-sync cap on rules returned. Default 500.
         #[arg(long, default_value_t = 500)]
         max_items: usize,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OverrideCmd {
+    /// List pending override requests (agent-filed, awaiting user decision).
+    List,
+    /// Approve a pending request by id, minting a single-use override token.
+    Approve {
+        /// Request id (UUID) as shown by `thoth override list`.
+        #[arg(required = true)]
+        id: String,
+        /// Remaining turns the approval is valid for. Default 1.
+        #[arg(long, default_value_t = override_cmd::DEFAULT_APPROVE_TTL)]
+        ttl_turns: u32,
+    },
+    /// Reject a pending request. Agent will see the rejection next turn.
+    Reject {
+        /// Request id (UUID) as shown by `thoth override list`.
+        #[arg(required = true)]
+        id: String,
+        /// Optional human-readable reason recorded on the rejection.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Per-rule counts across pending / approved / consumed / rejected.
+    Stats {
+        /// Window in weeks (filters on `requested_at`). `0` = all-time.
+        #[arg(long, default_value_t = 1)]
+        weeks: u32,
     },
 }
 
@@ -694,6 +852,75 @@ async fn main() -> anyhow::Result<()> {
             model,
             dry_run,
         } => cmd_compact(&cli.root, &backend, &model, dry_run).await?,
+        Cmd::Override { cmd } => match cmd {
+            OverrideCmd::List => override_cmd::cmd_list(&cli.root, cli.json).await?,
+            OverrideCmd::Approve { id, ttl_turns } => {
+                override_cmd::cmd_approve(&cli.root, &id, ttl_turns, cli.json).await?
+            }
+            OverrideCmd::Reject { id, reason } => {
+                override_cmd::cmd_reject(&cli.root, &id, reason, cli.json).await?
+            }
+            OverrideCmd::Stats { weeks } => {
+                override_cmd::cmd_stats(&cli.root, weeks, cli.json).await?
+            }
+        },
+        Cmd::Workflow { cmd } => match cmd {
+            WorkflowCmd::List => workflow_cmd::cmd_list(&cli.root, cli.json).await?,
+            WorkflowCmd::Reset { session_id } => {
+                workflow_cmd::cmd_reset(&cli.root, &session_id, cli.json).await?
+            }
+        },
+        Cmd::Rule { cmd } => match cmd {
+            RuleCmd::List { layer } => rule_cmd::cmd_list(&cli.root, layer, cli.json).await?,
+            RuleCmd::Disable { id, project } => {
+                rule_cmd::cmd_disable(&cli.root, &id, project, cli.json).await?
+            }
+            RuleCmd::Enable { id, project } => {
+                rule_cmd::cmd_enable(&cli.root, &id, project, cli.json).await?
+            }
+            RuleCmd::Override { id, tier, project } => {
+                rule_cmd::cmd_override(&cli.root, &id, tier, project, cli.json).await?
+            }
+            RuleCmd::Add {
+                id,
+                from_lesson,
+                inline,
+                tool,
+                path_glob,
+                cmd_regex,
+                content_regex,
+                natural,
+                message,
+                enforcement,
+                project,
+            } => {
+                rule_cmd::cmd_add(
+                    &cli.root,
+                    id,
+                    from_lesson,
+                    inline,
+                    tool,
+                    path_glob,
+                    cmd_regex,
+                    content_regex,
+                    natural,
+                    message,
+                    enforcement,
+                    project,
+                    cli.json,
+                )
+                .await?
+            }
+            RuleCmd::Diff => rule_cmd::cmd_diff(&cli.root, cli.json).await?,
+            RuleCmd::Check {
+                tool,
+                path,
+                cmd,
+                content,
+            } => rule_cmd::cmd_check(&cli.root, tool, path, cmd, content, cli.json).await?,
+            RuleCmd::Compile => rule_cmd::cmd_compile(&cli.root, cli.json).await?,
+        },
+        Cmd::Stats { weeks } => stats_cmd::run(&cli.root, weeks, cli.json).await?,
         Cmd::Domain { cmd } => match cmd {
             DomainCmd::Sync {
                 source,
@@ -1464,6 +1691,9 @@ async fn cmd_memory_lesson(
         advice,
         success_count: 0,
         failure_count: 0,
+        enforcement: Default::default(),
+        suggested_enforcement: None,
+        block_message: None,
     };
     store.markdown.append_lesson(&lesson).await?;
     println!(

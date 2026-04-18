@@ -28,14 +28,25 @@ fn run_setup(cwd: &Path) -> (String, String, bool) {
 fn setup_creates_user_md_seed_and_config_caps() {
     let tmp = TempDir::new().expect("tempdir");
     let (stdout, stderr, ok) = run_setup(tmp.path());
-    assert!(ok, "thoth setup --yes failed.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+    assert!(
+        ok,
+        "thoth setup --yes failed.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
 
     let thoth = tmp.path().join(".thoth");
     let user_md = thoth.join("USER.md");
     let config = thoth.join("config.toml");
 
-    assert!(user_md.exists(), "USER.md not seeded at {}", user_md.display());
-    assert!(config.exists(), "config.toml not written at {}", config.display());
+    assert!(
+        user_md.exists(),
+        "USER.md not seeded at {}",
+        user_md.display()
+    );
+    assert!(
+        config.exists(),
+        "config.toml not written at {}",
+        config.display()
+    );
 
     // USER.md: verify the seed body shipped by `assets/USER.md.template`.
     // The template anchors on the `# USER.md` header + an explanatory
@@ -82,7 +93,11 @@ fn setup_preserves_existing_user_md() {
     let thoth = tmp.path().join(".thoth");
     std::fs::create_dir_all(&thoth).unwrap();
     let user_md = thoth.join("USER.md");
-    std::fs::write(&user_md, "# USER.md\n### User prefers haiku.\ntags: style\n").unwrap();
+    std::fs::write(
+        &user_md,
+        "# USER.md\n### User prefers haiku.\ntags: style\n",
+    )
+    .unwrap();
 
     let (stdout, stderr, ok) = run_setup(tmp.path());
     assert!(ok, "setup failed: stdout={stdout} stderr={stderr}");

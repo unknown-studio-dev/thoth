@@ -194,6 +194,9 @@ pub async fn run_compact(
             advice: l.advice,
             success_count: 0,
             failure_count: 0,
+            enforcement: Default::default(),
+            suggested_enforcement: None,
+            block_message: None,
         })
         .collect();
 
@@ -353,8 +356,8 @@ fn project_memory_bytes(facts: &[CompactFact]) -> usize {
         total = total.saturating_add(f.text.len()).saturating_add(8);
         if !f.tags.is_empty() {
             // "tags: a, b, c\n" → ~6 + joined + 2
-            let joined: usize = f.tags.iter().map(|t| t.len()).sum::<usize>()
-                + f.tags.len().saturating_sub(1) * 2;
+            let joined: usize =
+                f.tags.iter().map(|t| t.len()).sum::<usize>() + f.tags.len().saturating_sub(1) * 2;
             total = total.saturating_add(6 + joined + 2);
         }
     }
@@ -543,21 +546,14 @@ mod tests {
             }
             format!(r#"{{"facts":[{}],"lessons":[]}}"#, facts.join(","))
         };
-        let small_json =
-            r#"{"facts":[{"text":"tiny","tags":[]}],"lessons":[]}"#.to_string();
+        let small_json = r#"{"facts":[{"text":"tiny","tags":[]}],"lessons":[]}"#.to_string();
 
         let calls_clone = Arc::clone(&calls);
         let caller = move |_prompt: String| -> BackendFuture<'static> {
             let n = calls_clone.fetch_add(1, Ordering::SeqCst);
             let oversize = oversize_json.clone();
             let small = small_json.clone();
-            Box::pin(async move {
-                if n < 2 {
-                    Ok(oversize)
-                } else {
-                    Ok(small)
-                }
-            })
+            Box::pin(async move { if n < 2 { Ok(oversize) } else { Ok(small) } })
         };
 
         let out = compact_with_caller(&[], &[], 512, caller).await.unwrap();

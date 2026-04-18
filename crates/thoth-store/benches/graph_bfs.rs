@@ -107,10 +107,7 @@ fn bench_graph_bfs(c: &mut Criterion) {
                 let kv = kv.clone();
                 let start = start.clone();
                 async move {
-                    let out = kv
-                        .graph_bfs(start, BFS_DEPTH, dir, None)
-                        .await
-                        .unwrap();
+                    let out = kv.graph_bfs(start, BFS_DEPTH, dir, None).await.unwrap();
                     // Discourage the optimiser from discarding the result.
                     criterion::black_box(out.len());
                 }

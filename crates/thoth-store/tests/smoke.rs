@@ -235,6 +235,9 @@ async fn markdown_facts_and_lessons_roundtrip() {
         advice: "Always run `sqlx prepare` afterwards.".into(),
         success_count: 0,
         failure_count: 0,
+        enforcement: Default::default(),
+        suggested_enforcement: None,
+        block_message: None,
     };
     md.append_lesson(&lesson).await.unwrap();
 

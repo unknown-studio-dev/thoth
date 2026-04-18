@@ -5832,6 +5832,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thoth-core",
  "thoth-graph",
@@ -5851,10 +5852,13 @@ dependencies = [
 name = "thoth-memory"
 version = "0.0.1"
 dependencies = [
+ "globset",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "thoth-core",
  "thoth-store",
  "time",
