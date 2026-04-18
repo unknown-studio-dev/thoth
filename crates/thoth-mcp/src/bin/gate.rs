@@ -1395,30 +1395,25 @@ struct TelemetryRecord {
     missed_tokens: Vec<String>,
 }
 
-/// Rotate `gate.jsonl` at ~1 MiB — reflection readers already filter by
-/// `.session-start` mtime so rotated entries are outside the window and
-/// safe to shed. Bounded on-disk cost: ≈2× this value (current + .prev).
+/// Truncate `gate.jsonl` at ~1 MiB. Readers filter by `.session-start`
+/// mtime so anything past the cap is outside the session window anyway.
 const GATE_LOG_CAP_BYTES: u64 = 1024 * 1024;
 
-fn rotate_gate_log_if_oversize(path: &Path) {
+fn truncate_gate_log_if_oversize(path: &Path) {
     let Ok(meta) = std::fs::metadata(path) else {
         return;
     };
     if meta.len() < GATE_LOG_CAP_BYTES {
         return;
     }
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-        return;
-    };
-    let prev = path.with_file_name(format!("{name}.prev"));
-    if let Err(e) = std::fs::rename(path, &prev) {
-        eprintln!("thoth-gate: log rotation failed: {e}");
+    if let Err(e) = std::fs::remove_file(path) {
+        eprintln!("thoth-gate: log truncate failed: {e}");
     }
 }
 
 fn append_telemetry(rec: &TelemetryRecord) -> io::Result<()> {
     let path = rec.root.join("gate.jsonl");
-    rotate_gate_log_if_oversize(&path);
+    truncate_gate_log_if_oversize(&path);
     let mut line = serde_json::json!({
         "ts": rec.ts_iso,
         "actor": rec.actor,

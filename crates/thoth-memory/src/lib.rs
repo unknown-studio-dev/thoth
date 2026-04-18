@@ -1044,26 +1044,6 @@ const USER_MD: &str = "USER.md";
 const MEMORY_MD: &str = "MEMORY.md";
 const LESSONS_MD: &str = "LESSONS.md";
 
-/// The `bak-<unix_ts>` suffix attached to a snapshot written *before* any
-/// mutating `replace` / `remove` call. Matches `thoth compact`'s convention
-/// so downstream pruners can sweep both sources uniformly.
-fn backup_suffix(now_unix: i64) -> String {
-    format!("bak-{now_unix}")
-}
-
-/// Write `<path>.bak-<unix>` iff `path` currently exists. A missing source
-/// file is not an error — fresh stores have nothing to preserve.
-async fn write_backup(path: &Path) -> Result<()> {
-    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return Ok(());
-    }
-    let body = tokio::fs::read(path).await?;
-    let ts = OffsetDateTime::now_utc().unix_timestamp();
-    let bak = path.with_extension(backup_suffix(ts));
-    tokio::fs::write(&bak, body).await?;
-    Ok(())
-}
-
 /// Path for the given markdown surface inside the store root.
 fn md_path(root: &Path, kind: MemoryKind) -> std::path::PathBuf {
     match kind {
@@ -1599,7 +1579,6 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
         // a new `tags:` line — keeps `replace` focused on swapping the body.
         let tags = entry_tags(&entries[idx]);
         let rendered = render_preference(new_text, &tags);
-        write_backup(&path).await?;
         entries[idx] = rendered;
         let header = match kind {
             MemoryKind::Fact => "# MEMORY.md\n",
@@ -1637,7 +1616,6 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
         };
         let (preamble, mut entries) = split_entries(&text);
         let idx = pick_entry(&entries, query)?;
-        write_backup(&path).await?;
         let removed = entries.remove(idx);
         let header = match kind {
             MemoryKind::Fact => "# MEMORY.md\n",
@@ -1821,29 +1799,7 @@ mod cap_enforcement_tests {
         assert!(size > 0);
     }
 
-    #[tokio::test]
-    async fn replace_creates_backup_file() {
-        let dir = tempdir().unwrap();
-        let store = MarkdownStore::open(dir.path()).await.unwrap();
-        store.append_fact(&fact("original entry")).await.unwrap();
-        store
-            .replace(MemoryKind::Fact, "original", "original entry v2")
-            .await
-            .expect("replace");
-        // Look for any MEMORY.bak-* sibling.
-        let mut found = false;
-        let mut rd = tokio::fs::read_dir(dir.path()).await.unwrap();
-        while let Some(ent) = rd.next_entry().await.unwrap() {
-            let name = ent.file_name().to_string_lossy().to_string();
-            if name.starts_with("MEMORY.bak-") {
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "expected MEMORY.bak-<unix> backup to exist");
-    }
-
-    /// REQ-12: with `strict_content_policy = false` (default), a
+/// REQ-12: with `strict_content_policy = false` (default), a
     /// commit-sha-only input must still be appended — the guard only
     /// emits a `tracing::warn!` and proceeds.
     #[tokio::test]
