@@ -46,6 +46,7 @@ pub mod vector_lance;
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use thoth_core::Result;
 
 pub use episodes::{EpisodeHit, EpisodeLog};
@@ -53,6 +54,88 @@ pub use fts::{ChunkDoc, FtsHit, FtsIndex};
 pub use kv::{EdgeRow, KvStore, NodeRow, SymbolRow};
 pub use markdown::MarkdownStore;
 pub use vector::VectorHit;
+
+/// Common contract for vector index backends.
+///
+/// Thoth ships two implementations — SQLite flat-cosine (default) and
+/// LanceDB (`--features lance`). Both expose the same method surface;
+/// this trait makes that contract explicit so callers can be generic
+/// over the backend and one test suite can cover both. Each backend's
+/// `open` is left off the trait (they use different path conventions
+/// and return `Self`), so construct the concrete type at the boundary
+/// and then pass `&impl VectorBackend` downstream.
+///
+/// Every `upsert*` call L2-normalises the input before storing so that
+/// [`search`](Self::search) can reduce cosine similarity to a dot
+/// product.
+#[async_trait]
+pub trait VectorBackend: Clone + Send + Sync + 'static {
+    /// Upsert a single `(id, vector)` pair tagged with `model`.
+    async fn upsert(&self, id: &str, model: &str, vector: &[f32]) -> Result<()>;
+
+    /// Upsert many `(id, vector)` pairs in one transaction.
+    async fn upsert_batch(&self, items: &[(String, Vec<f32>)], model: &str) -> Result<()>;
+
+    /// Return the top-`k` vectors (by cosine similarity) for `query`
+    /// within `model`'s partition. Scores live in `[-1.0, 1.0]`.
+    async fn search(&self, model: &str, query: &[f32], k: usize) -> Result<Vec<VectorHit>>;
+
+    /// Delete a single id. No-op if it doesn't exist.
+    async fn delete(&self, id: &str) -> Result<()>;
+
+    /// Delete every vector whose id begins with `<path>:` (our indexer
+    /// keys chunks as `<source-path>:<line-span>`). Returns the count
+    /// of deleted rows.
+    async fn delete_by_path(&self, path: &str) -> Result<u64>;
+
+    /// Total vector count (all models).
+    async fn count(&self) -> Result<i64>;
+}
+
+#[async_trait]
+impl VectorBackend for vector::VectorStore {
+    async fn upsert(&self, id: &str, model: &str, vector: &[f32]) -> Result<()> {
+        vector::VectorStore::upsert(self, id, model, vector).await
+    }
+    async fn upsert_batch(&self, items: &[(String, Vec<f32>)], model: &str) -> Result<()> {
+        vector::VectorStore::upsert_batch(self, items, model).await
+    }
+    async fn search(&self, model: &str, query: &[f32], k: usize) -> Result<Vec<VectorHit>> {
+        vector::VectorStore::search(self, model, query, k).await
+    }
+    async fn delete(&self, id: &str) -> Result<()> {
+        vector::VectorStore::delete(self, id).await
+    }
+    async fn delete_by_path(&self, path: &str) -> Result<u64> {
+        vector::VectorStore::delete_by_path(self, path).await
+    }
+    async fn count(&self) -> Result<i64> {
+        vector::VectorStore::count(self).await
+    }
+}
+
+#[cfg(feature = "lance")]
+#[async_trait]
+impl VectorBackend for vector_lance::LanceVectorStore {
+    async fn upsert(&self, id: &str, model: &str, vector: &[f32]) -> Result<()> {
+        vector_lance::LanceVectorStore::upsert(self, id, model, vector).await
+    }
+    async fn upsert_batch(&self, items: &[(String, Vec<f32>)], model: &str) -> Result<()> {
+        vector_lance::LanceVectorStore::upsert_batch(self, items, model).await
+    }
+    async fn search(&self, model: &str, query: &[f32], k: usize) -> Result<Vec<VectorHit>> {
+        vector_lance::LanceVectorStore::search(self, model, query, k).await
+    }
+    async fn delete(&self, id: &str) -> Result<()> {
+        vector_lance::LanceVectorStore::delete(self, id).await
+    }
+    async fn delete_by_path(&self, path: &str) -> Result<u64> {
+        vector_lance::LanceVectorStore::delete_by_path(self, path).await
+    }
+    async fn count(&self) -> Result<i64> {
+        vector_lance::LanceVectorStore::count(self).await
+    }
+}
 
 // `VectorStore` is the public name for *the* vector backend. Which concrete
 // implementation you get depends on the `lance` feature:

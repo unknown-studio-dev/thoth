@@ -5913,9 +5913,11 @@ version = "0.0.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "futures",
  "lancedb",
  "parking_lot",
+ "paste",
  "redb",
  "rusqlite",
  "serde",

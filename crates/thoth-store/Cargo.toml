@@ -10,6 +10,7 @@ description = "Embedded storage backends: redb (KV + graph), tantivy (BM25), Lan
 
 [dependencies]
 thoth-core   = { workspace = true }
+async-trait  = { workspace = true }
 tokio        = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
@@ -56,4 +57,5 @@ lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = { workspace = true }
-uuid = {workspace = true}
+uuid     = { workspace = true }
+paste    = "1"
