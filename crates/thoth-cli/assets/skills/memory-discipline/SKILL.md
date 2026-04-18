@@ -199,6 +199,23 @@ Ops include: `append`, `replace`, `remove`, `stage`, `promote`, `reject`,
 self-truncates — old entries past the session window are intentionally
 shed since reflection debt counts from `.session-start` anyway.
 
+## Proposing new skills
+
+When you've hit the same pattern in ≥5 lessons, consolidate them into a
+reusable skill via `thoth_skill_propose`:
+
+- `slug`: kebab-case directory name.
+- `body`: full SKILL.md text starting with `---\nname: ...` frontmatter.
+- `source_triggers`: the triggers of the lessons being consolidated.
+
+The draft lands at `.thoth/skills/<slug>.draft/SKILL.md` and an entry is
+written to the history log. The user promotes the draft via `thoth
+skills install .thoth/skills/<slug>.draft` once they've reviewed it.
+
+Drafts are NOT auto-installed — a human must review before a proposed
+skill starts shaping future sessions. This is the main guardrail against
+runaway self-modification.
+
 ## Why the strict gate exists
 
 Prompts alone are bypassable — a self-confident agent can talk itself
