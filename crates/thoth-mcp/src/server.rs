@@ -9,7 +9,10 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thoth_core::{Event, Fact, Lesson, MemoryKind, MemoryMeta, Outcome, Query, UserSignal};
-use thoth_memory::{DisciplineConfig, MemoryManager};
+use thoth_memory::{
+    CapExceededError, DisciplineConfig, GuardedAppendError, MarkdownStoreMemoryExt,
+    MemoryConfig, MemoryKind as MdKind, MemoryManager,
+};
 use thoth_parse::LanguageRegistry;
 use thoth_retrieve::{Indexer, RetrieveConfig, Retriever};
 use thoth_store::StoreRoot;
@@ -198,6 +201,9 @@ impl Server {
             "thoth_index" => self.tool_index(arguments).await,
             "thoth_remember_fact" => self.tool_remember_fact(arguments).await,
             "thoth_remember_lesson" => self.tool_remember_lesson(arguments).await,
+            "thoth_remember_preference" => self.tool_remember_preference(arguments).await,
+            "thoth_memory_replace" => self.tool_memory_replace(arguments).await,
+            "thoth_memory_remove" => self.tool_memory_remove(arguments).await,
             "thoth_skills_list" => self.tool_skills_list().await,
             "thoth_memory_show" => self.tool_memory_show().await,
             "thoth_memory_forget" => self.tool_memory_forget().await,
@@ -386,25 +392,43 @@ impl Server {
             tags,
         };
         let cfg = DisciplineConfig::load_or_default(&self.inner.root).await;
+        let mem_cfg = MemoryConfig::load_or_default(&self.inner.root).await;
         let staged = stage || cfg.requires_review();
-        let (path, status) = if staged {
+        if staged {
             self.inner.store.markdown.append_pending_fact(&fact).await?;
-            (
-                self.inner.root.join("MEMORY.pending.md"),
-                "staged (review mode) — run `thoth_memory_promote` to accept",
-            )
-        } else {
-            self.inner.store.markdown.append_fact(&fact).await?;
-            (self.inner.root.join("MEMORY.md"), "committed to MEMORY.md")
-        };
-        let text = format!("{status}: {}", first_line(&fact.text));
-        let data = json!({
-            "text": fact.text,
-            "tags": fact.tags,
-            "path": path.display().to_string(),
-            "staged": staged,
-        });
-        Ok(ToolOutput::new(data, text))
+            let path = self.inner.root.join("MEMORY.pending.md");
+            let text = format!(
+                "staged (review mode) — run `thoth_memory_promote` to accept: {}",
+                first_line(&fact.text)
+            );
+            let data = json!({
+                "text": fact.text,
+                "tags": fact.tags,
+                "path": path.display().to_string(),
+                "staged": true,
+            });
+            return Ok(ToolOutput::new(data, text));
+        }
+        match self
+            .inner
+            .store
+            .markdown
+            .append_fact_guarded(&fact, mem_cfg.cap_memory_bytes, mem_cfg.strict_content_policy)
+            .await
+        {
+            Ok(()) => {
+                let path = self.inner.root.join("MEMORY.md");
+                let text = format!("committed to MEMORY.md: {}", first_line(&fact.text));
+                let data = json!({
+                    "text": fact.text,
+                    "tags": fact.tags,
+                    "path": path.display().to_string(),
+                    "staged": false,
+                });
+                Ok(ToolOutput::new(data, text))
+            }
+            Err(e) => Ok(guarded_error_output(e)),
+        }
     }
 
     async fn tool_remember_lesson(&self, args: Value) -> anyhow::Result<ToolOutput> {
@@ -428,6 +452,7 @@ impl Server {
             failure_count: 0,
         };
         let cfg = DisciplineConfig::load_or_default(&self.inner.root).await;
+        let mem_cfg = MemoryConfig::load_or_default(&self.inner.root).await;
         let staged = stage || cfg.requires_review();
 
         // Conflict check: a lesson with the same trigger already exists.
@@ -443,7 +468,7 @@ impl Server {
             .into_iter()
             .find(|l| l.trigger.trim().eq_ignore_ascii_case(lesson.trigger.trim()));
 
-        let (path, status, staged) = if staged || conflict.is_some() {
+        if staged || conflict.is_some() {
             self.inner
                 .store
                 .markdown
@@ -454,25 +479,137 @@ impl Server {
             } else {
                 "staged (review mode) — run `thoth_memory_promote` to accept"
             };
-            (self.inner.root.join("LESSONS.pending.md"), note, true)
-        } else {
-            self.inner.store.markdown.append_lesson(&lesson).await?;
-            (
-                self.inner.root.join("LESSONS.md"),
-                "committed to LESSONS.md",
-                false,
+            let path = self.inner.root.join("LESSONS.pending.md");
+            let text = format!("{note}: {}", lesson.trigger);
+            let data = json!({
+                "trigger": lesson.trigger,
+                "advice": lesson.advice,
+                "path": path.display().to_string(),
+                "staged": true,
+                "conflict": conflict.map(|l| json!({
+                    "trigger": l.trigger,
+                    "existing_advice": l.advice,
+                })),
+            });
+            return Ok(ToolOutput::new(data, text));
+        }
+        match self
+            .inner
+            .store
+            .markdown
+            .append_lesson_guarded(
+                &lesson,
+                mem_cfg.cap_lessons_bytes,
+                mem_cfg.strict_content_policy,
             )
-        };
-        let text = format!("{status}: {}", lesson.trigger);
+            .await
+        {
+            Ok(()) => {
+                let path = self.inner.root.join("LESSONS.md");
+                let text = format!("committed to LESSONS.md: {}", lesson.trigger);
+                let data = json!({
+                    "trigger": lesson.trigger,
+                    "advice": lesson.advice,
+                    "path": path.display().to_string(),
+                    "staged": false,
+                    "conflict": Value::Null,
+                });
+                Ok(ToolOutput::new(data, text))
+            }
+            Err(e) => Ok(guarded_error_output(e)),
+        }
+    }
+
+    async fn tool_remember_preference(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            text: String,
+            #[serde(default)]
+            tags: Vec<String>,
+        }
+        let Args { text, tags } = serde_json::from_value(args)?;
+        let trimmed = text.trim().to_string();
+        let mem_cfg = MemoryConfig::load_or_default(&self.inner.root).await;
+        match self
+            .inner
+            .store
+            .markdown
+            .append_preference_guarded(
+                &trimmed,
+                &tags,
+                mem_cfg.cap_user_bytes,
+                mem_cfg.strict_content_policy,
+            )
+            .await
+        {
+            Ok(()) => {
+                let path = self.inner.root.join("USER.md");
+                let rendered = format!("committed to USER.md: {}", first_line(&trimmed));
+                let data = json!({
+                    "text": trimmed,
+                    "tags": tags,
+                    "path": path.display().to_string(),
+                });
+                Ok(ToolOutput::new(data, rendered))
+            }
+            Err(e) => Ok(guarded_error_output(e)),
+        }
+    }
+
+    async fn tool_memory_replace(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            kind: String,
+            query: String,
+            new_text: String,
+        }
+        let Args {
+            kind,
+            query,
+            new_text,
+        } = serde_json::from_value(args)?;
+        let md_kind = parse_md_kind(&kind)?;
+        let idx = self
+            .inner
+            .store
+            .markdown
+            .replace(md_kind, &query, &new_text)
+            .await?;
+        let path = md_kind_path(&self.inner.root, md_kind);
+        let text = format!(
+            "replaced entry [{idx}] in {}: {}",
+            path.display(),
+            first_line(&new_text)
+        );
         let data = json!({
-            "trigger": lesson.trigger,
-            "advice": lesson.advice,
+            "kind": kind,
+            "index": idx,
+            "new_text": new_text,
             "path": path.display().to_string(),
-            "staged": staged,
-            "conflict": conflict.map(|l| json!({
-                "trigger": l.trigger,
-                "existing_advice": l.advice,
-            })),
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    async fn tool_memory_remove(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            kind: String,
+            query: String,
+        }
+        let Args { kind, query } = serde_json::from_value(args)?;
+        let md_kind = parse_md_kind(&kind)?;
+        let idx = self
+            .inner
+            .store
+            .markdown
+            .remove(md_kind, &query)
+            .await?;
+        let path = md_kind_path(&self.inner.root, md_kind);
+        let text = format!("removed entry [{idx}] from {}", path.display());
+        let data = json!({
+            "kind": kind,
+            "index": idx,
+            "path": path.display().to_string(),
         });
         Ok(ToolOutput::new(data, text))
     }
@@ -1631,6 +1768,57 @@ fn tools_catalog() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "thoth_remember_preference".to_string(),
+            description: "Append a user preference to USER.md. Returns a structured \
+                          `cap_exceeded` / `content_policy` error (isError=true) when the \
+                          write would exceed `[memory].cap_user_bytes` or the content policy \
+                          rejects the payload."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The preference itself. First line becomes the heading." },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional tags for later filtering."
+                    }
+                },
+                "required": ["text"]
+            }),
+        },
+        Tool {
+            name: "thoth_memory_replace".to_string(),
+            description: "Replace one entry in MEMORY.md / LESSONS.md / USER.md identified by \
+                          a substring match. Use this to update an existing fact / lesson / \
+                          preference instead of appending a near-duplicate (REQ-04)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind":     { "type": "string", "enum": ["fact", "lesson", "preference"] },
+                    "query":    { "type": "string", "description": "Substring identifying the entry to replace." },
+                    "new_text": { "type": "string", "description": "Replacement entry body." }
+                },
+                "required": ["kind", "query", "new_text"]
+            }),
+        },
+        Tool {
+            name: "thoth_memory_remove".to_string(),
+            description: "Remove one entry from MEMORY.md / LESSONS.md / USER.md identified by \
+                          a substring match. Use this to prune obsolete entries after a cap \
+                          hit (REQ-05)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind":  { "type": "string", "enum": ["fact", "lesson", "preference"] },
+                    "query": { "type": "string", "description": "Substring identifying the entry to remove." }
+                },
+                "required": ["kind", "query"]
+            }),
+        },
+        Tool {
             name: "thoth_skills_list".to_string(),
             description: "List every installed skill under .thoth/skills/.".to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
@@ -2010,6 +2198,87 @@ async fn render_retrieval(r: &thoth_core::Retrieval, root: &Path) -> String {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Parse the MCP-level `kind` string ("fact" / "lesson" / "preference") into
+/// the thoth-memory `MemoryKind` enum used by the three-surface markdown API
+/// (DESIGN-SPEC REQ-04/05/06).
+fn parse_md_kind(kind: &str) -> anyhow::Result<MdKind> {
+    match kind {
+        "fact" => Ok(MdKind::Fact),
+        "lesson" => Ok(MdKind::Lesson),
+        "preference" => Ok(MdKind::Preference),
+        other => anyhow::bail!(
+            "unknown memory kind: {other} (expected `fact`, `lesson`, or `preference`)"
+        ),
+    }
+}
+
+/// Project a [`MdKind`] onto the on-disk markdown file for user-facing
+/// status messages.
+fn md_kind_path(root: &Path, kind: MdKind) -> PathBuf {
+    match kind {
+        MdKind::Fact => root.join("MEMORY.md"),
+        MdKind::Lesson => root.join("LESSONS.md"),
+        MdKind::Preference => root.join("USER.md"),
+    }
+}
+
+/// Serialize a [`GuardedAppendError`] as a structured MCP tool error so the
+/// client can key off `data.code` = `"cap_exceeded"` / `"content_policy"`
+/// and use the attached `preview` entries to pick a `thoth_memory_replace`
+/// or `thoth_memory_remove` target. DESIGN-SPEC REQ-03 / REQ-12.
+fn guarded_error_output(err: GuardedAppendError) -> ToolOutput {
+    match err {
+        GuardedAppendError::CapExceeded(e) => cap_error_output(e),
+        GuardedAppendError::ContentPolicy(e) => {
+            let data = json!({
+                "code": "content_policy",
+                "kind": e.kind,
+                "reason": e.reason,
+                "offending_first_line": e.offending_first_line,
+                "hint": e.hint,
+            });
+            let text = serde_json::to_string(&data).unwrap_or_else(|_| {
+                format!(
+                    "content policy rejected ({}): {}",
+                    e.reason, e.offending_first_line
+                )
+            });
+            ToolOutput {
+                data,
+                text,
+                is_error: true,
+            }
+        }
+    }
+}
+
+fn cap_error_output(e: CapExceededError) -> ToolOutput {
+    let preview = serde_json::to_value(&e.entries).unwrap_or_else(|_| json!([]));
+    let data = json!({
+        "code": "cap_exceeded",
+        "kind": e.kind,
+        "current_bytes": e.current_bytes,
+        "cap_bytes": e.cap_bytes,
+        "attempted_bytes": e.attempted_bytes,
+        "preview": preview,
+        "hint": e.hint,
+    });
+    // Serialize the structured payload into the text block too so plain MCP
+    // clients (which only see `content[0].text`) can still parse it as JSON
+    // and make the next replace/remove decision.
+    let text = serde_json::to_string(&data).unwrap_or_else(|_| {
+        format!(
+            "cap exceeded: {:?} would reach {} / {} bytes",
+            e.kind, e.attempted_bytes, e.cap_bytes
+        )
+    });
+    ToolOutput {
+        data,
+        text,
+        is_error: true,
+    }
 }
 
 // ===========================================================================

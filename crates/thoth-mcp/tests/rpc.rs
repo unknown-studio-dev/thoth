@@ -445,3 +445,63 @@ async fn impact_reports_unknown_symbol_cleanly() {
         "missing symbol should return is_error=true: {result}"
     );
 }
+
+/// REQ-03: when an append would push `MEMORY.md` past the configured cap,
+/// `thoth_remember_fact` must return a structured error the agent can parse
+/// (code="cap_exceeded", current/cap/attempted byte counts, and a preview of
+/// existing entries) so it can pick a replace/remove target instead of
+/// silently overflowing the file.
+#[tokio::test]
+async fn mcp_remember_fact_returns_structured_cap_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Seed a tiny cap so a single append trips it.
+    tokio::fs::write(
+        tmp.path().join("config.toml"),
+        "[memory]\ncap_memory_bytes = 16\n",
+    )
+    .await
+    .unwrap();
+    // Pre-fill MEMORY.md with one entry so the preview list is non-empty.
+    tokio::fs::write(tmp.path().join("MEMORY.md"), "### existing\nalpha fact\n")
+        .await
+        .unwrap();
+
+    let srv = open(&tmp).await;
+    let resp = srv
+        .handle(req(
+            1,
+            "tools/call",
+            json!({
+                "name": "thoth_remember_fact",
+                "arguments": { "text": "beta fact that definitely pushes past the cap", "tags": [] }
+            }),
+        ))
+        .await
+        .expect("response");
+    let result = resp.result.expect("ok");
+    assert_eq!(
+        result["isError"].as_bool(),
+        Some(true),
+        "cap-exceeded remember_fact must set isError=true: {result}"
+    );
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("content text");
+    let parsed: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("content text must be structured JSON: err={e} text={text}"));
+    assert_eq!(parsed["code"], "cap_exceeded");
+    assert_eq!(parsed["kind"], "fact");
+    assert_eq!(parsed["cap_bytes"], 16);
+    assert!(
+        parsed["attempted_bytes"].as_u64().unwrap() > 16,
+        "attempted_bytes should exceed cap: {parsed}"
+    );
+    assert!(
+        parsed["preview"].is_array(),
+        "preview must be an array of MemoryEntryPreview rows: {parsed}"
+    );
+    assert!(
+        !parsed["preview"].as_array().unwrap().is_empty(),
+        "preview should enumerate existing entries so the agent can pick one: {parsed}"
+    );
+}
