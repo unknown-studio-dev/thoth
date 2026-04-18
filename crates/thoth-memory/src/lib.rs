@@ -883,6 +883,616 @@ fn fact_key(text: &str) -> String {
         .to_ascii_lowercase()
 }
 
+// ---------------------------------------------------------------------------
+// DESIGN-SPEC §162-215: cap-aware verbs on the markdown surface.
+//
+// These live in `thoth-memory` (not `thoth-store`) because the concept of
+// a byte cap is a *policy* decision driven by `MemoryConfig`, not a raw
+// storage primitive. `MarkdownStoreMemoryExt` is an extension trait so the
+// existing `MarkdownStore` in `thoth-store` stays free of policy code while
+// the MCP / CLI layers get a single uniform entrypoint for replace, remove,
+// preview, preference append, and cap-enforced append.
+// ---------------------------------------------------------------------------
+
+const USER_MD: &str = "USER.md";
+const MEMORY_MD: &str = "MEMORY.md";
+const LESSONS_MD: &str = "LESSONS.md";
+
+/// The `bak-<unix_ts>` suffix attached to a snapshot written *before* any
+/// mutating `replace` / `remove` call. Matches `thoth compact`'s convention
+/// so downstream pruners can sweep both sources uniformly.
+fn backup_suffix(now_unix: i64) -> String {
+    format!("bak-{now_unix}")
+}
+
+/// Write `<path>.bak-<unix>` iff `path` currently exists. A missing source
+/// file is not an error — fresh stores have nothing to preserve.
+async fn write_backup(path: &Path) -> Result<()> {
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let body = tokio::fs::read(path).await?;
+    let ts = OffsetDateTime::now_utc().unix_timestamp();
+    let bak = path.with_extension(backup_suffix(ts));
+    tokio::fs::write(&bak, body).await?;
+    Ok(())
+}
+
+/// Path for the given markdown surface inside the store root.
+fn md_path(root: &Path, kind: MemoryKind) -> std::path::PathBuf {
+    match kind {
+        MemoryKind::Fact => root.join(MEMORY_MD),
+        MemoryKind::Lesson => root.join(LESSONS_MD),
+        MemoryKind::Preference => root.join(USER_MD),
+    }
+}
+
+/// Split a markdown file into entry blocks on `### ` level-3 headings.
+///
+/// Every block includes its own heading line and every following line until
+/// the next `### ` heading (or EOF). The file preamble (anything before the
+/// first heading — typically a `# TITLE\n` line) is returned separately so
+/// callers can re-emit it verbatim when rewriting. Trailing blank lines on
+/// each block are preserved so round-tripping is byte-identical.
+fn split_entries(text: &str) -> (String, Vec<String>) {
+    let mut preamble = String::new();
+    let mut entries: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("### ") {
+            if let Some(buf) = current.take() {
+                entries.push(buf);
+            }
+            current = Some(String::from(line));
+        } else if let Some(buf) = current.as_mut() {
+            buf.push_str(line);
+        } else {
+            preamble.push_str(line);
+        }
+    }
+    if let Some(buf) = current.take() {
+        entries.push(buf);
+    }
+    (preamble, entries)
+}
+
+/// Re-assemble a file body from its preamble + entries. Guarantees a
+/// trailing newline so downstream appends compose cleanly.
+fn join_entries(preamble: &str, entries: &[String]) -> String {
+    let mut out = String::from(preamble);
+    for e in entries {
+        out.push_str(e);
+    }
+    out
+}
+
+/// Extract the first non-empty line of an entry, minus the leading `### `
+/// heading marker, truncated to 120 chars.
+fn entry_first_line(entry: &str) -> String {
+    for line in entry.lines() {
+        let l = line.trim_start_matches("### ").trim();
+        if !l.is_empty() {
+            return l.chars().take(120).collect();
+        }
+    }
+    String::new()
+}
+
+/// Extract the `tags: a, b, c` line inside an entry, if any.
+fn entry_tags(entry: &str) -> Vec<String> {
+    for line in entry.lines() {
+        if let Some(rest) = line.trim().strip_prefix("tags:") {
+            return rest
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Render a preference entry. Mirrors `render_fact` in `thoth-store` so
+/// USER.md parses with the same `### heading / body / tags:` shape — the
+/// MarkdownStore in thoth-store is re-used without a bespoke parser.
+fn render_preference(text: &str, tags: &[String]) -> String {
+    let mut lines = text.lines();
+    let title = lines.next().unwrap_or("").trim();
+    let body: Vec<&str> = lines.collect();
+    let mut out = String::from("### ");
+    out.push_str(title);
+    out.push('\n');
+    let body_joined = body.join("\n");
+    if !body_joined.trim().is_empty() {
+        out.push_str(body_joined.trim_end());
+        out.push('\n');
+    }
+    if !tags.is_empty() {
+        out.push_str("tags: ");
+        out.push_str(&tags.join(", "));
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// Collect `MemoryEntryPreview` rows for the given markdown file. Missing
+/// file yields an empty list — not an error — so callers can chain this
+/// into `CapExceededError::entries` without an extra guard.
+async fn collect_previews(path: &Path) -> Result<Vec<MemoryEntryPreview>> {
+    let text = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let (_, entries) = split_entries(&text);
+    Ok(entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, e)| MemoryEntryPreview {
+            index,
+            first_line: entry_first_line(&e),
+            bytes: e.len(),
+            tags: entry_tags(&e),
+        })
+        .collect())
+}
+
+/// Pick the single matching entry index given a `query`:
+///
+/// 1. Case-insensitive substring match on the first line and tags.
+/// 2. If exactly one hit → return it.
+/// 3. If multiple hits → fall back to Jaccard similarity over `text_sim`
+///    tokens; only accept the top match when it's ≥ 0.6 AND strictly
+///    greater than every other candidate.
+/// 4. Otherwise → `Error::Other` listing all ambiguous candidates so the
+///    caller (MCP tool handler) can surface them to the agent.
+fn pick_entry(entries: &[String], query: &str) -> Result<usize> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Err(thoth_core::Error::Store(
+            "empty match_substring".to_string(),
+        ));
+    }
+    let mut substring_hits: Vec<usize> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let first_lc = entry_first_line(e).to_ascii_lowercase();
+        let tag_match = entry_tags(e)
+            .iter()
+            .any(|t| t.to_ascii_lowercase().contains(&needle));
+        if first_lc.contains(&needle) || tag_match {
+            substring_hits.push(i);
+        }
+    }
+
+    match substring_hits.len() {
+        0 => Err(thoth_core::Error::Store(format!(
+            "no entry matches query {query:?}"
+        ))),
+        1 => Ok(substring_hits[0]),
+        _ => {
+            let q_tokens = text_sim::tokens(query);
+            let mut scored: Vec<(usize, f32)> = substring_hits
+                .iter()
+                .map(|&i| {
+                    let t = text_sim::tokens(&entry_first_line(&entries[i]));
+                    (i, text_sim::jaccard(&q_tokens, &t))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let (best_idx, best_score) = scored[0];
+            let second = scored.get(1).map(|(_, s)| *s).unwrap_or(0.0);
+            if best_score >= 0.6 && best_score > second {
+                Ok(best_idx)
+            } else {
+                let titles: Vec<String> = substring_hits
+                    .iter()
+                    .map(|&i| entry_first_line(&entries[i]))
+                    .collect();
+                Err(thoth_core::Error::Store(format!(
+                    "ambiguous match for {query:?}: {} candidates — {}",
+                    substring_hits.len(),
+                    titles.join(" | ")
+                )))
+            }
+        }
+    }
+}
+
+/// Build a [`CapExceededError`] snapshotting the current file. Used by
+/// both cap-checking append paths.
+async fn build_cap_error(
+    kind: MemoryKind,
+    path: &Path,
+    current_bytes: usize,
+    cap_bytes: usize,
+    attempted_bytes: usize,
+) -> CapExceededError {
+    let entries = collect_previews(path).await.unwrap_or_default();
+    CapExceededError {
+        kind,
+        current_bytes,
+        cap_bytes,
+        attempted_bytes,
+        entries,
+        hint: "Call thoth_memory_replace or thoth_memory_remove to free space, then retry."
+            .to_string(),
+    }
+}
+
+/// Policy-layer extension on [`MarkdownStore`]: cap-aware appends, single-
+/// entry replace/remove with backup, and a uniform preview/size API across
+/// the three markdown surfaces (`MEMORY.md` / `LESSONS.md` / `USER.md`).
+///
+/// This is defined here rather than in `thoth-store` so the raw storage
+/// crate stays policy-free (its `append_fact` / `append_lesson` don't know
+/// about caps). The MCP `thoth_memory_replace` / `thoth_memory_remove` /
+/// `thoth_remember_preference` handlers call through this trait.
+#[allow(async_fn_in_trait)]
+pub trait MarkdownStoreMemoryExt {
+    /// Append a user preference to `USER.md`, enforcing `cap_user_bytes`.
+    ///
+    /// Returns [`CapExceededError`] (with a preview snapshot) when the
+    /// resulting file would exceed `cap`. Caller is expected to feed that
+    /// list back to the agent so it can pick an entry to replace/remove.
+    async fn append_preference(
+        &self,
+        text: &str,
+        tags: &[String],
+        cap: usize,
+    ) -> std::result::Result<(), CapExceededError>;
+
+    /// Wrapper around [`MarkdownStore::append_fact`] that refuses the write
+    /// when `MEMORY.md` would grow past `cap` bytes.
+    async fn append_fact_capped(
+        &self,
+        f: &thoth_core::Fact,
+        cap: usize,
+    ) -> std::result::Result<(), CapExceededError>;
+
+    /// Wrapper around [`MarkdownStore::append_lesson`] that refuses the
+    /// write when `LESSONS.md` would grow past `cap` bytes.
+    async fn append_lesson_capped(
+        &self,
+        l: &thoth_core::Lesson,
+        cap: usize,
+    ) -> std::result::Result<(), CapExceededError>;
+
+    /// Replace the single entry matching `query` with `new_text`. Returns
+    /// the index of the entry that was replaced. Writes a `.bak-<unix>`
+    /// snapshot before mutating.
+    async fn replace(&self, kind: MemoryKind, query: &str, new_text: &str) -> Result<usize>;
+
+    /// Remove the single entry matching `query`. Returns the index that
+    /// was removed. Writes a `.bak-<unix>` snapshot before mutating.
+    async fn remove(&self, kind: MemoryKind, query: &str) -> Result<usize>;
+
+    /// Snapshot all entries in the given markdown surface.
+    async fn preview(&self, kind: MemoryKind) -> Result<Vec<MemoryEntryPreview>>;
+
+    /// Current size of the given markdown surface, in bytes. Missing file
+    /// reports `0` — no error.
+    async fn size_bytes(&self, kind: MemoryKind) -> Result<u64>;
+}
+
+impl MarkdownStoreMemoryExt for MarkdownStore {
+    async fn append_preference(
+        &self,
+        text: &str,
+        tags: &[String],
+        cap: usize,
+    ) -> std::result::Result<(), CapExceededError> {
+        let path = md_path(&self.root, MemoryKind::Preference);
+        let rendered = render_preference(text, tags);
+        let current_bytes = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let attempted_bytes = current_bytes + rendered.len();
+        if attempted_bytes > cap {
+            return Err(
+                build_cap_error(MemoryKind::Preference, &path, current_bytes, cap, attempted_bytes)
+                    .await,
+            );
+        }
+        // Lazy init: write a header line if the file is missing so USER.md
+        // matches the shape of MEMORY.md / LESSONS.md.
+        if current_bytes == 0 {
+            let header = "# USER.md\n";
+            if let Err(e) = tokio::fs::write(&path, format!("{header}{rendered}")).await {
+                tracing::warn!(error = %e, "append_preference: failed to create USER.md");
+                return Err(CapExceededError {
+                    kind: MemoryKind::Preference,
+                    current_bytes,
+                    cap_bytes: cap,
+                    attempted_bytes,
+                    entries: Vec::new(),
+                    hint: format!("io error: {e}"),
+                });
+            }
+            return Ok(());
+        }
+        let mut f = match tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "append_preference: open failed");
+                return Err(CapExceededError {
+                    kind: MemoryKind::Preference,
+                    current_bytes,
+                    cap_bytes: cap,
+                    attempted_bytes,
+                    entries: Vec::new(),
+                    hint: format!("io error: {e}"),
+                });
+            }
+        };
+        use tokio::io::AsyncWriteExt;
+        if let Err(e) = f.write_all(rendered.as_bytes()).await {
+            tracing::warn!(error = %e, "append_preference: write failed");
+            return Err(CapExceededError {
+                kind: MemoryKind::Preference,
+                current_bytes,
+                cap_bytes: cap,
+                attempted_bytes,
+                entries: Vec::new(),
+                hint: format!("io error: {e}"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn append_fact_capped(
+        &self,
+        f: &thoth_core::Fact,
+        cap: usize,
+    ) -> std::result::Result<(), CapExceededError> {
+        let path = md_path(&self.root, MemoryKind::Fact);
+        let current_bytes = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        // Approximate rendered size: first_line + body + tags + framing (~6 bytes of `### \n\n`).
+        let mut approx = 4 + f.text.len() + 2;
+        if !f.tags.is_empty() {
+            approx += 6 + f.tags.iter().map(|t| t.len() + 2).sum::<usize>();
+        }
+        let attempted_bytes = current_bytes + approx;
+        if attempted_bytes > cap {
+            return Err(
+                build_cap_error(MemoryKind::Fact, &path, current_bytes, cap, attempted_bytes).await,
+            );
+        }
+        if let Err(e) = self.append_fact(f).await {
+            tracing::warn!(error = %e, "append_fact_capped: underlying append failed");
+            return Err(CapExceededError {
+                kind: MemoryKind::Fact,
+                current_bytes,
+                cap_bytes: cap,
+                attempted_bytes,
+                entries: Vec::new(),
+                hint: format!("io error: {e}"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn append_lesson_capped(
+        &self,
+        l: &thoth_core::Lesson,
+        cap: usize,
+    ) -> std::result::Result<(), CapExceededError> {
+        let path = md_path(&self.root, MemoryKind::Lesson);
+        let current_bytes = tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let mut approx = 4 + l.trigger.len() + l.advice.len() + 3;
+        if l.success_count > 0 || l.failure_count > 0 {
+            approx += 40;
+        }
+        let attempted_bytes = current_bytes + approx;
+        if attempted_bytes > cap {
+            return Err(
+                build_cap_error(MemoryKind::Lesson, &path, current_bytes, cap, attempted_bytes)
+                    .await,
+            );
+        }
+        if let Err(e) = self.append_lesson(l).await {
+            tracing::warn!(error = %e, "append_lesson_capped: underlying append failed");
+            return Err(CapExceededError {
+                kind: MemoryKind::Lesson,
+                current_bytes,
+                cap_bytes: cap,
+                attempted_bytes,
+                entries: Vec::new(),
+                hint: format!("io error: {e}"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn replace(&self, kind: MemoryKind, query: &str, new_text: &str) -> Result<usize> {
+        let path = md_path(&self.root, kind);
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let (preamble, mut entries) = split_entries(&text);
+        let idx = pick_entry(&entries, query)?;
+        // Preserve original tags on the entry when the caller didn't supply
+        // a new `tags:` line — keeps `replace` focused on swapping the body.
+        let tags = entry_tags(&entries[idx]);
+        let rendered = render_preference(new_text, &tags);
+        write_backup(&path).await?;
+        entries[idx] = rendered;
+        let header = match kind {
+            MemoryKind::Fact => "# MEMORY.md\n",
+            MemoryKind::Lesson => "# LESSONS.md\n",
+            MemoryKind::Preference => "# USER.md\n",
+        };
+        let preamble = if preamble.trim().is_empty() {
+            header.to_string()
+        } else {
+            preamble
+        };
+        let body = join_entries(&preamble, &entries);
+        tokio::fs::write(&path, body).await?;
+        Ok(idx)
+    }
+
+    async fn remove(&self, kind: MemoryKind, query: &str) -> Result<usize> {
+        let path = md_path(&self.root, kind);
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let (preamble, mut entries) = split_entries(&text);
+        let idx = pick_entry(&entries, query)?;
+        write_backup(&path).await?;
+        entries.remove(idx);
+        let header = match kind {
+            MemoryKind::Fact => "# MEMORY.md\n",
+            MemoryKind::Lesson => "# LESSONS.md\n",
+            MemoryKind::Preference => "# USER.md\n",
+        };
+        let preamble = if preamble.trim().is_empty() {
+            header.to_string()
+        } else {
+            preamble
+        };
+        let body = join_entries(&preamble, &entries);
+        tokio::fs::write(&path, body).await?;
+        Ok(idx)
+    }
+
+    async fn preview(&self, kind: MemoryKind) -> Result<Vec<MemoryEntryPreview>> {
+        let path = md_path(&self.root, kind);
+        collect_previews(&path).await
+    }
+
+    async fn size_bytes(&self, kind: MemoryKind) -> Result<u64> {
+        let path = md_path(&self.root, kind);
+        match tokio::fs::metadata(&path).await {
+            Ok(m) => Ok(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cap_enforcement_tests {
+    use super::*;
+    use tempfile::tempdir;
+    use thoth_core::{Fact, MemoryKind as CoreKind, MemoryMeta};
+
+    fn fact(text: &str) -> Fact {
+        Fact {
+            meta: MemoryMeta::new(CoreKind::Semantic),
+            text: text.to_string(),
+            tags: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_fact_errors_when_cap_exceeded() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        // Seed with one large fact so the next append tips us over.
+        let big = "x".repeat(200);
+        store.append_fact(&fact(&big)).await.unwrap();
+        // Cap well below current size.
+        let err = store
+            .append_fact_capped(&fact("another"), 50)
+            .await
+            .expect_err("expected CapExceededError");
+        assert!(matches!(err.kind, MemoryKind::Fact));
+        assert!(err.attempted_bytes > err.cap_bytes);
+        assert!(!err.entries.is_empty(), "preview entries must be populated");
+    }
+
+    #[tokio::test]
+    async fn replace_updates_single_match() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store.append_fact(&fact("alpha fact")).await.unwrap();
+        store.append_fact(&fact("beta fact")).await.unwrap();
+        let idx = store
+            .replace(MemoryKind::Fact, "alpha", "alpha fact v2")
+            .await
+            .expect("single match replace");
+        assert_eq!(idx, 0);
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts[0].text.contains("v2"));
+        assert!(facts[1].text.contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn remove_errors_on_ambiguous_match() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store.append_fact(&fact("shared token here")).await.unwrap();
+        store.append_fact(&fact("shared token there")).await.unwrap();
+        // "shared" substring-matches both; Jaccard tie (both share only
+        // "shared" with the query) so pick_entry must error.
+        let err = store
+            .remove(MemoryKind::Fact, "shared")
+            .await
+            .expect_err("ambiguous should error");
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous"), "unexpected error: {msg}");
+        // Neither entry should have been removed.
+        assert_eq!(store.read_facts().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn append_preference_writes_user_md() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store
+            .append_preference("prefers dark mode", &["ui".to_string()], 1536)
+            .await
+            .expect("append_preference");
+        let body =
+            tokio::fs::read_to_string(dir.path().join("USER.md")).await.unwrap();
+        assert!(body.contains("### prefers dark mode"));
+        assert!(body.contains("tags: ui"));
+        let size = store.size_bytes(MemoryKind::Preference).await.unwrap();
+        assert!(size > 0);
+    }
+
+    #[tokio::test]
+    async fn replace_creates_backup_file() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store.append_fact(&fact("original entry")).await.unwrap();
+        store
+            .replace(MemoryKind::Fact, "original", "original entry v2")
+            .await
+            .expect("replace");
+        // Look for any MEMORY.bak-* sibling.
+        let mut found = false;
+        let mut rd = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(ent) = rd.next_entry().await.unwrap() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.starts_with("MEMORY.bak-") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected MEMORY.bak-<unix> backup to exist");
+    }
+}
+
 #[cfg(test)]
 mod cap_tests {
     use super::*;
