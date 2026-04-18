@@ -179,10 +179,9 @@ impl MarkdownStore {
             .into_iter()
             .filter(|f| {
                 let text_lc = f.text.to_lowercase();
-                let tags_lc: Vec<String> = f.tags.iter().map(|t| t.to_lowercase()).collect();
                 lowered.iter().any(|needle| {
                     text_lc.contains(needle.as_str())
-                        || tags_lc.iter().any(|t| t.contains(needle.as_str()))
+                        || f.tags.iter().any(|t| t.to_lowercase().contains(needle.as_str()))
                 })
             })
             .collect())

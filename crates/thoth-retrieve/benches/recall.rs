@@ -172,7 +172,10 @@ fn recall_benchmark(c: &mut Criterion) {
         indexer.index_path(src_dir.path()).await.unwrap();
     });
 
-    let store_path = thoth_dir.path().to_path_buf();
+    // Open the store once; StoreRoot is Arc-backed so clone() is cheap.
+    let store = rt
+        .block_on(StoreRoot::open(thoth_dir.path()))
+        .unwrap();
 
     // --- benchmark group ---
     let mut group = c.benchmark_group("recall_latency");
@@ -181,10 +184,12 @@ fn recall_benchmark(c: &mut Criterion) {
     group.sample_size(50);
 
     group.bench_function("recall_p50_p95", |b| {
-        b.to_async(&rt).iter(|| async {
-            let store = StoreRoot::open(&store_path).await.unwrap();
-            let q = Query::text("symbol retrieval query");
-            recall(store, q, Mode::Zero).await.unwrap()
+        b.to_async(&rt).iter(|| {
+            let store = store.clone();
+            async move {
+                let q = Query::text("symbol retrieval query");
+                recall(store, q, Mode::Zero).await.unwrap()
+            }
         });
     });
 

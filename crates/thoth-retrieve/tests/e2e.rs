@@ -1,11 +1,24 @@
 //! End-to-end test: index a small project → run hybrid recall → sanity-check
 //! that the chunks we expect come back.
 
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use thoth_core::Query;
 use thoth_parse::LanguageRegistry;
 use thoth_retrieve::{Indexer, Retriever};
 use thoth_store::StoreRoot;
+
+/// Open a fresh in-memory-equivalent store backed by a temp directory.
+/// Returns the `TempDir` guard (must stay alive) and the `StoreRoot`.
+async fn make_store() -> (TempDir, StoreRoot) {
+    let dir = tempdir().unwrap();
+    let store = StoreRoot::open(dir.path()).await.unwrap();
+    (dir, store)
+}
+
+/// Build an `Indexer` for `store` using the default language registry.
+fn make_indexer(store: StoreRoot) -> Indexer {
+    Indexer::new(store, LanguageRegistry::new())
+}
 
 const AUTH_RS: &str = r#"
 use std::collections::HashMap;
@@ -47,11 +60,10 @@ async fn index_and_recall_returns_relevant_chunks() {
         .unwrap();
 
     // Open a `.thoth/` alongside.
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
+    let (_thoth_dir, store) = make_store().await;
 
     // Index.
-    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
+    let idx = make_indexer(store.clone());
     let stats = idx.index_path(src_dir.path()).await.unwrap();
     assert!(stats.files >= 2, "indexed files: {stats:?}");
     assert!(stats.chunks >= 4, "indexed chunks: {stats:?}");
@@ -110,10 +122,11 @@ pub fn helper(x: i32) -> i32 {
         .await
         .unwrap();
 
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
-    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
-    idx.index_path(src_dir.path()).await.unwrap();
+    let (_thoth_dir, store) = make_store().await;
+    make_indexer(store.clone())
+        .index_path(src_dir.path())
+        .await
+        .unwrap();
 
     let r = Retriever::new(store);
     let out = r.recall(&Query::text("do_heavy_lifting")).await.unwrap();
@@ -170,9 +183,8 @@ pub fn login() {}
         .await
         .unwrap();
 
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
-    Indexer::new(store.clone(), LanguageRegistry::new())
+    let (_thoth_dir, store) = make_store().await;
+    make_indexer(store.clone())
         .index_path(src_dir.path())
         .await
         .unwrap();
@@ -192,8 +204,7 @@ pub fn login() {}
 
 #[tokio::test]
 async fn recall_fuses_markdown_memory_hits() {
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
+    let (thoth_dir, store) = make_store().await;
 
     // Seed MEMORY.md directly.
     tokio::fs::write(
@@ -231,9 +242,8 @@ pub fn migration_runner() -> &'static str {
         .await
         .unwrap();
 
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
-    Indexer::new(store.clone(), LanguageRegistry::new())
+    let (thoth_dir, store) = make_store().await;
+    make_indexer(store.clone())
         .index_path(src_dir.path())
         .await
         .unwrap();
@@ -302,8 +312,7 @@ async fn recall_surfaces_lessons_by_trigger() {
     // Reflective memory (LESSONS.md) must be surfaced by recall, not just
     // MEMORY.md. Without this, `thoth_lesson_outcome` bumps counters in a
     // file nobody reads — the learn-from-mistakes loop stays open.
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
+    let (thoth_dir, store) = make_store().await;
 
     tokio::fs::write(
         thoth_dir.path().join("LESSONS.md"),
@@ -360,10 +369,11 @@ impl Greet for English {
         .await
         .unwrap();
 
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
-    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
-    idx.index_path(src_dir.path()).await.unwrap();
+    let (_thoth_dir, store) = make_store().await;
+    make_indexer(store.clone())
+        .index_path(src_dir.path())
+        .await
+        .unwrap();
 
     // `greet::English` extends `greet::Greet`. The aliases map in this
     // file is empty (no `use` statements), so the parent name `Greet`
@@ -403,10 +413,11 @@ pub fn noop() {}
         .await
         .unwrap();
 
-    let thoth_dir = tempdir().unwrap();
-    let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
-    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
-    idx.index_path(src_dir.path()).await.unwrap();
+    let (_thoth_dir, store) = make_store().await;
+    make_indexer(store.clone())
+        .index_path(src_dir.path())
+        .await
+        .unwrap();
 
     let graph = thoth_graph::Graph::new(store.kv.clone());
     let imports = graph
