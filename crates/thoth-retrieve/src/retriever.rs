@@ -285,22 +285,27 @@ impl Retriever {
 
     async fn graph_stage(&self, seeds: &[String]) -> Result<Vec<Candidate>> {
         use futures::StreamExt;
-        let results = futures::stream::iter(seeds)
-            .map(|seed| async move {
-                let ns = self.graph.neighbors(seed, 1).await?;
-                let cands: Vec<Candidate> = ns
-                    .into_iter()
-                    .map(|n| Candidate {
-                        id: chunk_id(&n.path, n.line, n.line),
-                        path: n.path,
-                        start_line: n.line,
-                        end_line: n.line,
-                        symbol: Some(n.fqn),
-                        source: RetrievalSource::Graph,
-                        preview: None,
-                    })
-                    .collect();
-                Ok::<Vec<Candidate>, thoth_core::Error>(cands)
+        let seeds_owned: Vec<String> = seeds.to_vec();
+        let graph = self.graph.clone();
+        let results = futures::stream::iter(seeds_owned)
+            .map(move |seed| {
+                let graph = graph.clone();
+                async move {
+                    let ns = graph.neighbors(&seed, 1).await?;
+                    let cands: Vec<Candidate> = ns
+                        .into_iter()
+                        .map(|n| Candidate {
+                            id: chunk_id(&n.path, n.line, n.line),
+                            path: n.path,
+                            start_line: n.line,
+                            end_line: n.line,
+                            symbol: Some(n.fqn),
+                            source: RetrievalSource::Graph,
+                            preview: None,
+                        })
+                        .collect();
+                    Ok::<Vec<Candidate>, thoth_core::Error>(cands)
+                }
             })
             .buffer_unordered(8)
             .collect::<Vec<_>>()
