@@ -1735,6 +1735,57 @@ mod cap_enforcement_tests {
         assert!(facts[1].text.contains("beta"));
     }
 
+    /// REQ-04: `replace` with 2+ substring hits whose Jaccard tiebreak
+    /// can't promote a single winner must surface an `ambiguous match`
+    /// error listing the candidate first-lines and leave the file
+    /// untouched.
+    #[tokio::test]
+    async fn replace_errors_on_ambiguous_match() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store
+            .append_fact(&fact("thoth compact rewrites MEMORY.md"))
+            .await
+            .unwrap();
+        store
+            .append_fact(&fact("thoth compact rewrites LESSONS.md"))
+            .await
+            .unwrap();
+        let err = store
+            .replace(MemoryKind::Fact, "thoth compact", "new text")
+            .await
+            .expect_err("ambiguous replace should error");
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous"), "unexpected error: {msg}");
+        assert!(msg.contains("2 candidates"), "should list candidate count: {msg}");
+        // Neither entry rewritten.
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().all(|f| f.text.contains("thoth compact")));
+    }
+
+    /// REQ-05: `remove` with zero substring hits must return a `no entry
+    /// matches` error and leave the store untouched.
+    #[tokio::test]
+    async fn remove_errors_on_zero_match() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store.append_fact(&fact("alpha fact here")).await.unwrap();
+        let err = store
+            .remove(MemoryKind::Fact, "nonexistent substring xyz")
+            .await
+            .expect_err("zero-match remove should error");
+        let msg = format!("{err}");
+        assert!(msg.contains("no entry matches"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("nonexistent substring xyz"),
+            "error should echo query: {msg}"
+        );
+        // File untouched.
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts.len(), 1);
+    }
+
     #[tokio::test]
     async fn remove_errors_on_ambiguous_match() {
         let dir = tempdir().unwrap();
