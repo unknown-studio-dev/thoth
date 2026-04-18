@@ -69,11 +69,7 @@ pub struct LessonCluster {
 /// average trigger-token-set size. Fine for practical lesson counts
 /// (hundreds); if a project ever exceeds that we can switch to a
 /// MinHash / LSH index.
-pub fn detect_clusters(
-    lessons: &[Lesson],
-    min_size: usize,
-    threshold: f32,
-) -> Vec<LessonCluster> {
+pub fn detect_clusters(lessons: &[Lesson], min_size: usize, threshold: f32) -> Vec<LessonCluster> {
     if lessons.len() < min_size || min_size == 0 || threshold <= 0.0 {
         return Vec::new();
     }
@@ -117,8 +113,7 @@ pub fn detect_clusters(
         .into_values()
         .filter(|indices| indices.len() >= min_size)
         .map(|indices| {
-            let triggers: Vec<String> =
-                indices.iter().map(|&i| entries[i].0.clone()).collect();
+            let triggers: Vec<String> = indices.iter().map(|&i| entries[i].0.clone()).collect();
             let mut iter = indices.iter().map(|&i| entries[i].1.clone());
             // Intersection across every member — the tokens every
             // trigger agrees on. Safe: `indices` is non-empty because
@@ -198,17 +193,15 @@ mod tests {
             mk_lesson("when pushing to main branch"),
             mk_lesson("when answering user questions"),
         ];
-        let clusters = detect_clusters(
-            &lessons,
-            DEFAULT_CLUSTER_MIN_SIZE,
-            DEFAULT_CLUSTER_JACCARD,
-        );
+        let clusters = detect_clusters(&lessons, DEFAULT_CLUSTER_MIN_SIZE, DEFAULT_CLUSTER_JACCARD);
         assert_eq!(clusters.len(), 1, "expected one cluster: {clusters:?}");
         assert_eq!(clusters[0].triggers.len(), 5);
         assert!(clusters[0].shared_tokens.contains(&"sqlx".to_string()));
-        assert!(clusters[0]
-            .shared_tokens
-            .contains(&"migrations".to_string()));
+        assert!(
+            clusters[0]
+                .shared_tokens
+                .contains(&"migrations".to_string())
+        );
     }
 
     #[test]
@@ -219,11 +212,7 @@ mod tests {
             mk_lesson("after sqlx migrations"),
             // Only 3 — below default min_size (5).
         ];
-        let clusters = detect_clusters(
-            &lessons,
-            DEFAULT_CLUSTER_MIN_SIZE,
-            DEFAULT_CLUSTER_JACCARD,
-        );
+        let clusters = detect_clusters(&lessons, DEFAULT_CLUSTER_MIN_SIZE, DEFAULT_CLUSTER_JACCARD);
         assert!(clusters.is_empty(), "expected no cluster: {clusters:?}");
     }
 

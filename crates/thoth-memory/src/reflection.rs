@@ -495,7 +495,10 @@ mod tests {
         let dir = tempdir().unwrap();
         // 12 mutations, 2 remembers → debt = 10.
         let mut lines: Vec<String> = (0..12)
-            .map(|_| r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#.to_string())
+            .map(|_| {
+                r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#
+                    .to_string()
+            })
             .collect();
         write(
             &dir.path().join("gate.jsonl"),
@@ -503,7 +506,10 @@ mod tests {
         )
         .await;
         lines = (0..2)
-            .map(|_| r#"{"at_unix":1,"at_rfc3339":"","op":"append","kind":"fact","title":"x"}"#.to_string())
+            .map(|_| {
+                r#"{"at_unix":1,"at_rfc3339":"","op":"append","kind":"fact","title":"x"}"#
+                    .to_string()
+            })
             .collect();
         write(
             &dir.path().join("memory-history.jsonl"),
@@ -564,7 +570,10 @@ mod tests {
         // through the sync API — gate.rs's entry point.
         let dir = tempdir().unwrap();
         let gate_lines: Vec<String> = (0..6)
-            .map(|_| r#"{"ts":"2026-04-17T10:00:00Z","tool":"Edit","decision":"pass","reason":""}"#.to_string())
+            .map(|_| {
+                r#"{"ts":"2026-04-17T10:00:00Z","tool":"Edit","decision":"pass","reason":""}"#
+                    .to_string()
+            })
             .collect();
         std::fs::write(dir.path().join("gate.jsonl"), gate_lines.join("\n")).unwrap();
         let history = r#"{"at_unix":1,"at_rfc3339":"","op":"append","kind":"lesson","title":"x"}"#;

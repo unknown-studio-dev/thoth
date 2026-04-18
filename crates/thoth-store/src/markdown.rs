@@ -181,7 +181,9 @@ impl MarkdownStore {
                 let text_lc = f.text.to_lowercase();
                 lowered.iter().any(|needle| {
                     text_lc.contains(needle.as_str())
-                        || f.tags.iter().any(|t| t.to_lowercase().contains(needle.as_str()))
+                        || f.tags
+                            .iter()
+                            .any(|t| t.to_lowercase().contains(needle.as_str()))
                 })
             })
             .collect())

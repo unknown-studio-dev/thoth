@@ -215,8 +215,16 @@ pub fn render_prompt(ctx: &ReviewContext) -> String {
     // counts so the LLM knows it is seeing a *sample*, not the whole
     // store. Without this the model thinks "I don't see it here" and
     // re-suggests entries that already exist further down the file.
-    let shown_facts = ctx.memory_md.lines().filter(|l| l.starts_with("- ")).count();
-    let shown_lessons = ctx.lessons_md.lines().filter(|l| l.starts_with("- ")).count();
+    let shown_facts = ctx
+        .memory_md
+        .lines()
+        .filter(|l| l.starts_with("- "))
+        .count();
+    let shown_lessons = ctx
+        .lessons_md
+        .lines()
+        .filter(|l| l.starts_with("- "))
+        .count();
     let memory_header = format!(
         "## Current Memory ({shown_facts} of {total} facts shown)",
         total = ctx.total_facts,

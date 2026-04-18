@@ -15,9 +15,8 @@ use std::collections::HashSet;
 /// gate's larger stoplist because we want to keep verbs like "editing"
 /// or "running" — those *are* meaningful signals here.
 pub(crate) const TRIGGER_STOPWORDS: &[&str] = &[
-    "when", "before", "after", "during", "while", "whenever",
-    "the", "and", "for", "any", "all", "new", "old", "also",
-    "not", "from", "with", "into", "onto", "out",
+    "when", "before", "after", "during", "while", "whenever", "the", "and", "for", "any", "all",
+    "new", "old", "also", "not", "from", "with", "into", "onto", "out",
 ];
 
 /// Tokenise a short string into the set used for Jaccard scoring.

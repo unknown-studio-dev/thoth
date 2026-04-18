@@ -90,7 +90,10 @@ pub async fn run_compact(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let facts = md.read_facts().await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    let lessons = md.read_lessons().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let lessons = md
+        .read_lessons()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if facts.is_empty() && lessons.is_empty() {
         bail!("MEMORY.md and LESSONS.md are both empty — nothing to compact");
@@ -352,7 +355,8 @@ mod tests {
 
     #[test]
     fn parse_handles_plain_json() {
-        let raw = r#"{"facts":[{"text":"hello","tags":["a"]}],"lessons":[{"trigger":"x","advice":"y"}]}"#;
+        let raw =
+            r#"{"facts":[{"text":"hello","tags":["a"]}],"lessons":[{"trigger":"x","advice":"y"}]}"#;
         let out = parse_response(raw).unwrap();
         assert_eq!(out.facts.len(), 1);
         assert_eq!(out.lessons[0].trigger, "x");

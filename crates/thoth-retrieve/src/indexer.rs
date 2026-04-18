@@ -463,7 +463,10 @@ impl Indexer {
 
         // Call edges
         for (caller, callee) in &table.calls {
-            let resolved = resolution.get(callee).cloned().unwrap_or_else(|| callee.clone());
+            let resolved = resolution
+                .get(callee)
+                .cloned()
+                .unwrap_or_else(|| callee.clone());
             all_edges.push(Edge {
                 from: caller.clone(),
                 to: resolved,
@@ -501,7 +504,10 @@ impl Indexer {
 
         // Extends edges
         for (child, parent) in &table.extends {
-            let resolved = resolution.get(parent).cloned().unwrap_or_else(|| parent.clone());
+            let resolved = resolution
+                .get(parent)
+                .cloned()
+                .unwrap_or_else(|| parent.clone());
             if !resolved.is_empty() {
                 all_edges.push(Edge {
                     from: child.clone(),
@@ -550,7 +556,6 @@ impl Indexer {
         vectors.upsert_batch(&items, embedder.model_id()).await?;
         Ok(Some(items.len()))
     }
-
 }
 
 // ---- helpers ---------------------------------------------------------------

@@ -288,11 +288,7 @@ impl Language {
     /// - **Go** struct embeddings — currently disabled (false positives on
     ///   non-type anonymous fields). Revisit when we have field-type
     ///   resolution.
-    pub(crate) fn extract_extends(
-        self,
-        node: tree_sitter::Node<'_>,
-        source: &[u8],
-    ) -> Vec<String> {
+    pub(crate) fn extract_extends(self, node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
         match self.inner {
             #[cfg(feature = "lang-rust")]
             LanguageKind::Rust => rust_extends(node, source),
@@ -506,11 +502,16 @@ fn go_aliases(text: &str, out: &mut Vec<(String, String)>) {
         Some(b) => b.trim(),
         None => return,
     };
-    let lines: Vec<&str> = if let Some(inner) = body.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        inner.lines().map(str::trim).filter(|l| !l.is_empty()).collect()
-    } else {
-        vec![body]
-    };
+    let lines: Vec<&str> =
+        if let Some(inner) = body.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            inner
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect()
+        } else {
+            vec![body]
+        };
     for line in lines {
         // Strip a trailing line comment if present.
         let line = line.split("//").next().unwrap_or(line).trim();
@@ -648,11 +649,7 @@ fn ts_js_extends(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
 }
 
 #[cfg(any(feature = "lang-javascript", feature = "lang-typescript"))]
-fn collect_heritage_children(
-    clause: tree_sitter::Node<'_>,
-    source: &[u8],
-    out: &mut Vec<String>,
-) {
+fn collect_heritage_children(clause: tree_sitter::Node<'_>, source: &[u8], out: &mut Vec<String>) {
     let mut cursor = clause.walk();
     for c in clause.children(&mut cursor) {
         let k = c.kind();
@@ -785,14 +782,8 @@ mod tests {
 
     #[test]
     fn split_top_level_respects_groups() {
-        assert_eq!(
-            split_top_level("a, b, c", ','),
-            vec!["a", " b", " c"],
-        );
-        assert_eq!(
-            split_top_level("{a, b}, c", ','),
-            vec!["{a, b}", " c"],
-        );
+        assert_eq!(split_top_level("a, b, c", ','), vec!["a", " b", " c"],);
+        assert_eq!(split_top_level("{a, b}, c", ','), vec!["{a, b}", " c"],);
         assert_eq!(
             split_top_level("foo<Bar, Baz>, quux", ','),
             vec!["foo<Bar, Baz>", " quux"],

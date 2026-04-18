@@ -72,8 +72,10 @@ fn build_ignore(root: &Path) -> Option<Gitignore> {
 /// Returns `true` if `path` is inside one of the [`ALWAYS_IGNORED_DIRS`].
 fn in_always_ignored(path: &Path) -> bool {
     path.components().any(|c| {
-        if let std::path::Component::Normal(s) = c && let Some(s) = s.to_str() {
-                return ALWAYS_IGNORED_DIRS.contains(&s);
+        if let std::path::Component::Normal(s) = c
+            && let Some(s) = s.to_str()
+        {
+            return ALWAYS_IGNORED_DIRS.contains(&s);
         }
         false
     })
@@ -101,8 +103,8 @@ impl Watcher {
         // Canonicalize the root so that ignore-rule matching doesn't
         // panic when `notify` returns absolute/canonical paths (macOS
         // fsevents always does) but root was passed as a relative path.
-        let root_path = std::fs::canonicalize(root.as_ref())
-            .unwrap_or_else(|_| root.as_ref().to_path_buf());
+        let root_path =
+            std::fs::canonicalize(root.as_ref()).unwrap_or_else(|_| root.as_ref().to_path_buf());
         let ignore = build_ignore(&root_path);
 
         let (tx, rx) = mpsc::channel::<Event>(buffer);
@@ -125,11 +127,13 @@ impl Watcher {
                     // .gitignore + .thothignore rules. The `ignore` crate
                     // panics if the path isn't under the gitignore root, so
                     // we guard with `strip_prefix` first.
-                    if let Some(gi) = ignore.as_ref() && path.strip_prefix(&root_path).is_ok() {
-                            let is_dir = path.is_dir();
-                            if gi.matched_path_or_any_parents(&path, is_dir).is_ignore() {
-                                continue;
-                            }
+                    if let Some(gi) = ignore.as_ref()
+                        && path.strip_prefix(&root_path).is_ok()
+                    {
+                        let is_dir = path.is_dir();
+                        if gi.matched_path_or_any_parents(&path, is_dir).is_ignore() {
+                            continue;
+                        }
                     }
 
                     let now = OffsetDateTime::now_utc();

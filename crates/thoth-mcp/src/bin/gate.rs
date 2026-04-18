@@ -517,17 +517,112 @@ fn defer_marker_fresh(root: &std::path::Path) -> bool {
 /// e.g. `fn`, `let`, `const`, `the`, `and`.
 const STOPWORDS: &[&str] = &[
     // English stopwords
-    "the", "and", "for", "a", "to", "of", "in", "is", "it", "as", "or", "be", "on", "at", "this",
-    "that", "an", "with", "from", "by", "but", "if", "are", "was", "were", "we", "you", "i", "they",
-    "he", "she", "them", "his", "her", "its", "our", "my", "your", "their", "all", "any", "some",
-    "no", "not", "so", "do", "does", "did", "has", "have", "had", "will", "would", "could",
-    "should", "may", "might", "can", "just", "only",
+    "the",
+    "and",
+    "for",
+    "a",
+    "to",
+    "of",
+    "in",
+    "is",
+    "it",
+    "as",
+    "or",
+    "be",
+    "on",
+    "at",
+    "this",
+    "that",
+    "an",
+    "with",
+    "from",
+    "by",
+    "but",
+    "if",
+    "are",
+    "was",
+    "were",
+    "we",
+    "you",
+    "i",
+    "they",
+    "he",
+    "she",
+    "them",
+    "his",
+    "her",
+    "its",
+    "our",
+    "my",
+    "your",
+    "their",
+    "all",
+    "any",
+    "some",
+    "no",
+    "not",
+    "so",
+    "do",
+    "does",
+    "did",
+    "has",
+    "have",
+    "had",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "can",
+    "just",
+    "only",
     // Code keywords (multi-language intersection)
-    "fn", "let", "const", "var", "if", "else", "return", "use", "mod", "struct", "impl", "pub",
-    "def", "class", "from", "import", "async", "await", "while", "loop", "match", "break",
-    "continue", "true", "false", "null", "none", "self", "this", "new", "type", "enum", "trait",
-    "interface", "public", "private", "protected", "static", "final", "abstract", "extends",
-    "implements", "func", "package", "module",
+    "fn",
+    "let",
+    "const",
+    "var",
+    "if",
+    "else",
+    "return",
+    "use",
+    "mod",
+    "struct",
+    "impl",
+    "pub",
+    "def",
+    "class",
+    "from",
+    "import",
+    "async",
+    "await",
+    "while",
+    "loop",
+    "match",
+    "break",
+    "continue",
+    "true",
+    "false",
+    "null",
+    "none",
+    "self",
+    "this",
+    "new",
+    "type",
+    "enum",
+    "trait",
+    "interface",
+    "public",
+    "private",
+    "protected",
+    "static",
+    "final",
+    "abstract",
+    "extends",
+    "implements",
+    "func",
+    "package",
+    "module",
 ];
 
 /// Tokenize an arbitrary text blob into a lowercased identifier set.
@@ -579,7 +674,9 @@ fn insert_token(out: &mut HashSet<String>, tok: &str) {
 
 fn has_camel_transition(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
-    chars.windows(2).any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+    chars
+        .windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
 }
 
 /// Split a CamelCase identifier into segments. Consecutive uppercase runs
@@ -712,7 +809,8 @@ fn recent_recalls(root: &Path, window_long_secs: u64) -> rusqlite::Result<Vec<Re
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let cutoff_ns: i64 = (now_unix_ns().saturating_sub(window_long_secs.saturating_mul(1_000_000_000))) as i64;
+    let cutoff_ns: i64 =
+        (now_unix_ns().saturating_sub(window_long_secs.saturating_mul(1_000_000_000))) as i64;
     let mut stmt = conn.prepare(
         "SELECT at_unix_ns, payload FROM episodes \
          WHERE kind = 'query_issued' AND at_unix_ns >= ?1 \
@@ -859,7 +957,11 @@ fn decide(
         policy,
         Decision {
             verdict: Verdict::Pass,
-            reason: if no_context { "no_edit_context" } else { "relevance_miss" },
+            reason: if no_context {
+                "no_edit_context"
+            } else {
+                "relevance_miss"
+            },
             recency_secs,
             best_score: Some(best_score),
             considered: recalls.len(),
@@ -1412,7 +1514,10 @@ mod tests {
 
     #[test]
     fn containment_min_denominator() {
-        let a: HashSet<String> = ["foo", "bar", "baz"].iter().map(|s| s.to_string()).collect();
+        let a: HashSet<String> = ["foo", "bar", "baz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let b: HashSet<String> = ["foo"].iter().map(|s| s.to_string()).collect();
         // |A ∩ B| = 1; min(|A|, |B|) = 1 → score 1.0 (short query fully covered).
         assert!((containment(&a, &b) - 1.0).abs() < 1e-9);
@@ -1492,7 +1597,10 @@ mod tests {
     #[test]
     fn edit_caps_at_edit_token_cap() {
         // Build a synthetic new_string with 500+ unique identifiers.
-        let many = (0..500).map(|i| format!("sym_{i}")).collect::<Vec<_>>().join(" ");
+        let many = (0..500)
+            .map(|i| format!("sym_{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let input = json!({ "file_path": "x.rs", "new_string": many });
         let toks = extract_edit_tokens("Edit", &input);
         assert!(toks.len() <= EDIT_TOKEN_CAP);
@@ -1500,12 +1608,7 @@ mod tests {
 
     // ---- decision ----
 
-    fn mk_policy(
-        mode: PolicyMode,
-        short: u64,
-        long: u64,
-        threshold: f64,
-    ) -> Policy {
+    fn mk_policy(mode: PolicyMode, short: u64, long: u64, threshold: f64) -> Policy {
         Policy {
             mode,
             window_short_secs: short,
@@ -1537,10 +1640,7 @@ mod tests {
     #[test]
     fn relevance_pass_when_score_ge_threshold() {
         let policy = mk_policy(PolicyMode::Strict, 10, 1800, 0.30);
-        let recalls = vec![mk_recall(
-            200,
-            "retriever bfs callers depth",
-        )];
+        let recalls = vec![mk_recall(200, "retriever bfs callers depth")];
         let edit: HashSet<String> = ["retriever", "bfs", "depth"]
             .iter()
             .map(|s| s.to_string())
@@ -1666,12 +1766,20 @@ reflect_debt_block = 3
             msg.contains("reflection debt"),
             "stderr should explain why: {msg}"
         );
-        assert!(msg.contains("THOTH_DEFER_REFLECT"), "stderr should mention bypass: {msg}");
+        assert!(
+            msg.contains("THOTH_DEFER_REFLECT"),
+            "stderr should mention bypass: {msg}"
+        );
         // No telemetry because the config above left telemetry_enabled at
         // its default (false).
-        assert!(telemetry.is_none(), "telemetry shouldn't fire when disabled");
+        assert!(
+            telemetry.is_none(),
+            "telemetry shouldn't fire when disabled"
+        );
 
-        unsafe { std::env::remove_var("THOTH_ROOT"); }
+        unsafe {
+            std::env::remove_var("THOTH_ROOT");
+        }
     }
 
     #[test]
@@ -1709,7 +1817,10 @@ reflect_debt_block = 3
         // With bypass set, the debt check doesn't fire — we fall through
         // to the recall-relevance path, which on an empty log under
         // nudge mode emits a nudge (not a block).
-        assert_ne!(verdict["decision"], "block", "bypass should prevent debt block: {verdict}");
+        assert_ne!(
+            verdict["decision"], "block",
+            "bypass should prevent debt block: {verdict}"
+        );
 
         unsafe {
             std::env::remove_var("THOTH_ROOT");
@@ -1748,7 +1859,9 @@ gate_window_secs = 180
         // Legacy window maps to short.
         assert_eq!(cfg.default_policy.window_short_secs, 180);
         // New fields default.
-        assert!((cfg.default_policy.relevance_threshold - DEFAULT_RELEVANCE_THRESHOLD).abs() < 1e-9);
+        assert!(
+            (cfg.default_policy.relevance_threshold - DEFAULT_RELEVANCE_THRESHOLD).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -1804,8 +1917,16 @@ gate_bash_readonly_prefixes = ["my-custom-tool "]
         .unwrap();
         let cfg = load_config(tmp.path());
         // Built-ins preserved.
-        assert!(cfg.bash_readonly_prefixes.iter().any(|p| p.starts_with("cargo test")));
+        assert!(
+            cfg.bash_readonly_prefixes
+                .iter()
+                .any(|p| p.starts_with("cargo test"))
+        );
         // Custom added.
-        assert!(cfg.bash_readonly_prefixes.iter().any(|p| p == "my-custom-tool "));
+        assert!(
+            cfg.bash_readonly_prefixes
+                .iter()
+                .any(|p| p == "my-custom-tool ")
+        );
     }
 }

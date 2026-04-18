@@ -22,11 +22,7 @@ use thoth_memory::background_review::{
 /// function checks `ANTHROPIC_API_KEY` and falls back to `claude` CLI.
 /// `model` is passed through to the backend (e.g. `claude-haiku-4-5`);
 /// empty string means "let the backend pick its default".
-pub async fn run_review(
-    root: &Path,
-    backend: &str,
-    model: &str,
-) -> anyhow::Result<ReviewReport> {
+pub async fn run_review(root: &Path, backend: &str, model: &str) -> anyhow::Result<ReviewReport> {
     // 1. Build context.
     let mut ctx = build_review_context(root)
         .await
@@ -42,8 +38,7 @@ pub async fn run_review(
     let response = call_backend(&prompt, backend, model).await?;
 
     // 5. Parse response.
-    let output =
-        parse_review_response(&response).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let output = parse_review_response(&response).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // 6. Persist.
     let report = persist_review(root, output)
@@ -83,7 +78,9 @@ fn resolve_backend(requested: &str) -> Backend {
         "api" => match std::env::var("ANTHROPIC_API_KEY") {
             Ok(k) if !k.is_empty() => Backend::Api(k),
             _ => {
-                tracing::warn!("background-review: api backend requested but ANTHROPIC_API_KEY not set, falling back to cli");
+                tracing::warn!(
+                    "background-review: api backend requested but ANTHROPIC_API_KEY not set, falling back to cli"
+                );
                 Backend::Cli
             }
         },
@@ -143,8 +140,7 @@ async fn call_cli(prompt: &str, model: &str) -> anyhow::Result<String> {
         bail!("claude CLI exited with {}: {stderr}", output.status);
     }
 
-    String::from_utf8(output.stdout)
-        .context("claude CLI output is not valid UTF-8")
+    String::from_utf8(output.stdout).context("claude CLI output is not valid UTF-8")
 }
 
 // ------------------------------------------------------- backend: Anthropic API
@@ -154,7 +150,11 @@ async fn call_api(prompt: &str, api_key: &str, model: &str) -> anyhow::Result<St
     let client = reqwest::Client::new();
     // Empty model string → fall back to the Haiku snapshot that
     // matches [`DisciplineConfig::default`].
-    let model = if model.is_empty() { "claude-haiku-4-5" } else { model };
+    let model = if model.is_empty() {
+        "claude-haiku-4-5"
+    } else {
+        model
+    };
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 1024,
@@ -179,8 +179,7 @@ async fn call_api(prompt: &str, api_key: &str, model: &str) -> anyhow::Result<St
         bail!("Anthropic API returned {status}: {text}");
     }
 
-    let json: serde_json::Value =
-        resp.json().await.context("failed to parse API response")?;
+    let json: serde_json::Value = resp.json().await.context("failed to parse API response")?;
 
     json.get("content")
         .and_then(|c| c.as_array())

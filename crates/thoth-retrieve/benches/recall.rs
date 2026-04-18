@@ -173,9 +173,7 @@ fn recall_benchmark(c: &mut Criterion) {
     });
 
     // Open the store once; StoreRoot is Arc-backed so clone() is cheap.
-    let store = rt
-        .block_on(StoreRoot::open(thoth_dir.path()))
-        .unwrap();
+    let store = rt.block_on(StoreRoot::open(thoth_dir.path())).unwrap();
 
     // --- benchmark group ---
     let mut group = c.benchmark_group("recall_latency");

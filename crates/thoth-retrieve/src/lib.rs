@@ -60,7 +60,9 @@ async fn cached_retrieve_config(root: &std::path::Path) -> RetrieveConfig {
     {
         let mut guard = cache.write().expect("RETRIEVE_CFG_CACHE poisoned");
         // Another task may have raced us — only insert if still absent.
-        guard.entry(root.to_path_buf()).or_insert_with(|| cfg.clone());
+        guard
+            .entry(root.to_path_buf())
+            .or_insert_with(|| cfg.clone());
     }
     cfg
 }

@@ -364,9 +364,7 @@ fn prompt_interactive(state: &InstallState) -> Result<SetupAnswers> {
     println!("Press enter to accept the highlighted default.\n");
 
     let mode_idx = Select::with_theme(&theme)
-        .with_prompt(
-            "Gate mode (nudge = warn on miss, strict = block on miss, off = disabled)",
-        )
+        .with_prompt("Gate mode (nudge = warn on miss, strict = block on miss, off = disabled)")
         .items(MODES)
         .default(0)
         .interact()?;
@@ -388,34 +386,34 @@ fn prompt_interactive(state: &InstallState) -> Result<SetupAnswers> {
 
     // Relevance-related knobs only matter when the gate isn't `off`.
     // Skip the prompts entirely in that case so the wizard stays short.
-    let (gate_window_short_secs, gate_window_long_secs, gate_relevance_threshold) =
-        if mode == "off" {
-            (
-                DEFAULT_WINDOW_SHORT_SECS,
-                DEFAULT_WINDOW_LONG_SECS,
-                DEFAULT_RELEVANCE_THRESHOLD,
+    let (gate_window_short_secs, gate_window_long_secs, gate_relevance_threshold) = if mode == "off"
+    {
+        (
+            DEFAULT_WINDOW_SHORT_SECS,
+            DEFAULT_WINDOW_LONG_SECS,
+            DEFAULT_RELEVANCE_THRESHOLD,
+        )
+    } else {
+        let short: u64 = Input::with_theme(&theme)
+            .with_prompt(
+                "Recency window in seconds (recall within this passes without relevance check)",
             )
-        } else {
-            let short: u64 = Input::with_theme(&theme)
-                .with_prompt(
-                    "Recency window in seconds (recall within this passes without relevance check)",
-                )
-                .default(DEFAULT_WINDOW_SHORT_SECS)
-                .interact_text()?;
-            let long: u64 = Input::with_theme(&theme)
-                .with_prompt(
-                    "Relevance pool window in seconds (how far back to search for a topical recall)",
-                )
-                .default(DEFAULT_WINDOW_LONG_SECS)
-                .interact_text()?;
-            let threshold: f64 = Input::with_theme(&theme)
-                .with_prompt(
-                    "Relevance threshold [0.0=off, 0.15=permissive, 0.30=balanced, 0.50=strict]",
-                )
-                .default(DEFAULT_RELEVANCE_THRESHOLD)
-                .interact_text()?;
-            (short, long, threshold.clamp(0.0, 1.0))
-        };
+            .default(DEFAULT_WINDOW_SHORT_SECS)
+            .interact_text()?;
+        let long: u64 = Input::with_theme(&theme)
+            .with_prompt(
+                "Relevance pool window in seconds (how far back to search for a topical recall)",
+            )
+            .default(DEFAULT_WINDOW_LONG_SECS)
+            .interact_text()?;
+        let threshold: f64 = Input::with_theme(&theme)
+            .with_prompt(
+                "Relevance threshold [0.0=off, 0.15=permissive, 0.30=balanced, 0.50=strict]",
+            )
+            .default(DEFAULT_RELEVANCE_THRESHOLD)
+            .interact_text()?;
+        (short, long, threshold.clamp(0.0, 1.0))
+    };
 
     let gate_telemetry_enabled = Confirm::with_theme(&theme)
         .with_prompt("Append every gate decision to .thoth/gate.jsonl? (useful for tuning)")
@@ -902,10 +900,22 @@ fn print_summary(root: &Path, a: &SetupAnswers) {
     println!("  watch.enabled            = {}", a.watch_enabled);
     println!("  background_review        = {}", a.background_review);
     if a.background_review {
-        println!("  background_review_interval = {}", a.background_review_interval);
-        println!("  background_review_min_secs = {}", a.background_review_min_secs);
-        println!("  background_review_backend  = {}", a.background_review_backend);
-        println!("  background_review_model    = {}", a.background_review_model);
+        println!(
+            "  background_review_interval = {}",
+            a.background_review_interval
+        );
+        println!(
+            "  background_review_min_secs = {}",
+            a.background_review_min_secs
+        );
+        println!(
+            "  background_review_backend  = {}",
+            a.background_review_backend
+        );
+        println!(
+            "  background_review_model    = {}",
+            a.background_review_model
+        );
     }
     println!("  ignore patterns          = {}", a.ignore.len());
 }

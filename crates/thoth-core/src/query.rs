@@ -448,7 +448,9 @@ mod tests {
     fn render_with_drops_tail_chunks_past_byte_budget() {
         // Ten chunks, each well-formed but chunky. A 1KiB budget should
         // cut off well before chunk 9.
-        let chunks: Vec<Chunk> = (0..10).map(|i| chunk_with_body(80, (i * 100 + 1) as u32)).collect();
+        let chunks: Vec<Chunk> = (0..10)
+            .map(|i| chunk_with_body(80, (i * 100 + 1) as u32))
+            .collect();
         let retrieval = Retrieval {
             chunks,
             synthesized: None,
@@ -471,7 +473,9 @@ mod tests {
 
     #[test]
     fn render_with_emits_every_chunk_when_budget_disabled() {
-        let chunks: Vec<Chunk> = (0..5).map(|i| chunk_with_body(5, (i * 10 + 1) as u32)).collect();
+        let chunks: Vec<Chunk> = (0..5)
+            .map(|i| chunk_with_body(5, (i * 10 + 1) as u32))
+            .collect();
         let retrieval = Retrieval {
             chunks,
             synthesized: None,

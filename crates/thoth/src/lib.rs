@@ -43,7 +43,7 @@ pub use thoth_core::{
 
 pub use thoth_memory::{MemoryConfig, MemoryManager, NudgeReport, WorkingMemory, WorkingNote};
 pub use thoth_parse::LanguageRegistry;
-pub use thoth_retrieve::{IndexProgress, IndexStats, Indexer, Retriever, RetrieveConfig};
+pub use thoth_retrieve::{IndexProgress, IndexStats, Indexer, RetrieveConfig, Retriever};
 pub use thoth_store::{StoreRoot, VectorStore};
 
 // --------------------------------------------------------------- CodeMemory

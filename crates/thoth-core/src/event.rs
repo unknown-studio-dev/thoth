@@ -102,18 +102,18 @@ impl Event {
                 synthesized,
                 ..
             } => {
-                format!(
-                    "{} chunks, synth={}",
-                    chunk_ids.len(),
-                    synthesized,
-                )
+                format!("{} chunks, synth={}", chunk_ids.len(), synthesized,)
             }
             Event::OutcomeObserved { outcome, .. } => match outcome {
                 Outcome::Test { passed, suite } => {
                     format!("test {suite}: {}", if *passed { "pass" } else { "FAIL" })
                 }
                 Outcome::Commit { sha, files } => {
-                    format!("commit {} ({} files)", &sha[..7.min(sha.len())], files.len())
+                    format!(
+                        "commit {} ({} files)",
+                        &sha[..7.min(sha.len())],
+                        files.len()
+                    )
                 }
                 Outcome::Revert { sha, .. } => format!("revert {}", &sha[..7.min(sha.len())]),
                 Outcome::UserFeedback { signal, note } => {

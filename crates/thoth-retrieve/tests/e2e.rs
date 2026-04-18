@@ -261,10 +261,7 @@ pub fn migration_runner() -> &'static str {
 
     let query = Query::text("database migrations sqlx prepare");
 
-    let baseline = Retriever::new(store.clone())
-        .recall(&query)
-        .await
-        .unwrap();
+    let baseline = Retriever::new(store.clone()).recall(&query).await.unwrap();
     let boosted = Retriever::new(store)
         .with_markdown_boost(2.0)
         .recall(&query)
@@ -389,7 +386,9 @@ impl Greet for English {
         .filter(|e| e.kind == thoth_graph::EdgeKind::Extends)
         .collect::<Vec<_>>();
     assert!(
-        extends.iter().any(|e| e.to == "Greet" || e.to == "greet::Greet"),
+        extends
+            .iter()
+            .any(|e| e.to == "Greet" || e.to == "greet::Greet"),
         "expected an Extends edge English -> Greet; got {extends:?}"
     );
 }

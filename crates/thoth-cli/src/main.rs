@@ -52,9 +52,9 @@ use thoth_store::markdown::MarkdownStore;
 use thoth_store::{StoreRoot, VectorStore};
 use tracing::warn;
 
+mod compact;
 mod daemon;
 mod hooks;
-mod compact;
 mod review;
 mod setup;
 
@@ -623,11 +623,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Cmd::Install { scope } => hooks::install_all(scope, &cli.root).await?,
         Cmd::Uninstall { scope } => hooks::uninstall_all(scope, &cli.root).await?,
-        Cmd::Eval {
-            gold,
-            top_k,
-            mode,
-        } => {
+        Cmd::Eval { gold, top_k, mode } => {
             cmd_eval(
                 &cli.root,
                 &gold,
@@ -650,9 +646,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Curate { quiet } => cmd_curate(&cli.root, quiet).await?,
         Cmd::Review { backend, model } => cmd_review(&cli.root, &backend, &model).await?,
-        Cmd::Compact { backend, model, dry_run } => {
-            cmd_compact(&cli.root, &backend, &model, dry_run).await?
-        }
+        Cmd::Compact {
+            backend,
+            model,
+            dry_run,
+        } => cmd_compact(&cli.root, &backend, &model, dry_run).await?,
         Cmd::Domain { cmd } => match cmd {
             DomainCmd::Sync {
                 source,
@@ -1246,10 +1244,7 @@ async fn cmd_watch(
 /// Log-only fallback for `thoth watch` when the MCP daemon holds the
 /// redb lock. Watches the filesystem and prints changes, but doesn't
 /// index — the daemon handles that.
-async fn cmd_watch_log_only(
-    src: &std::path::Path,
-    debounce: Duration,
-) -> anyhow::Result<()> {
+async fn cmd_watch_log_only(src: &std::path::Path, debounce: Duration) -> anyhow::Result<()> {
     let mut w = Watcher::watch(src, 1024)?;
     println!("… watching {} (log only, ctrl-c to stop)", src.display());
 
@@ -1730,8 +1725,14 @@ fn match_rank(gold: &GoldQuery, out: &thoth_core::Retrieval) -> usize {
     for (i, c) in out.chunks.iter().enumerate() {
         let p = c.path.to_string_lossy().to_lowercase();
         let body = format!("{} {}", c.preview, c.body).to_lowercase();
-        let path_ok = gold.expect_path.iter().any(|s| p.contains(&s.to_lowercase()));
-        let text_ok = gold.expect_text.iter().any(|s| body.contains(&s.to_lowercase()));
+        let path_ok = gold
+            .expect_path
+            .iter()
+            .any(|s| p.contains(&s.to_lowercase()));
+        let text_ok = gold
+            .expect_text
+            .iter()
+            .any(|s| body.contains(&s.to_lowercase()));
         if (!gold.expect_path.is_empty() && path_ok) || (!gold.expect_text.is_empty() && text_ok) {
             return i + 1;
         }
@@ -1760,7 +1761,11 @@ async fn cmd_eval(
     if want_full && embedder_kind.is_none() && synth_kind.is_none() {
         anyhow::bail!(
             "--mode {} requires --embedder and/or --synth (Mode::Full needs at least one provider)",
-            if mode == EvalMode::Full { "full" } else { "both" }
+            if mode == EvalMode::Full {
+                "full"
+            } else {
+                "both"
+            }
         );
     }
 
@@ -1778,7 +1783,11 @@ async fn cmd_eval(
         anyhow::bail!(
             "thoth-mcp daemon is running; stop it before running `thoth eval --mode {}` \
              (Mode::Full would fight for the redb exclusive lock)",
-            if mode == EvalMode::Full { "full" } else { "both" }
+            if mode == EvalMode::Full {
+                "full"
+            } else {
+                "both"
+            }
         );
     }
 
@@ -1809,13 +1818,8 @@ async fn cmd_eval(
             None
         };
         Some(
-            Retriever::with_full(
-                store.as_ref().unwrap().clone(),
-                vectors,
-                embedder,
-                synth,
-            )
-            .with_markdown_boost(retrieve_cfg.rerank_markdown_boost),
+            Retriever::with_full(store.as_ref().unwrap().clone(), vectors, embedder, synth)
+                .with_markdown_boost(retrieve_cfg.rerank_markdown_boost),
         )
     } else {
         None
@@ -1970,9 +1974,7 @@ async fn cmd_eval(
     // Non-zero exit if any active mode missed a query, so CI can gate on
     // eval regressions just like before — now across whichever mode(s)
     // were requested.
-    let any_miss = reports
-        .iter()
-        .any(|rep| rep.runs.iter().any(|r| !r.hit()));
+    let any_miss = reports.iter().any(|rep| rep.runs.iter().any(|r| !r.hit()));
     if any_miss {
         std::process::exit(1);
     }
@@ -2155,14 +2157,15 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
                     // touch any episode is still a finding worth
                     // surfacing. Suppress entirely when all four are
                     // zero to match the daemon path's no-op silence.
-                    let total = r.episodes_ttl
-                        + r.episodes_cap
-                        + r.lessons_dropped
-                        + r.lessons_quarantined;
+                    let total =
+                        r.episodes_ttl + r.episodes_cap + r.lessons_dropped + r.lessons_quarantined;
                     if total > 0 {
                         Some(format!(
                             "forget pass: episodes_ttl={} episodes_cap={} lessons_dropped={} lessons_quarantined={}",
-                            r.episodes_ttl, r.episodes_cap, r.lessons_dropped, r.lessons_quarantined
+                            r.episodes_ttl,
+                            r.episodes_cap,
+                            r.lessons_dropped,
+                            r.lessons_quarantined
                         ))
                     } else {
                         None
@@ -2245,7 +2248,10 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
 
     if findings.is_empty() {
         if !quiet {
-            println!("curate: nothing to flag (debt={}, no TTL work)", debt.debt());
+            println!(
+                "curate: nothing to flag (debt={}, no TTL work)",
+                debt.debt()
+            );
         }
         return Ok(());
     }
@@ -2257,11 +2263,7 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_review(
-    root: &std::path::Path,
-    backend: &str,
-    model: &str,
-) -> anyhow::Result<()> {
+async fn cmd_review(root: &std::path::Path, backend: &str, model: &str) -> anyhow::Result<()> {
     if !root.exists() {
         println!("(no .thoth/ at {} — nothing to review)", root.display());
         return Ok(());

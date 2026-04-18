@@ -56,8 +56,8 @@ impl Server {
         let store = StoreRoot::open(&root).await?;
         let indexer = Indexer::new(store.clone(), LanguageRegistry::new());
         let retrieve_cfg = RetrieveConfig::load_or_default(&root).await;
-        let retriever = Retriever::new(store.clone())
-            .with_markdown_boost(retrieve_cfg.rerank_markdown_boost);
+        let retriever =
+            Retriever::new(store.clone()).with_markdown_boost(retrieve_cfg.rerank_markdown_boost);
         let graph = thoth_graph::Graph::new(store.kv.clone());
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1076,9 +1076,9 @@ impl Server {
             "up" | "callers" | "incoming" => thoth_graph::BlastDir::Up,
             "down" | "callees" | "outgoing" => thoth_graph::BlastDir::Down,
             "both" => thoth_graph::BlastDir::Both,
-            other => anyhow::bail!(
-                "invalid direction {other:?}; expected one of: up | down | both"
-            ),
+            other => {
+                anyhow::bail!("invalid direction {other:?}; expected one of: up | down | both")
+            }
         };
 
         // Confirm the symbol exists so the caller gets a clear error
@@ -1107,10 +1107,9 @@ impl Server {
         // nodes per file, ordered by hit density, so the caller sees
         // the tightly-coupled subsystems at a glance. Structured `data`
         // (JSON) is unchanged — the cap is text-surface only.
-        let output_cfg =
-            thoth_retrieve::OutputConfig::load_or_default(&self.inner.root).await;
-        let group_by_file = output_cfg.impact_group_threshold > 0
-            && hits.len() > output_cfg.impact_group_threshold;
+        let output_cfg = thoth_retrieve::OutputConfig::load_or_default(&self.inner.root).await;
+        let group_by_file =
+            output_cfg.impact_group_threshold > 0 && hits.len() > output_cfg.impact_group_threshold;
 
         let mut text = format!(
             "impact({fqn}, direction={}, depth={depth}) — {} nodes{}\n",
@@ -1140,18 +1139,13 @@ impl Server {
                     by_file.entry(n.path.clone()).or_default().push(*n);
                 }
                 let mut ordered: Vec<_> = by_file.into_iter().collect();
-                ordered.sort_by(|(pa, a), (pb, b)| {
-                    b.len().cmp(&a.len()).then_with(|| pa.cmp(pb))
-                });
+                ordered.sort_by(|(pa, a), (pb, b)| b.len().cmp(&a.len()).then_with(|| pa.cmp(pb)));
                 for (path, bucket) in ordered {
                     // Show up to 3 example FQNs per file so the user
                     // can drill in; more than that is the same noise
                     // the grouping was meant to avoid.
-                    let examples: Vec<&str> = bucket
-                        .iter()
-                        .take(3)
-                        .map(|n| n.fqn.as_str())
-                        .collect();
+                    let examples: Vec<&str> =
+                        bucket.iter().take(3).map(|n| n.fqn.as_str()).collect();
                     let ellipsis = if bucket.len() > examples.len() {
                         format!(", … +{} more", bucket.len() - examples.len())
                     } else {
@@ -1168,12 +1162,7 @@ impl Server {
                 }
             } else {
                 for n in nodes {
-                    text.push_str(&format!(
-                        "    {}  {}:{}\n",
-                        n.fqn,
-                        n.path.display(),
-                        n.line
-                    ));
+                    text.push_str(&format!("    {}  {}:{}\n", n.fqn, n.path.display(), n.line));
                 }
             }
         }
@@ -1234,9 +1223,7 @@ impl Server {
         let mut extends = g
             .out_neighbors(&fqn, thoth_graph::EdgeKind::Extends)
             .await?;
-        let mut extended_by = g
-            .in_neighbors(&fqn, thoth_graph::EdgeKind::Extends)
-            .await?;
+        let mut extended_by = g.in_neighbors(&fqn, thoth_graph::EdgeKind::Extends).await?;
         let mut references = g
             .in_neighbors(&fqn, thoth_graph::EdgeKind::References)
             .await?;
@@ -1430,8 +1417,7 @@ impl Server {
             impact_seen.remove(fqn);
         }
 
-        let mut impact_vec: Vec<(thoth_graph::Node, usize)> =
-            impact_seen.into_values().collect();
+        let mut impact_vec: Vec<(thoth_graph::Node, usize)> = impact_seen.into_values().collect();
         impact_vec.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.fqn.cmp(&b.0.fqn)));
 
         let node_json = |n: &thoth_graph::Node| {
@@ -1462,12 +1448,7 @@ impl Server {
         );
         text.push_str("touched:\n");
         for n in touched.values() {
-            text.push_str(&format!(
-                "  {}  {}:{}\n",
-                n.fqn,
-                n.path.display(),
-                n.line
-            ));
+            text.push_str(&format!("  {}  {}:{}\n", n.fqn, n.path.display(), n.line));
         }
         if !impact_vec.is_empty() {
             text.push_str("impact (depth / fqn / location):\n");
@@ -1508,11 +1489,7 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffHunk> {
     let mut current_path: Option<String> = None;
     let mut current_ranges: Vec<(u32, u32)> = Vec::new();
 
-    fn flush(
-        out: &mut Vec<DiffHunk>,
-        path: &mut Option<String>,
-        ranges: &mut Vec<(u32, u32)>,
-    ) {
+    fn flush(out: &mut Vec<DiffHunk>, path: &mut Option<String>, ranges: &mut Vec<(u32, u32)>) {
         if let Some(p) = path.take() {
             if !ranges.is_empty() {
                 out.push(DiffHunk {
@@ -2102,7 +2079,11 @@ async fn run_watcher(
             if let Err(e) = inner.indexer.commit().await {
                 warn!(error = %e, "watcher: fts commit failed");
             }
-            debug!(changed = changed_n, deleted = deleted_n, "watcher: reindexed");
+            debug!(
+                changed = changed_n,
+                deleted = deleted_n,
+                "watcher: reindexed"
+            );
         }
     }
     Ok(())
