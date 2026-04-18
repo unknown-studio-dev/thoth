@@ -25,6 +25,10 @@ use serde_json::Value;
 
 use crate::hooks;
 
+/// Embedded seed body for `USER.md` — personal preferences/style file.
+/// Written once on first setup; never overwritten.
+const USER_MD_TEMPLATE: &str = include_str!("../assets/USER.md.template");
+
 // Public knob keys — kept in sync with `DisciplineConfig` and the gate
 // binary's `PolicyMode` parser. `nudge` is the default (pass on miss +
 // stderr warning); `strict` blocks; `off` disables the gate entirely.
@@ -582,6 +586,16 @@ fn render_toml(a: &SetupAnswers) -> String {
          episodic_ttl_days = 30\n\
          # Let the agent run `thoth.nudge` proactively (Mode::Full).\n\
          enable_nudge      = true\n\
+         # Byte caps for the three durable memory files. Writes that would\n\
+         # push a file past its cap are rejected with a structured error;\n\
+         # the agent is expected to curate (forget/compact) before retrying.\n\
+         cap_memory_bytes       = 3072\n\
+         cap_user_bytes         = 1536\n\
+         cap_lessons_bytes      = 5120\n\
+         # Strict content policy — when true, REQ-12 violations (e.g.\n\
+         # session-handoff prose, path-only entries) are hard-rejected.\n\
+         # Default false: policy is warn-only.\n\
+         strict_content_policy  = false\n\
          \n\
          [discipline]\n\
          # Master switch — flip to `false` to disable the gate entirely.\n\
@@ -751,6 +765,12 @@ async fn seed_markdown(root: &Path) -> Result<()> {
         tokio::fs::write(&lessons, "# LESSONS.md\n")
             .await
             .with_context(|| format!("write {}", lessons.display()))?;
+    }
+    let user = root.join("USER.md");
+    if !user.exists() {
+        tokio::fs::write(&user, USER_MD_TEMPLATE)
+            .await
+            .with_context(|| format!("write {}", user.display()))?;
     }
     Ok(())
 }
@@ -934,4 +954,43 @@ fn print_final_message(root: &Path, reconfigured: bool) {
     println!("  2. thoth index .              # build the code index");
     println!();
     println!("Re-run `thoth setup` any time to reconfigure or repair the install.");
+}
+
+// ------------------------------------------------------------------ tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn setup_creates_user_md_seed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        seed_markdown(root).await.expect("seed_markdown");
+
+        let user = root.join("USER.md");
+        assert!(user.exists(), "USER.md should be created");
+        let body = tokio::fs::read_to_string(&user).await.expect("read USER.md");
+        assert!(body.contains("# USER.md"), "USER.md header missing");
+        assert!(
+            body.contains("preferences") || body.contains("first-person"),
+            "seed should mention preferences"
+        );
+
+        // Idempotent: existing USER.md is not overwritten.
+        tokio::fs::write(&user, "# custom\n").await.unwrap();
+        seed_markdown(root).await.expect("second seed");
+        let after = tokio::fs::read_to_string(&user).await.unwrap();
+        assert_eq!(after, "# custom\n", "existing USER.md must be preserved");
+    }
+
+    #[test]
+    fn render_toml_includes_memory_caps_and_policy() {
+        let toml = render_toml(&SetupAnswers::default());
+        assert!(toml.contains("cap_memory_bytes       = 3072"));
+        assert!(toml.contains("cap_user_bytes         = 1536"));
+        assert!(toml.contains("cap_lessons_bytes      = 5120"));
+        assert!(toml.contains("strict_content_policy  = false"));
+    }
 }
