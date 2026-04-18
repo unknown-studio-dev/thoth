@@ -223,14 +223,12 @@ pub fn check_content_policy(text: &str) -> Option<&'static str> {
     let lower = trimmed.to_ascii_lowercase();
     // Rule (a): session handoff.
     // Matches `Session 20YY-MM-DD shipped…` at the start of the entry.
-    if lower.starts_with("session ") {
-        let rest = &lower["session ".len()..];
-        if rest.len() >= 10
-            && is_iso_date_prefix(rest)
-            && rest[10..].trim_start().starts_with("shipped")
-        {
-            return Some("session_handoff");
-        }
+    if let Some(rest) = lower.strip_prefix("session ")
+        && rest.len() >= 10
+        && is_iso_date_prefix(rest)
+        && rest[10..].trim_start().starts_with("shipped")
+    {
+        return Some("session_handoff");
     }
     // For the short-input rules we exempt inputs that carry a reusable
     // invariant keyword.

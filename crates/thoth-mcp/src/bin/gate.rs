@@ -465,7 +465,7 @@ fn classify_intent(tool_name: &str, tool_input: &Value, readonly_prefixes: &[Str
         // the agent can clean up memory under a debt lockdown.
         name if name.starts_with("mcp__") => {
             let tail = name.rsplit("__").next().unwrap_or(name);
-            if DEFAULT_MCP_TOOL_READONLY.iter().any(|t| *t == tail) {
+            if DEFAULT_MCP_TOOL_READONLY.contains(&tail) {
                 Intent::ReadOnly
             } else {
                 Intent::Ignored
