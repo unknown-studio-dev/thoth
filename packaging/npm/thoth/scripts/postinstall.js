@@ -16,7 +16,6 @@ const REPO = "unknown-studio-dev/thoth";
 
 const TRIPLES = {
   "darwin-arm64": "aarch64-apple-darwin",
-  "darwin-x64":   "x86_64-apple-darwin",
   "linux-arm64":  "aarch64-unknown-linux-gnu",
   "linux-x64":    "x86_64-unknown-linux-gnu",
 };

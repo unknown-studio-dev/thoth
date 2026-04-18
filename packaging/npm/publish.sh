@@ -28,7 +28,6 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # (platform, triple, os, cpu)
 platforms=(
   "darwin-arm64:aarch64-apple-darwin:darwin:arm64"
-  "darwin-x64:x86_64-apple-darwin:darwin:x64"
   "linux-arm64:aarch64-unknown-linux-gnu:linux:arm64"
   "linux-x64:x86_64-unknown-linux-gnu:linux:x64"
 )

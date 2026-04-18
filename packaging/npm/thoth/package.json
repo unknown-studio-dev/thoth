@@ -30,7 +30,6 @@
   },
   "optionalDependencies": {
     "@unknownstudio/thoth-darwin-arm64": "0.0.1",
-    "@unknownstudio/thoth-darwin-x64":   "0.0.1",
     "@unknownstudio/thoth-linux-arm64":  "0.0.1",
     "@unknownstudio/thoth-linux-x64":    "0.0.1"
   },

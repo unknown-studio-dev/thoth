@@ -32,7 +32,6 @@ HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
 case "$HOST_OS-$HOST_ARCH" in
   Darwin-arm64)   TRIPLE="aarch64-apple-darwin";       PLAT="darwin-arm64"; OS="darwin"; CPU="arm64" ;;
-  Darwin-x86_64)  TRIPLE="x86_64-apple-darwin";        PLAT="darwin-x64";   OS="darwin"; CPU="x64"   ;;
   Linux-aarch64)  TRIPLE="aarch64-unknown-linux-gnu";  PLAT="linux-arm64";  OS="linux";  CPU="arm64" ;;
   Linux-x86_64)   TRIPLE="x86_64-unknown-linux-gnu";   PLAT="linux-x64";    OS="linux";  CPU="x64"   ;;
   *) echo "unsupported host: $HOST_OS-$HOST_ARCH" >&2; exit 1 ;;
