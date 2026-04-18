@@ -162,6 +162,32 @@ impl MarkdownStore {
             .collect())
     }
 
+    /// Multi-token variant of [`Self::grep_facts`]: reads the file **once**
+    /// and returns every fact that matches at least one needle.
+    ///
+    /// This is O(file_size + N) instead of O(N * file_size) when the caller
+    /// has N tokens to match. The returned facts are in disk order; duplicates
+    /// are impossible because each fact is tested against all needles in a
+    /// single pass.
+    pub async fn grep_facts_multi(&self, needles: &[impl AsRef<str>]) -> Result<Vec<Fact>> {
+        if needles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lowered: Vec<String> = needles.iter().map(|n| n.as_ref().to_lowercase()).collect();
+        let all = self.read_facts().await?;
+        Ok(all
+            .into_iter()
+            .filter(|f| {
+                let text_lc = f.text.to_lowercase();
+                let tags_lc: Vec<String> = f.tags.iter().map(|t| t.to_lowercase()).collect();
+                lowered.iter().any(|needle| {
+                    text_lc.contains(needle.as_str())
+                        || tags_lc.iter().any(|t| t.contains(needle.as_str()))
+                })
+            })
+            .collect())
+    }
+
     /// Append a fact to `MEMORY.md`. File is created if missing.
     ///
     /// Also writes an `op = "append"` entry to `memory-history.jsonl` so
@@ -215,6 +241,28 @@ impl MarkdownStore {
             .filter(|l| {
                 l.trigger.to_lowercase().contains(&needle)
                     || l.advice.to_lowercase().contains(&needle)
+            })
+            .collect())
+    }
+
+    /// Multi-token variant of [`Self::grep_lessons`]: reads the file **once**
+    /// and returns every lesson that matches at least one needle.
+    ///
+    /// Same O(file_size + N) guarantee as [`Self::grep_facts_multi`].
+    pub async fn grep_lessons_multi(&self, needles: &[impl AsRef<str>]) -> Result<Vec<Lesson>> {
+        if needles.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lowered: Vec<String> = needles.iter().map(|n| n.as_ref().to_lowercase()).collect();
+        let all = self.read_lessons().await?;
+        Ok(all
+            .into_iter()
+            .filter(|l| {
+                let trigger_lc = l.trigger.to_lowercase();
+                let advice_lc = l.advice.to_lowercase();
+                lowered.iter().any(|needle| {
+                    trigger_lc.contains(needle.as_str()) || advice_lc.contains(needle.as_str())
+                })
             })
             .collect())
     }
@@ -905,4 +953,170 @@ async fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---- tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod single_pass_grep_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use thoth_core::{Fact, Lesson, MemoryKind, MemoryMeta};
+
+    async fn open_store() -> (TempDir, MarkdownStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        (dir, store)
+    }
+
+    fn make_fact(text: &str, tags: &[&str]) -> Fact {
+        Fact {
+            meta: MemoryMeta::new(MemoryKind::Semantic),
+            text: text.to_string(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn make_lesson(trigger: &str, advice: &str) -> Lesson {
+        Lesson {
+            meta: MemoryMeta::new(MemoryKind::Reflective),
+            trigger: trigger.to_string(),
+            advice: advice.to_string(),
+            success_count: 0,
+            failure_count: 0,
+        }
+    }
+
+    /// REQ-05: grep_facts_multi returns correct results for multiple tokens.
+    #[tokio::test]
+    async fn grep_facts_multi_returns_correct_results() {
+        let (_dir, store) = open_store().await;
+        store
+            .append_fact(&make_fact("auth uses JWT tokens", &["auth", "jwt"]))
+            .await
+            .unwrap();
+        store
+            .append_fact(&make_fact("db uses postgres", &["db", "postgres"]))
+            .await
+            .unwrap();
+        store
+            .append_fact(&make_fact("cache uses redis", &["cache", "redis"]))
+            .await
+            .unwrap();
+
+        // Search for two tokens that each match one distinct fact.
+        let results = store.grep_facts_multi(&["jwt", "postgres"]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        let texts: Vec<&str> = results.iter().map(|f| f.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("JWT")),
+            "expected JWT fact in results"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("postgres")),
+            "expected postgres fact in results"
+        );
+    }
+
+    /// REQ-05: no duplicate entries when multiple tokens match the same fact.
+    #[tokio::test]
+    async fn grep_facts_multi_no_duplicates_when_multiple_tokens_match() {
+        let (_dir, store) = open_store().await;
+        // This fact contains both "auth" and "jwt".
+        store
+            .append_fact(&make_fact("auth uses JWT tokens", &["auth", "jwt"]))
+            .await
+            .unwrap();
+
+        // Both tokens match the same fact — should appear only once.
+        let results = store.grep_facts_multi(&["auth", "jwt"]).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "fact matched by two tokens must appear only once"
+        );
+    }
+
+    /// REQ-05: empty tokens list returns empty results.
+    #[tokio::test]
+    async fn grep_facts_multi_empty_needles_returns_empty() {
+        let (_dir, store) = open_store().await;
+        store
+            .append_fact(&make_fact("auth uses JWT", &[]))
+            .await
+            .unwrap();
+
+        let empty: &[&str] = &[];
+        let results = store.grep_facts_multi(empty).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "empty needle list must return empty results"
+        );
+    }
+
+    /// REQ-06: grep_lessons_multi returns correct results for multiple tokens.
+    #[tokio::test]
+    async fn grep_lessons_multi_returns_correct_results() {
+        let (_dir, store) = open_store().await;
+        store
+            .append_lesson(&make_lesson("when editing migrations", "run sqlx prepare"))
+            .await
+            .unwrap();
+        store
+            .append_lesson(&make_lesson("when adding indexes", "analyze query plans"))
+            .await
+            .unwrap();
+        store
+            .append_lesson(&make_lesson("when using caches", "set explicit TTLs"))
+            .await
+            .unwrap();
+
+        let results = store
+            .grep_lessons_multi(&["migrations", "caches"])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        let triggers: Vec<&str> = results.iter().map(|l| l.trigger.as_str()).collect();
+        assert!(triggers.iter().any(|t| t.contains("migrations")));
+        assert!(triggers.iter().any(|t| t.contains("caches")));
+    }
+
+    /// REQ-06: no duplicate lessons when multiple tokens match the same lesson.
+    #[tokio::test]
+    async fn grep_lessons_multi_no_duplicates_when_multiple_tokens_match() {
+        let (_dir, store) = open_store().await;
+        // trigger and advice both contain matchable tokens.
+        store
+            .append_lesson(&make_lesson(
+                "when editing sql migrations",
+                "run sqlx prepare",
+            ))
+            .await
+            .unwrap();
+
+        // "sql" matches trigger, "sqlx" matches advice — same lesson, one result.
+        let results = store.grep_lessons_multi(&["sql", "sqlx"]).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "lesson matched by two tokens must appear only once"
+        );
+    }
+
+    /// REQ-06: empty tokens list returns empty results for lessons too.
+    #[tokio::test]
+    async fn grep_lessons_multi_empty_needles_returns_empty() {
+        let (_dir, store) = open_store().await;
+        store
+            .append_lesson(&make_lesson("when editing migrations", "run sqlx prepare"))
+            .await
+            .unwrap();
+
+        let empty: &[&str] = &[];
+        let results = store.grep_lessons_multi(empty).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "empty needle list must return empty results"
+        );
+    }
 }

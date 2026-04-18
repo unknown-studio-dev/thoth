@@ -579,3 +579,61 @@ impl KvStore {
 fn store<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
+
+// ---- tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod prefix_scan_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn make_symbol(fqn: &str) -> SymbolRow {
+        SymbolRow {
+            fqn: fqn.to_string(),
+            path: PathBuf::from("/fake/path.rs"),
+            start_line: 1,
+            end_line: 10,
+            kind: "function".to_string(),
+        }
+    }
+
+    async fn open_store() -> (TempDir, KvStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("kv.redb");
+        let store = KvStore::open(&db_path).await.unwrap();
+        (dir, store)
+    }
+
+    /// REQ-02: prefix_scan_early_exit — `symbols_with_prefix` must stop as
+    /// soon as the sorted key range exits the prefix, returning only foo:*
+    /// keys when bar:* keys are also present.
+    #[tokio::test]
+    async fn prefix_scan_early_exit() {
+        let (_dir, store) = open_store().await;
+
+        // Insert keys in a mix of prefixes; redb stores them sorted by key.
+        for key in &["foo:1", "foo:2", "foo:3", "bar:1", "bar:2"] {
+            store.put_symbol(make_symbol(key)).await.unwrap();
+        }
+
+        let results = store.symbols_with_prefix("foo:").await.unwrap();
+
+        // Only foo: keys must be returned — no bar: keys.
+        for row in &results {
+            assert!(
+                row.fqn.starts_with("foo:"),
+                "unexpected key in results: {}",
+                row.fqn
+            );
+        }
+
+        // Exactly 3 results (foo:1, foo:2, foo:3).
+        assert_eq!(
+            results.len(),
+            3,
+            "expected 3 foo: keys, got {}",
+            results.len()
+        );
+    }
+}
