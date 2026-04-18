@@ -159,6 +159,151 @@ pub struct CapExceededError {
     pub hint: String,
 }
 
+/// REQ-12: structured error surfaced when an append is rejected because the
+/// input looks like a session handoff / commit-sha-only / bare-date-only /
+/// path-only fact (the same classes the compact prompt DROPs — see
+/// DESIGN-SPEC §REQ-08). Only produced when
+/// [`MemoryConfig::strict_content_policy`] is true; otherwise this crate
+/// emits a `tracing::warn!` and still performs the append.
+#[derive(Debug, serde::Serialize)]
+pub struct ContentPolicyError {
+    /// Which markdown surface the rejected write targeted.
+    pub kind: MemoryKind,
+    /// Machine-readable reason, e.g. "session_handoff", "commit_sha_only",
+    /// "date_only", "path_only".
+    pub reason: &'static str,
+    /// First ~120 chars of the offending input — lets the agent rewrite.
+    pub offending_first_line: String,
+    /// Hint the agent can surface to the user.
+    pub hint: &'static str,
+}
+
+/// Union error for the REQ-12 guarded append entry points — either the
+/// content policy rejected the input, or the cap guard rejected it.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind_of_error", rename_all = "snake_case")]
+pub enum GuardedAppendError {
+    /// REQ-12: strict content policy rejected the input.
+    ContentPolicy(ContentPolicyError),
+    /// REQ-03: hard-cap enforcement rejected the write.
+    CapExceeded(CapExceededError),
+}
+
+impl From<CapExceededError> for GuardedAppendError {
+    fn from(e: CapExceededError) -> Self {
+        GuardedAppendError::CapExceeded(e)
+    }
+}
+
+impl From<ContentPolicyError> for GuardedAppendError {
+    fn from(e: ContentPolicyError) -> Self {
+        GuardedAppendError::ContentPolicy(e)
+    }
+}
+
+/// REQ-12: classify a free-form `text` input against the three DROP patterns
+/// the compact prompt (DESIGN-SPEC §REQ-08) uses. Returns `None` when the
+/// input is acceptable, or a machine-readable reason code otherwise:
+///
+/// - `"session_handoff"` — starts with `Session <ISO-date> shipped…`
+/// - `"commit_sha_only"` — consists only of a 7-40 hex-char sha with no
+///   reusable invariant keyword
+/// - `"date_only"` — consists only of a bare ISO date `20\d{2}-\d{2}-\d{2}`
+/// - `"path_only"` — is a single file path like `crate/src/x.rs` with no
+///   invariant keyword
+///
+/// An "invariant keyword" (one of `always`, `must`, `never`, `because`,
+/// `so that`) exempts short inputs from the commit/date/path rules — those
+/// are the signals that a short fact *does* encode reusable structure.
+pub fn check_content_policy(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // Rule (a): session handoff.
+    // Matches `Session 20YY-MM-DD shipped…` at the start of the entry.
+    if lower.starts_with("session ") {
+        let rest = &lower["session ".len()..];
+        if rest.len() >= 10
+            && is_iso_date_prefix(rest)
+            && rest[10..].trim_start().starts_with("shipped")
+        {
+            return Some("session_handoff");
+        }
+    }
+    // For the short-input rules we exempt inputs that carry a reusable
+    // invariant keyword.
+    let has_invariant = ["always", "must", "never", "because", "so that"]
+        .iter()
+        .any(|kw| lower.contains(kw));
+    if has_invariant {
+        return None;
+    }
+    // Rule (b-sha): commit-sha-only — content (sans whitespace/punct) is a
+    // single 7-40 hex token.
+    let stripped: String = trimmed
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '.' && *c != ',' && *c != ':')
+        .collect();
+    let sha_len_ok = (7..=40).contains(&stripped.len());
+    let all_hex = !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_hexdigit());
+    // Must include at least one letter a-f to rule out pure numbers (e.g.
+    // "12345678" should not count as a commit sha).
+    let has_alpha = stripped.chars().any(|c| c.is_ascii_alphabetic());
+    if sha_len_ok && all_hex && has_alpha {
+        return Some("commit_sha_only");
+    }
+    // Rule (b-date): bare ISO date.
+    if trimmed.len() <= 32 && contains_only_iso_date(trimmed) {
+        return Some("date_only");
+    }
+    // Rule (c): path-only — single token that looks like a file path and has
+    // no surrounding prose.
+    if !trimmed.contains(' ') && trimmed.contains('/') && trimmed.contains('.') {
+        return Some("path_only");
+    }
+    None
+}
+
+fn truncate_first_line(text: &str) -> String {
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if first.chars().count() <= 120 {
+        first.to_string()
+    } else {
+        first.chars().take(120).collect::<String>() + "…"
+    }
+}
+
+fn is_iso_date_prefix(s: &str) -> bool {
+    // Expect `20YY-MM-DD...` (already lowercased upstream).
+    let b = s.as_bytes();
+    b.len() >= 10
+        && b[0] == b'2'
+        && b[1] == b'0'
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
+}
+
+fn contains_only_iso_date(s: &str) -> bool {
+    // The entry is "bare date" when stripping punctuation/whitespace leaves
+    // just the 8 digits of an ISO date.
+    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 8 {
+        return false;
+    }
+    // And the original string actually matches the YYYY-MM-DD shape somewhere.
+    s.as_bytes()
+        .windows(10)
+        .any(|w| is_iso_date_prefix(std::str::from_utf8(w).unwrap_or("")))
+}
+
 /// Preview row describing one entry in a markdown memory file. Used inside
 /// [`CapExceededError::entries`] and by the read-side `preview` API.
 #[derive(Debug, serde::Serialize)]
@@ -1171,6 +1316,40 @@ pub trait MarkdownStoreMemoryExt {
         cap: usize,
     ) -> std::result::Result<(), CapExceededError>;
 
+    /// REQ-12: [`MarkdownStoreMemoryExt::append_fact_capped`] + content
+    /// policy gate. When `strict` is `false` (the default — matches
+    /// `MemoryConfig::strict_content_policy = false`), a policy violation is
+    /// logged via `tracing::warn!` and the write still proceeds. When
+    /// `strict` is `true`, the write is rejected with
+    /// [`GuardedAppendError::ContentPolicy`] and the file is untouched.
+    async fn append_fact_guarded(
+        &self,
+        f: &thoth_core::Fact,
+        cap: usize,
+        strict: bool,
+    ) -> std::result::Result<(), GuardedAppendError>;
+
+    /// REQ-12: [`MarkdownStoreMemoryExt::append_lesson_capped`] + content
+    /// policy gate. See [`MarkdownStoreMemoryExt::append_fact_guarded`] for
+    /// the strict/warn semantics.
+    async fn append_lesson_guarded(
+        &self,
+        l: &thoth_core::Lesson,
+        cap: usize,
+        strict: bool,
+    ) -> std::result::Result<(), GuardedAppendError>;
+
+    /// REQ-12: [`MarkdownStoreMemoryExt::append_preference`] + content
+    /// policy gate. See [`MarkdownStoreMemoryExt::append_fact_guarded`] for
+    /// the strict/warn semantics.
+    async fn append_preference_guarded(
+        &self,
+        text: &str,
+        tags: &[String],
+        cap: usize,
+        strict: bool,
+    ) -> std::result::Result<(), GuardedAppendError>;
+
     /// Replace the single entry matching `query` with `new_text`. Returns
     /// the index of the entry that was replaced. Writes a `.bak-<unix>`
     /// snapshot before mutating.
@@ -1326,6 +1505,84 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
             });
         }
         Ok(())
+    }
+
+    async fn append_fact_guarded(
+        &self,
+        f: &thoth_core::Fact,
+        cap: usize,
+        strict: bool,
+    ) -> std::result::Result<(), GuardedAppendError> {
+        if let Some(reason) = check_content_policy(&f.text) {
+            if strict {
+                return Err(GuardedAppendError::ContentPolicy(ContentPolicyError {
+                    kind: MemoryKind::Fact,
+                    reason,
+                    offending_first_line: truncate_first_line(&f.text),
+                    hint: "strict_content_policy: rewrite the entry as a reusable invariant, or disable [memory].strict_content_policy",
+                }));
+            }
+            tracing::warn!(
+                reason = reason,
+                first_line = %truncate_first_line(&f.text),
+                "append_fact: content policy violation (warn-only; enable [memory].strict_content_policy to block)",
+            );
+        }
+        self.append_fact_capped(f, cap).await.map_err(Into::into)
+    }
+
+    async fn append_lesson_guarded(
+        &self,
+        l: &thoth_core::Lesson,
+        cap: usize,
+        strict: bool,
+    ) -> std::result::Result<(), GuardedAppendError> {
+        // Lesson content = trigger + " => " + advice; check the concatenation
+        // so "Session 2025-..." as a trigger is still caught.
+        let composite = format!("{} => {}", l.trigger, l.advice);
+        if let Some(reason) = check_content_policy(&composite) {
+            if strict {
+                return Err(GuardedAppendError::ContentPolicy(ContentPolicyError {
+                    kind: MemoryKind::Lesson,
+                    reason,
+                    offending_first_line: truncate_first_line(&composite),
+                    hint: "strict_content_policy: rewrite the lesson as a reusable invariant, or disable [memory].strict_content_policy",
+                }));
+            }
+            tracing::warn!(
+                reason = reason,
+                first_line = %truncate_first_line(&composite),
+                "append_lesson: content policy violation (warn-only; enable [memory].strict_content_policy to block)",
+            );
+        }
+        self.append_lesson_capped(l, cap).await.map_err(Into::into)
+    }
+
+    async fn append_preference_guarded(
+        &self,
+        text: &str,
+        tags: &[String],
+        cap: usize,
+        strict: bool,
+    ) -> std::result::Result<(), GuardedAppendError> {
+        if let Some(reason) = check_content_policy(text) {
+            if strict {
+                return Err(GuardedAppendError::ContentPolicy(ContentPolicyError {
+                    kind: MemoryKind::Preference,
+                    reason,
+                    offending_first_line: truncate_first_line(text),
+                    hint: "strict_content_policy: rewrite the preference as a reusable invariant, or disable [memory].strict_content_policy",
+                }));
+            }
+            tracing::warn!(
+                reason = reason,
+                first_line = %truncate_first_line(text),
+                "append_preference: content policy violation (warn-only; enable [memory].strict_content_policy to block)",
+            );
+        }
+        self.append_preference(text, tags, cap)
+            .await
+            .map_err(Into::into)
     }
 
     async fn replace(&self, kind: MemoryKind, query: &str, new_text: &str) -> Result<usize> {
@@ -1532,6 +1789,68 @@ mod cap_enforcement_tests {
             }
         }
         assert!(found, "expected MEMORY.bak-<unix> backup to exist");
+    }
+
+    /// REQ-12: with `strict_content_policy = false` (default), a
+    /// commit-sha-only input must still be appended — the guard only
+    /// emits a `tracing::warn!` and proceeds.
+    #[tokio::test]
+    async fn content_policy_warns_by_default() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        // Commit sha alone — classic DROP candidate per DESIGN-SPEC §REQ-08.
+        let bad = fact("deadbeefcafe1234");
+        store
+            .append_fact_guarded(&bad, 4096, false)
+            .await
+            .expect("warn-mode must still append");
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts.len(), 1, "entry should have been written");
+        assert!(facts[0].text.contains("deadbeefcafe1234"));
+        // And the pure classifier agrees it's a commit_sha_only violation.
+        assert_eq!(
+            check_content_policy("deadbeefcafe1234"),
+            Some("commit_sha_only"),
+        );
+    }
+
+    /// REQ-12: with `strict_content_policy = true`, the same bad input must
+    /// be rejected with a `ContentPolicyError` *without* touching the file.
+    #[tokio::test]
+    async fn content_policy_blocks_when_strict() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        let bad = fact("deadbeefcafe1234");
+        let err = store
+            .append_fact_guarded(&bad, 4096, true)
+            .await
+            .expect_err("strict mode must reject commit-sha-only input");
+        match err {
+            GuardedAppendError::ContentPolicy(c) => {
+                assert!(matches!(c.kind, MemoryKind::Fact));
+                assert_eq!(c.reason, "commit_sha_only");
+                assert!(c.offending_first_line.contains("deadbeefcafe1234"));
+            }
+            other => panic!("expected ContentPolicy error, got {other:?}"),
+        }
+        // File must remain untouched (never created).
+        let facts = store.read_facts().await.unwrap();
+        assert!(facts.is_empty(), "strict rejection must not write");
+        // Session handoff + path-only + date-only also caught.
+        assert_eq!(
+            check_content_policy("Session 2025-04-18 shipped T-04"),
+            Some("session_handoff"),
+        );
+        assert_eq!(
+            check_content_policy("crates/thoth-memory/src/lib.rs"),
+            Some("path_only"),
+        );
+        assert_eq!(check_content_policy("2025-04-18"), Some("date_only"));
+        // Invariant keyword exempts the short input.
+        assert_eq!(
+            check_content_policy("must always use absolute paths"),
+            None,
+        );
     }
 }
 
