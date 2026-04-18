@@ -56,16 +56,8 @@ pub struct LessonCluster {
     pub shared_tokens: Vec<String>,
 }
 
-/// Compact glue-word stoplist. Lessons triggers almost always start
-/// with one of these, and leaving them in would inflate Jaccard scores
-/// to the point where every lesson clusters with every other. Distinct
-/// from the gate's larger stoplist because we want to keep verbs like
-/// "editing" / "running" — those *are* meaningful trigger signals.
-const TRIGGER_STOPWORDS: &[&str] = &[
-    "when", "before", "after", "during", "while", "whenever",
-    "the", "and", "for", "any", "all", "new", "old", "also",
-    "not", "from", "with", "into", "onto", "out",
-];
+// Tokenisation + Jaccard live in [`crate::text_sim`] so dedup and
+// clustering share one definition of "similar text".
 
 /// Detect lesson clusters from `lessons`.
 ///
@@ -148,44 +140,7 @@ pub fn detect_clusters(
     out
 }
 
-/// Tokenise a lesson trigger into the set used for Jaccard scoring.
-///
-/// Rules:
-/// - lowercase
-/// - split on any non-`[a-zA-Z0-9_]` character
-/// - drop tokens shorter than 3 chars (noise like "a", "to")
-/// - drop pure-digit tokens
-/// - drop the short trigger-glue stoplist (see [`TRIGGER_STOPWORDS`])
-fn trigger_tokens(text: &str) -> HashSet<String> {
-    let mut out: HashSet<String> = HashSet::new();
-    for raw in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-        if raw.len() < 3 {
-            continue;
-        }
-        if raw.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let lower = raw.to_ascii_lowercase();
-        if TRIGGER_STOPWORDS.contains(&lower.as_str()) {
-            continue;
-        }
-        out.insert(lower);
-    }
-    out
-}
-
-fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let inter = a.intersection(b).count() as f32;
-    let uni = a.union(b).count() as f32;
-    if uni == 0.0 {
-        0.0
-    } else {
-        inter / uni
-    }
-}
+use crate::text_sim::{jaccard, tokens as trigger_tokens};
 
 fn find(parent: &mut [usize], i: usize) -> usize {
     let mut cur = i;

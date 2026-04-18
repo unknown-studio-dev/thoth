@@ -481,6 +481,19 @@ agent-initiated recalls do.
 
 Run `thoth_detect_changes({{diff: \"<git diff output>\"}})` to verify changes only affect expected symbols.
 
+### Memory maintenance
+
+- `thoth review` — periodic background curation; the PostToolUse hook spawns \
+it automatically when `background_review = true` (every `background_review_interval` \
+mutations, subject to `background_review_min_secs` cooldown). Appends new insights; \
+never deletes. Uses `background_review_model` (default `claude-haiku-4-5`) to avoid \
+burning Opus tokens on a curator task.
+- `thoth compact` — LLM-driven consolidation of `MEMORY.md` / `LESSONS.md`. Reads \
+every entry, merges reworded near-duplicates into canonical form, **rewrites** both \
+files (with `.bak-<unix>` backups). Run `thoth compact --dry-run` first to eyeball the \
+proposal. Use when the files feel bloated with restatements of the same subject. \
+Reuses the review backend/model config — no extra setup.
+
 ### Available skills
 
 Use `/skill-name` to invoke: `thoth-exploring` (understand code), `thoth-debugging` (trace bugs), \
@@ -1371,6 +1384,23 @@ async fn maybe_spawn_background_review(root: &Path) {
     let mutations = thoth_memory::mutations_since_last_review(root).await;
     if mutations < disc.background_review_interval {
         return;
+    }
+
+    // Time-based cooldown on top of mutation count. Stops a rapid burst
+    // of edits from firing multiple reviews back-to-back — each review
+    // costs an LLM call, and reviews fired seconds apart can't
+    // meaningfully differ in what they'd curate.
+    if disc.background_review_min_secs > 0
+        && let Some(last) = thoth_memory::read_last_review(root).await
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let elapsed = now.saturating_sub(last);
+        if (elapsed as u64) < disc.background_review_min_secs {
+            return;
+        }
     }
 
     // Resolve the thoth binary path — prefer the same binary that's

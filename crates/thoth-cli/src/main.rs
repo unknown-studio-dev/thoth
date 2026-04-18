@@ -54,6 +54,7 @@ use tracing::warn;
 
 mod daemon;
 mod hooks;
+mod compact;
 mod review;
 mod setup;
 
@@ -310,8 +311,34 @@ enum Cmd {
     /// PostToolUse hook when `background_review = true` in config.
     Review {
         /// Backend for the LLM call: `auto` (default), `cli`, or `api`.
-        #[arg(long, default_value = "auto")]
+        /// Empty string falls back to `background_review_backend` in
+        /// config.toml.
+        #[arg(long, default_value = "")]
         backend: String,
+        /// Model name passed to the backend (e.g. `claude-haiku-4-5`).
+        /// Empty string falls back to `background_review_model` in
+        /// config.toml.
+        #[arg(long, default_value = "")]
+        model: String,
+    },
+
+    /// Compact MEMORY.md / LESSONS.md by merging reworded near-duplicate
+    /// entries. Overwrites both files (with `.bak-<unix>` backups).
+    /// Reuses `background_review_backend` / `background_review_model`
+    /// config — same Haiku-default as `thoth review`.
+    Compact {
+        /// Backend for the LLM call. Empty string falls back to
+        /// `background_review_backend` in config.toml.
+        #[arg(long, default_value = "")]
+        backend: String,
+        /// Model name. Empty string falls back to
+        /// `background_review_model` in config.toml.
+        #[arg(long, default_value = "")]
+        model: String,
+        /// Print the proposed consolidated list without writing or
+        /// backing up. Useful to eyeball the LLM output first.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -622,7 +649,10 @@ async fn main() -> anyhow::Result<()> {
             cmd_changes(&cli.root, from.as_deref(), depth, cli.json).await?
         }
         Cmd::Curate { quiet } => cmd_curate(&cli.root, quiet).await?,
-        Cmd::Review { backend } => cmd_review(&cli.root, &backend).await?,
+        Cmd::Review { backend, model } => cmd_review(&cli.root, &backend, &model).await?,
+        Cmd::Compact { backend, model, dry_run } => {
+            cmd_compact(&cli.root, &backend, &model, dry_run).await?
+        }
         Cmd::Domain { cmd } => match cmd {
             DomainCmd::Sync {
                 source,
@@ -2227,12 +2257,29 @@ async fn cmd_curate(root: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_review(root: &std::path::Path, backend: &str) -> anyhow::Result<()> {
+async fn cmd_review(
+    root: &std::path::Path,
+    backend: &str,
+    model: &str,
+) -> anyhow::Result<()> {
     if !root.exists() {
         println!("(no .thoth/ at {} — nothing to review)", root.display());
         return Ok(());
     }
-    match review::run_review(root, backend).await {
+    // Flag overrides, else fall back to config values so the hook-spawned
+    // and user-invoked paths agree on model/backend.
+    let disc = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let backend = if backend.is_empty() {
+        disc.background_review_backend.as_str()
+    } else {
+        backend
+    };
+    let model = if model.is_empty() {
+        disc.background_review_model.as_str()
+    } else {
+        model
+    };
+    match review::run_review(root, backend, model).await {
         Ok(report) => {
             let total = report.facts_added + report.lessons_added + report.skills_proposed;
             if total > 0 {
@@ -2245,6 +2292,58 @@ async fn cmd_review(root: &std::path::Path, backend: &str) -> anyhow::Result<()>
             }
         }
         Err(e) => eprintln!("thoth: background review failed: {e}"),
+    }
+    Ok(())
+}
+
+async fn cmd_compact(
+    root: &std::path::Path,
+    backend: &str,
+    model: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if !root.exists() {
+        println!("(no .thoth/ at {} — nothing to compact)", root.display());
+        return Ok(());
+    }
+    let disc = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let backend = if backend.is_empty() {
+        disc.background_review_backend.as_str()
+    } else {
+        backend
+    };
+    let model = if model.is_empty() {
+        disc.background_review_model.as_str()
+    } else {
+        model
+    };
+    match compact::run_compact(root, backend, model, dry_run).await {
+        Ok(report) => {
+            let label = if dry_run {
+                "thoth compact (dry-run)"
+            } else {
+                "thoth compact"
+            };
+            eprintln!(
+                "{label}: {} → {} facts, {} → {} lessons",
+                report.facts_before,
+                report.facts_after,
+                report.lessons_before,
+                report.lessons_after,
+            );
+            if !dry_run {
+                if !report.memory_backup.is_empty() {
+                    eprintln!("  MEMORY.md backup:  {}", report.memory_backup);
+                }
+                if !report.lessons_backup.is_empty() {
+                    eprintln!("  LESSONS.md backup: {}", report.lessons_backup);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("thoth compact failed: {e}");
+            return Err(e);
+        }
     }
     Ok(())
 }

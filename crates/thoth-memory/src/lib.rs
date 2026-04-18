@@ -23,11 +23,15 @@
 pub mod background_review;
 pub mod lesson_clusters;
 pub mod reflection;
+pub mod text_sim;
 pub mod working;
 pub use lesson_clusters::{
     DEFAULT_CLUSTER_JACCARD, DEFAULT_CLUSTER_MIN_SIZE, LessonCluster, detect_clusters,
 };
-pub use reflection::{ReflectionDebt, mark_last_review, mark_session_start, mutations_since_last_review};
+pub use reflection::{
+    ReflectionDebt, mark_last_review, mark_session_start, mutations_since_last_review,
+    read_last_review,
+};
 pub use working::{WorkingMemory, WorkingNote};
 
 use std::path::Path;
@@ -234,13 +238,34 @@ pub struct DisciplineConfig {
     /// (opt-in).
     pub background_review: bool,
     /// Number of mutations (Write/Edit/NotebookEdit) between background
-    /// reviews. Default `10`.
+    /// reviews. Default `50`. Was `10` pre-2026-04-18 but that fires so
+    /// often a 50-mutation session can spawn 5+ reviews, each running
+    /// through the whole MEMORY.md/LESSONS.md and tending to snowball
+    /// reworded near-duplicates.
     pub background_review_interval: u32,
+    /// Minimum seconds between two background reviews, regardless of
+    /// mutation count. A hard floor on spawn rate so a rapid burst of
+    /// edits can't fire back-to-back reviews. Default `600` (10 min).
+    pub background_review_min_secs: u64,
     /// Backend for the review LLM call. `"auto"` checks
     /// `ANTHROPIC_API_KEY` → API, else `claude` CLI (subscription).
     /// `"cli"` forces the CLI path. `"api"` forces the API path.
     /// Default `"auto"`.
     pub background_review_backend: String,
+    /// Model name passed to the backend. For the CLI backend this
+    /// becomes `claude --model <name>`; for the API backend it's the
+    /// `model` field in the request body. Default
+    /// `"claude-haiku-4-5"` — Haiku is plenty for memory curation, and
+    /// leaving this unset on the CLI path previously meant reviews ran
+    /// under whatever default the user's interactive session uses
+    /// (often Opus), burning tokens.
+    pub background_review_model: String,
+
+    /// How many `MEMORY.md.bak-*` / `LESSONS.md.bak-*` files `thoth
+    /// compact` keeps around after a successful rewrite. Older
+    /// backups (by filename timestamp) are deleted. `0` disables
+    /// pruning (keep every backup forever). Default `2`.
+    pub compact_backup_keep: u32,
 }
 
 /// Per-actor gate policy override. Missing fields inherit from the
@@ -295,8 +320,11 @@ impl Default for DisciplineConfig {
             gate_bash_readonly_prefixes: Vec::new(),
             policies: Vec::new(),
             background_review: false,
-            background_review_interval: 10,
+            background_review_interval: 50,
+            background_review_min_secs: 600,
             background_review_backend: "auto".to_string(),
+            background_review_model: "claude-haiku-4-5".to_string(),
+            compact_backup_keep: 2,
         }
     }
 }

@@ -240,19 +240,51 @@ full conversation (~5-50k tokens).
 
 ```toml
 [discipline]
-background_review          = true   # opt-in (default false)
-background_review_interval = 10     # mutations between reviews
-background_review_backend  = "auto" # "auto" | "cli" | "api"
-gate_telemetry_enabled     = true   # required (counter reads gate.jsonl)
+background_review          = true                # opt-in (default false)
+background_review_interval = 50                  # mutations between reviews
+background_review_min_secs = 600                 # hard cooldown (seconds)
+background_review_backend  = "auto"              # "auto" | "cli" | "api"
+background_review_model    = "claude-haiku-4-5"  # model passed to backend
+gate_telemetry_enabled     = true                # required (counter reads gate.jsonl)
 ```
 
 | Backend | How | When |
 |---------|-----|------|
-| `cli`   | `claude --print --dangerously-skip-permissions` via stdin | Default — uses your Claude subscription |
+| `cli`   | `claude --print --model <name> --dangerously-skip-permissions` via stdin | Default — uses your Claude subscription |
 | `api`   | Direct POST to `api.anthropic.com/v1/messages` | When `ANTHROPIC_API_KEY` is set |
 | `auto`  | API if key is set, else CLI | Recommended default |
 
-Run manually: `thoth review --backend cli`
+> **Important:** The CLI backend always passes `--model`. Without this, the
+> `claude` subprocess inherits your interactive session default (often Opus)
+> and every review quietly burns premium tokens on a task Haiku handles fine.
+> `background_review_interval`/`_min_secs` gate spawn rate with **both** a
+> mutation threshold and a time floor so rapid edit bursts can't fire
+> back-to-back reviews.
+
+Run manually: `thoth review --backend cli` (flags fall back to config)
+
+## Compact (memory consolidation)
+
+`thoth review` is **append-only** — it never deletes or merges. Over many
+sessions MEMORY.md / LESSONS.md accumulate reworded near-duplicates. Use
+`thoth compact` to collapse them:
+
+```bash
+thoth compact --dry-run     # preview the LLM-proposed consolidation
+thoth compact               # rewrite MEMORY.md + LESSONS.md in place
+```
+
+- Reads every entry, asks an LLM to merge restatements into canonical
+  form, and **overwrites** both files.
+- Backs up originals to `.thoth/MEMORY.md.bak-<unix>` and
+  `.thoth/LESSONS.md.bak-<unix>` before writing (matched timestamps for
+  pair-rollback).
+- Reuses `background_review_backend` / `background_review_model`
+  (Haiku default — cheap; no separate config).
+- Refuses to proceed if the LLM response is empty or shrinks the store
+  by >95% (almost certainly a broken response, not a real compaction).
+- Safe to run on a schedule; designed as a user-invoked maintenance
+  command, not a hook trigger.
 
 ## Status line
 
@@ -443,9 +475,14 @@ thoth domain sync --source asana      --project-id <gid>          # needs ASANA_
 thoth domain sync --source notebooklm                          # stub; export → file
 
 # background review
-thoth review                              # run once (auto backend)
+thoth review                              # run once (auto backend, config model)
 thoth review --backend cli                # force claude CLI (subscription)
 thoth review --backend api                # force Anthropic API (needs key)
+thoth review --model claude-haiku-4-5     # override model for this run
+
+# memory compaction (merge reworded near-dups, overwrites MEMORY/LESSONS)
+thoth compact --dry-run                   # preview the proposed consolidation
+thoth compact                             # rewrite both files (with .bak-<ts> backups)
 
 # Claude Code wiring
 thoth install                             # skills + hooks + MCP + statusline

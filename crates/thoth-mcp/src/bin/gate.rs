@@ -135,6 +135,8 @@ const DEFAULT_BASH_READONLY_PREFIXES: &[&str] = &[
     // these are real mutations (write DBs, settings.json, skill
     // directories) and shouldn't bypass discipline.
     "thoth curate",
+    "thoth compact",
+    "thoth review",
     "thoth query ",
     "thoth impact ",
     "thoth context ",
@@ -268,14 +270,40 @@ fn run(input: &Value) -> (Value, Option<String>, Option<TelemetryRecord>) {
     if policy.mode != PolicyMode::Off {
         let disc = thoth_memory::DisciplineConfig::load_or_default_sync(&root);
         let debt = thoth_memory::ReflectionDebt::compute_sync(&root);
-        let bypass = std::env::var("THOTH_DEFER_REFLECT").is_ok_and(|v| v == "1" || v == "true");
+        // Bypass paths for the debt block. Any one is enough.
+        //
+        // 1. `THOTH_DEFER_REFLECT=1` — the documented session-wide
+        //    escape hatch. Requires restarting Claude Code to set
+        //    (env is snapshot at session start), so it's coarse but
+        //    reliable.
+        //
+        // 2. The mutation targets `<root>/config.toml` or a `.bak-*`
+        //    file inside `.thoth/`. Without this carve-out the gate
+        //    deadlocks: you can't raise `reflect_debt_block` or roll
+        //    back a compact backup because the very edit that would
+        //    fix the lockup is itself blocked. Config tuning and
+        //    rollback are recovery operations and must stay reachable
+        //    at any debt level.
+        //
+        // 3. A fresh `.thoth/.reflect-defer` marker file (mtime
+        //    within `DEFER_MARKER_TTL_SECS`). Creating this file is an
+        //    in-session escape hatch that doesn't require restarting
+        //    Claude Code — the MCP daemon's `thoth_defer_reflect` tool
+        //    writes it, and MCP tool calls don't route through the
+        //    gate (this hook only sees Write/Edit/Bash/NotebookEdit),
+        //    so it works even when every mutation is blocked.
+        let bypass = std::env::var("THOTH_DEFER_REFLECT").is_ok_and(|v| v == "1" || v == "true")
+            || recovery_path(&tool_input, &root)
+            || defer_marker_fresh(&root);
         if !bypass && debt.should_block(&disc) {
             let msg = format!(
                 "Thoth discipline: reflection debt {} ≥ block threshold {} \
                  ({} mutation(s), {} remember(s) this session). Call \
                  `thoth_remember_fact` / `thoth_remember_lesson` for anything \
-                 durable from the recent edits, or set \
-                 `THOTH_DEFER_REFLECT=1` to dismiss for this session.",
+                 durable from the recent edits, OR call the MCP tool \
+                 `thoth_defer_reflect` to create a 30-min bypass marker, \
+                 OR set `THOTH_DEFER_REFLECT=1` (requires restart). Edits to \
+                 `.thoth/config.toml` and `.thoth/*.bak-*` always pass.",
                 debt.debt(),
                 disc.reflect_debt_block,
                 debt.mutations,
@@ -423,6 +451,61 @@ fn tool_input_path(tool_input: &Value) -> Option<String> {
         .or_else(|| tool_input.get("notebook_path"))
         .and_then(Value::as_str)
         .map(String::from)
+}
+
+/// TTL for the defer marker. 30 minutes is long enough that a human
+/// can clear a debt lockdown without being rushed, short enough that a
+/// stale marker from a previous session won't silently disable the
+/// gate for the next session. The marker file is created by the MCP
+/// daemon's `thoth_defer_reflect` tool.
+const DEFER_MARKER_TTL_SECS: u64 = 1800;
+
+/// Returns `true` when the mutation targets a recovery-safe path
+/// inside `<root>/`. These are the edits the user MUST be able to make
+/// even when every other mutation is blocked:
+///
+/// - `<root>/config.toml` — tune the thresholds that caused the block.
+/// - `<root>/MEMORY.md.bak-<unix>` / `<root>/LESSONS.md.bak-<unix>` —
+///   roll back a bad `thoth compact` output.
+fn recovery_path(tool_input: &Value, root: &std::path::Path) -> bool {
+    let Some(raw) = tool_input_path(tool_input) else {
+        return false;
+    };
+    let path = std::path::Path::new(&raw);
+    // Match either absolute path under root or relative path that
+    // resolves to one. We don't canonicalise (file might not exist on
+    // Write), just compare the components we care about.
+    let config = root.join("config.toml");
+    if path == config {
+        return true;
+    }
+    // .bak-<digits> suffixes on MEMORY.md or LESSONS.md anywhere inside root.
+    if let Some(name) = path.file_name().and_then(|s| s.to_str())
+        && (name.starts_with("MEMORY.md.bak-") || name.starts_with("LESSONS.md.bak-"))
+        && path.starts_with(root)
+    {
+        return true;
+    }
+    false
+}
+
+/// Returns `true` when `<root>/.reflect-defer` exists and its mtime is
+/// within [`DEFER_MARKER_TTL_SECS`] of now. Any I/O error is treated
+/// as "no defer" so a missing or unreadable marker fails closed (gate
+/// stays active).
+fn defer_marker_fresh(root: &std::path::Path) -> bool {
+    let marker = root.join(".reflect-defer");
+    let Ok(meta) = std::fs::metadata(&marker) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = std::time::SystemTime::now().duration_since(mtime) else {
+        // Future mtime — treat as fresh (clock skew, don't penalise).
+        return true;
+    };
+    age.as_secs() < DEFER_MARKER_TTL_SECS
 }
 
 // ===========================================================================

@@ -83,8 +83,26 @@ pub struct SetupAnswers {
     pub background_review: bool,
     /// Mutations between background reviews.
     pub background_review_interval: u32,
+    /// Minimum seconds between reviews (time-based cooldown).
+    pub background_review_min_secs: u64,
     /// Backend: "auto", "cli", or "api".
     pub background_review_backend: String,
+    /// Model name passed to the backend (e.g. `claude-haiku-4-5`).
+    pub background_review_model: String,
+    /// How many MEMORY/LESSONS backups `thoth compact` keeps.
+    pub compact_backup_keep: u32,
+    /// Debt threshold that triggers the statusline / prompt nudge.
+    pub reflect_debt_nudge: u32,
+    /// Debt threshold that hard-blocks further mutations.
+    pub reflect_debt_block: u32,
+    /// Require fresh recall right before every edit (on top of relevance).
+    pub gate_require_nudge: bool,
+    /// Opt-in grounding check on factual claims.
+    pub grounding_check: bool,
+    /// Auto-quarantine lessons whose failure ratio crosses this.
+    pub quarantine_failure_ratio: f64,
+    /// Minimum attempts before quarantine is eligible.
+    pub quarantine_min_attempts: u32,
 }
 
 impl Default for SetupAnswers {
@@ -106,8 +124,17 @@ impl Default for SetupAnswers {
             watch_enabled: false,
             watch_debounce_ms: 300,
             background_review: false,
-            background_review_interval: 10,
+            background_review_interval: 50,
+            background_review_min_secs: 600,
             background_review_backend: "auto".to_string(),
+            background_review_model: "claude-haiku-4-5".to_string(),
+            compact_backup_keep: 2,
+            reflect_debt_nudge: 10,
+            reflect_debt_block: 20,
+            gate_require_nudge: false,
+            grounding_check: false,
+            quarantine_failure_ratio: 0.66,
+            quarantine_min_attempts: 5,
         }
     }
 }
@@ -448,18 +475,31 @@ fn prompt_interactive(state: &InstallState) -> Result<SetupAnswers> {
         gate_telemetry_enabled
     };
 
-    let (background_review_interval, background_review_backend) = if background_review {
+    let (
+        background_review_interval,
+        background_review_min_secs,
+        background_review_backend,
+        background_review_model,
+    ) = if background_review {
         let interval: u32 = Input::with_theme(&theme)
             .with_prompt("Mutations between reviews")
-            .default(10u32)
+            .default(50u32)
+            .interact_text()?;
+        let min_secs: u64 = Input::with_theme(&theme)
+            .with_prompt("Minimum seconds between reviews (cooldown)")
+            .default(600u64)
             .interact_text()?;
         let backend: String = Input::with_theme(&theme)
             .with_prompt("Review backend (auto / cli / api)")
             .default("auto".to_string())
             .interact_text()?;
-        (interval, backend)
+        let model: String = Input::with_theme(&theme)
+            .with_prompt("Review model (e.g. claude-haiku-4-5)")
+            .default("claude-haiku-4-5".to_string())
+            .interact_text()?;
+        (interval, min_secs, backend, model)
     } else {
-        (10, "auto".to_string())
+        (50, 600, "auto".to_string(), "claude-haiku-4-5".to_string())
     };
 
     // Small courtesy — if skills from a previous install are still there,
@@ -486,7 +526,16 @@ fn prompt_interactive(state: &InstallState) -> Result<SetupAnswers> {
         watch_debounce_ms: 300,
         background_review,
         background_review_interval,
+        background_review_min_secs,
         background_review_backend,
+        background_review_model,
+        compact_backup_keep: 2,
+        reflect_debt_nudge: 10,
+        reflect_debt_block: 20,
+        gate_require_nudge: false,
+        grounding_check: false,
+        quarantine_failure_ratio: 0.66,
+        quarantine_min_attempts: 5,
     })
 }
 
@@ -575,18 +624,39 @@ fn render_toml(a: &SetupAnswers) -> String {
          # Append every decision to `.thoth/gate.jsonl` for calibration.\n\
          gate_telemetry_enabled     = {gate_telemetry_enabled}\n\
          \n\
+         # Require a fresh `thoth_recall` immediately before each edit,\n\
+         # in addition to (not instead of) the relevance check above.\n\
+         # Rarely wanted — the recall already covers this.\n\
+         gate_require_nudge         = {gate_require_nudge}\n\
+         \n\
          # Bash commands matching these prefixes bypass the gate.\n\
          # This list is additive — built-in defaults (cargo test, git status,\n\
          # grep, rg, ls, …) are always included.\n\
          # gate_bash_readonly_prefixes = [\"pnpm lint\", \"just check\"]\n\
          \n\
+         # --- reflection debt --------------------------------------------------\n\
+         # Debt = session mutations (Write/Edit/NotebookEdit) minus\n\
+         # remembers (thoth_remember_fact / thoth_remember_lesson).\n\
+         # Above `reflect_debt_nudge` the statusline + UserPromptSubmit\n\
+         # hook surface a soft reminder. Above `reflect_debt_block` the\n\
+         # PreToolUse gate hard-blocks mutations until you persist\n\
+         # something or use an escape hatch.\n\
+         #\n\
+         # Escape hatches (in order of preference):\n\
+         #   1. Persist a real fact/lesson (decrements debt).\n\
+         #   2. MCP tool `thoth_defer_reflect` — 30-min bypass marker.\n\
+         #   3. Edits to `.thoth/config.toml` or `.thoth/*.bak-*` — always pass.\n\
+         #   4. `THOTH_DEFER_REFLECT=1` env (requires restart).\n\
+         reflect_debt_nudge         = {reflect_debt_nudge}\n\
+         reflect_debt_block         = {reflect_debt_block}\n\
+         \n\
          # Opt-in: thoth.grounding_check on every factual claim.\n\
-         grounding_check            = false\n\
+         grounding_check            = {grounding_check}\n\
          \n\
          # Auto-quarantine lessons whose failure ratio crosses this (0.0-1.0).\n\
-         quarantine_failure_ratio   = 0.66\n\
+         quarantine_failure_ratio   = {quarantine_failure_ratio}\n\
          # Minimum attempts before quarantine is eligible.\n\
-         quarantine_min_attempts    = 5\n\
+         quarantine_min_attempts    = {quarantine_min_attempts}\n\
          \n\
          # Actor-specific policy overrides. `THOTH_ACTOR` env var selects\n\
          # the policy; first matching glob wins. Uncomment to enable.\n\
@@ -606,8 +676,22 @@ fn render_toml(a: &SetupAnswers) -> String {
          # Requires gate_telemetry_enabled = true (counter reads gate.jsonl).\n\
          background_review              = {background_review}\n\
          background_review_interval     = {background_review_interval}\n\
+         # Hard floor on review spawn rate (seconds). Mutation bursts can't\n\
+         # fire back-to-back reviews within this window. 0 disables.\n\
+         background_review_min_secs     = {background_review_min_secs}\n\
          # Backend: \"auto\" (API key → api, else cli), \"cli\", or \"api\".\n\
          background_review_backend      = \"{background_review_backend}\"\n\
+         # Model passed to the backend. Haiku is plenty for curation;\n\
+         # leaving this empty lets the CLI inherit the user's interactive\n\
+         # default (often Opus) which is expensive.\n\
+         background_review_model        = \"{background_review_model}\"\n\
+         \n\
+         # --- compact (memory consolidation) -----------------------------------\n\
+         # `thoth compact` backs MEMORY.md + LESSONS.md to sibling .bak-<unix>\n\
+         # files before each rewrite. This knob caps how many pairs are kept —\n\
+         # older backups are deleted after each successful compact. 0 disables\n\
+         # pruning (keep every backup forever).\n\
+         compact_backup_keep            = {compact_backup_keep}\n\
          \n\
          [watch]\n\
          # Auto-watch the source tree for changes and reindex in the MCP\n\
@@ -630,7 +714,16 @@ fn render_toml(a: &SetupAnswers) -> String {
         watch_debounce_ms = a.watch_debounce_ms,
         background_review = a.background_review,
         background_review_interval = a.background_review_interval,
+        background_review_min_secs = a.background_review_min_secs,
         background_review_backend = a.background_review_backend,
+        background_review_model = a.background_review_model,
+        compact_backup_keep = a.compact_backup_keep,
+        reflect_debt_nudge = a.reflect_debt_nudge,
+        reflect_debt_block = a.reflect_debt_block,
+        gate_require_nudge = a.gate_require_nudge,
+        grounding_check = a.grounding_check,
+        quarantine_failure_ratio = a.quarantine_failure_ratio,
+        quarantine_min_attempts = a.quarantine_min_attempts,
     )
 }
 
@@ -810,7 +903,9 @@ fn print_summary(root: &Path, a: &SetupAnswers) {
     println!("  background_review        = {}", a.background_review);
     if a.background_review {
         println!("  background_review_interval = {}", a.background_review_interval);
+        println!("  background_review_min_secs = {}", a.background_review_min_secs);
         println!("  background_review_backend  = {}", a.background_review_backend);
+        println!("  background_review_model    = {}", a.background_review_model);
     }
     println!("  ignore patterns          = {}", a.ignore.len());
 }

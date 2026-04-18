@@ -204,19 +204,51 @@ kiệm token hơn ~10 lần: Thoth build context từ event log có cấu trúc
 
 ```toml
 [discipline]
-background_review          = true   # opt-in (mặc định false)
-background_review_interval = 10     # số mutations giữa các lần review
-background_review_backend  = "auto" # "auto" | "cli" | "api"
-gate_telemetry_enabled     = true   # bắt buộc (đếm mutation từ gate.jsonl)
+background_review          = true                # opt-in (mặc định false)
+background_review_interval = 50                  # mutations giữa các lần review
+background_review_min_secs = 600                 # cooldown thời gian (giây)
+background_review_backend  = "auto"              # "auto" | "cli" | "api"
+background_review_model    = "claude-haiku-4-5"  # model truyền xuống backend
+gate_telemetry_enabled     = true                # bắt buộc (đếm mutation từ gate.jsonl)
 ```
 
 | Backend | Cách | Khi nào |
 |---------|------|---------|
-| `cli`   | `claude --print` qua stdin | Mặc định — dùng subscription Claude |
+| `cli`   | `claude --print --model <name>` qua stdin | Mặc định — dùng subscription Claude |
 | `api`   | POST trực tiếp tới `api.anthropic.com` | Khi có `ANTHROPIC_API_KEY` |
 | `auto`  | API nếu có key, ngược lại CLI | Khuyến nghị |
 
-Chạy thủ công: `thoth review --backend cli`
+> **Quan trọng:** CLI backend luôn truyền `--model`. Không có flag này,
+> subprocess `claude` sẽ kế thừa model mặc định của session tương tác
+> (thường là Opus), khiến mỗi lần review đốt token premium cho task mà
+> Haiku thừa sức. `background_review_interval`/`_min_secs` gate tốc độ
+> spawn bằng **cả** ngưỡng mutation **lẫn** ngưỡng thời gian để burst
+> edit nhanh không thể fire review liên tiếp.
+
+Chạy thủ công: `thoth review --backend cli` (flag fallback về config)
+
+## Compact (cô đọng memory)
+
+`thoth review` **chỉ append** — không bao giờ xoá/merge. Qua nhiều
+session, MEMORY.md / LESSONS.md tích tụ các phiên bản viết lại của cùng
+một insight. Dùng `thoth compact` để gộp chúng:
+
+```bash
+thoth compact --dry-run     # xem LLM đề xuất gộp gì trước
+thoth compact               # rewrite MEMORY.md + LESSONS.md tại chỗ
+```
+
+- Đọc toàn bộ entries, yêu cầu LLM gộp các phiên bản viết lại thành
+  entry chuẩn, rồi **ghi đè** cả hai file.
+- Backup bản gốc vào `.thoth/MEMORY.md.bak-<unix>` và
+  `.thoth/LESSONS.md.bak-<unix>` trước khi ghi (cùng timestamp để
+  rollback theo cặp).
+- Tái dùng config `background_review_backend` / `background_review_model`
+  (mặc định Haiku — rẻ; không cần config riêng).
+- Từ chối chạy nếu LLM trả về rỗng hoặc shrink >95% (gần chắc chắn
+  response hỏng, không phải compact thật).
+- An toàn để chạy định kỳ; thiết kế là lệnh user-invoked, không trigger
+  tự động qua hook.
 
 ## Status line
 
@@ -351,9 +383,14 @@ thoth domain sync --source asana      --project-id <gid>          # cần ASANA_
 thoth domain sync --source notebooklm                             # stub; export → file
 
 # background review
-thoth review                              # chạy 1 lần (auto backend)
+thoth review                              # chạy 1 lần (auto backend, model từ config)
 thoth review --backend cli                # ép dùng claude CLI (subscription)
 thoth review --backend api                # ép dùng Anthropic API (cần key)
+thoth review --model claude-haiku-4-5     # override model cho lần chạy này
+
+# compact memory (gộp near-dup, ghi đè MEMORY/LESSONS)
+thoth compact --dry-run                   # xem đề xuất gộp trước khi ghi
+thoth compact                             # rewrite cả 2 file (kèm .bak-<ts>)
 
 # Claude Code
 thoth install                             # skills + hooks + MCP + statusline

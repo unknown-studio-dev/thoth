@@ -206,6 +206,7 @@ impl Server {
             "thoth_memory_pending" => self.tool_memory_pending().await,
             "thoth_memory_promote" => self.tool_memory_promote(arguments).await,
             "thoth_memory_reject" => self.tool_memory_reject(arguments).await,
+            "thoth_defer_reflect" => self.tool_defer_reflect().await,
             "thoth_memory_history" => self.tool_memory_history(arguments).await,
             "thoth_request_review" => self.tool_request_review(arguments).await,
             "thoth_skill_propose" => self.tool_skill_propose(arguments).await,
@@ -599,6 +600,34 @@ impl Server {
             "rejected": ok,
             "title": title,
             "reason": reason,
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// In-session escape hatch for the reflection-debt gate.
+    ///
+    /// Touches `<root>/.reflect-defer`; the gate treats the marker as
+    /// a bypass for 30 minutes. MCP tool calls don't route through the
+    /// gate (PreToolUse only intercepts Write/Edit/Bash/NotebookEdit),
+    /// so this stays callable even when the gate is blocking every
+    /// mutation — which is exactly the deadlock it's designed to
+    /// resolve. Prefer persisting a real fact/lesson to this; only
+    /// reach for defer when there is genuinely nothing durable to
+    /// remember from the recent edits.
+    async fn tool_defer_reflect(&self) -> anyhow::Result<ToolOutput> {
+        let marker = self.inner.root.join(".reflect-defer");
+        // `write` updates mtime even if the file already exists, which
+        // is what the gate's 30-min TTL checks.
+        if let Err(e) = tokio::fs::write(&marker, b"").await {
+            anyhow::bail!("write {}: {e}", marker.display());
+        }
+        let text = format!(
+            "wrote defer marker: {} (bypass active for ~30 min)",
+            marker.display()
+        );
+        let data = serde_json::json!({
+            "marker": marker.display().to_string(),
+            "ttl_secs": 1800,
         });
         Ok(ToolOutput::new(data, text))
     }
@@ -1716,6 +1745,17 @@ fn tools_catalog() -> Vec<Tool> {
                 },
                 "required": ["kind", "index"]
             }),
+        },
+        Tool {
+            name: "thoth_defer_reflect".to_string(),
+            description: "Create `<root>/.reflect-defer` to bypass the reflection-debt gate \
+                          for ~30 minutes. In-session escape hatch when every mutation is \
+                          blocked and you can't restart to set `THOTH_DEFER_REFLECT=1`. \
+                          Prefer `thoth_remember_fact`/`thoth_remember_lesson` when there is \
+                          real insight to persist — defer is for the case where there is \
+                          genuinely nothing durable to remember yet."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
         },
         Tool {
             name: "thoth_memory_history".to_string(),

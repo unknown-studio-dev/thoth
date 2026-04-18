@@ -20,7 +20,13 @@ use thoth_memory::background_review::{
 ///
 /// `backend` is one of `"auto"`, `"cli"`, or `"api"`. On `"auto"` the
 /// function checks `ANTHROPIC_API_KEY` and falls back to `claude` CLI.
-pub async fn run_review(root: &Path, backend: &str) -> anyhow::Result<ReviewReport> {
+/// `model` is passed through to the backend (e.g. `claude-haiku-4-5`);
+/// empty string means "let the backend pick its default".
+pub async fn run_review(
+    root: &Path,
+    backend: &str,
+    model: &str,
+) -> anyhow::Result<ReviewReport> {
     // 1. Build context.
     let mut ctx = build_review_context(root)
         .await
@@ -33,11 +39,7 @@ pub async fn run_review(root: &Path, backend: &str) -> anyhow::Result<ReviewRepo
     let prompt = render_prompt(&ctx);
 
     // 4. Call LLM.
-    let response = match resolve_backend(backend) {
-        #[cfg(feature = "anthropic")]
-        Backend::Api(key) => call_api(&prompt, &key).await?,
-        Backend::Cli => call_cli(&prompt).await?,
-    };
+    let response = call_backend(&prompt, backend, model).await?;
 
     // 5. Parse response.
     let output =
@@ -57,6 +59,17 @@ pub async fn run_review(root: &Path, backend: &str) -> anyhow::Result<ReviewRepo
 }
 
 // ------------------------------------------------------------------ backend
+
+/// Dispatch a single prompt through the resolved backend. Re-used by
+/// `thoth review` and `thoth compact` so both paths honour the same
+/// backend/model config (and the same `--model` override semantics).
+pub async fn call_backend(prompt: &str, backend: &str, model: &str) -> anyhow::Result<String> {
+    match resolve_backend(backend) {
+        #[cfg(feature = "anthropic")]
+        Backend::Api(key) => call_api(prompt, &key, model).await,
+        Backend::Cli => call_cli(prompt, model).await,
+    }
+}
 
 enum Backend {
     Cli,
@@ -85,15 +98,29 @@ fn resolve_backend(requested: &str) -> Backend {
 
 // --------------------------------------------------------- backend: claude CLI
 
-async fn call_cli(prompt: &str) -> anyhow::Result<String> {
+async fn call_cli(prompt: &str, model: &str) -> anyhow::Result<String> {
     use tokio::io::AsyncWriteExt;
 
     // Pipe the prompt via stdin instead of a CLI arg — prompts can
     // exceed the OS argument-length limit (macOS ARG_MAX ≈ 256 KiB).
-    // `--bare` skips hooks/LSP/CLAUDE.md so the review doesn't
-    // recurse into Thoth's own discipline loop.
-    let mut child = tokio::process::Command::new("claude")
-        .args(["--print", "--output-format", "text", "--dangerously-skip-permissions"])
+    // `--dangerously-skip-permissions` skips interactive permission
+    // prompts and the project's PreToolUse hooks, so the review
+    // doesn't recurse into Thoth's own discipline loop.
+    //
+    // `--model` is critical: without it the subprocess inherits the
+    // user's current session default (often Opus), so every review
+    // burns Opus tokens for a task that Haiku handles fine.
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args([
+        "--print",
+        "--output-format",
+        "text",
+        "--dangerously-skip-permissions",
+    ]);
+    if !model.is_empty() {
+        cmd.args(["--model", model]);
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -123,10 +150,13 @@ async fn call_cli(prompt: &str) -> anyhow::Result<String> {
 // ------------------------------------------------------- backend: Anthropic API
 
 #[cfg(feature = "anthropic")]
-async fn call_api(prompt: &str, api_key: &str) -> anyhow::Result<String> {
+async fn call_api(prompt: &str, api_key: &str, model: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
+    // Empty model string → fall back to the Haiku snapshot that
+    // matches [`DisciplineConfig::default`].
+    let model = if model.is_empty() { "claude-haiku-4-5" } else { model };
     let body = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
+        "model": model,
         "max_tokens": 1024,
         "messages": [
             { "role": "user", "content": prompt }
