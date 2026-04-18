@@ -51,7 +51,7 @@ use thoth_core::Result;
 
 pub use episodes::{EpisodeHit, EpisodeLog};
 pub use fts::{ChunkDoc, FtsHit, FtsIndex};
-pub use kv::{EdgeRow, KvStore, NodeRow, SymbolRow};
+pub use kv::{BfsDir, EdgeRow, KvStore, NodeRow, SymbolRow};
 pub use markdown::MarkdownStore;
 pub use vector::VectorHit;
 

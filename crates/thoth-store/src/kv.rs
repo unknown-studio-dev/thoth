@@ -67,6 +67,26 @@ pub struct EdgeRow {
     pub payload: serde_json::Value,
 }
 
+/// BFS direction for [`KvStore::graph_bfs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BfsDir {
+    /// Follow outgoing edges (src → dst).
+    Out,
+    /// Follow incoming edges (dst ← src).
+    In,
+    /// Union of both.
+    Both,
+}
+
+impl BfsDir {
+    fn walks_out(self) -> bool {
+        matches!(self, BfsDir::Out | BfsDir::Both)
+    }
+    fn walks_in(self) -> bool {
+        matches!(self, BfsDir::In | BfsDir::Both)
+    }
+}
+
 // ---- handle ----------------------------------------------------------------
 
 /// Handle to the redb-backed KV + graph store.
@@ -338,13 +358,15 @@ impl KvStore {
         tokio::task::spawn_blocking(move || -> Result<Vec<EdgeRow>> {
             let rtxn = db.begin_read().map_err(store)?;
             let t = rtxn.open_table(EDGES).map_err(store)?;
+            // Edge keys are `"<src>|<kind>|<dst>"`. Use a range scan over
+            // `"<src>|".."<src>|\u{10FFFF}"` (max scalar value in UTF-8)
+            // so this is O(matches), not O(|EDGES|).
+            let lo = format!("{src}|");
+            let hi = format!("{src}|\u{10FFFF}");
             let mut out = Vec::new();
-            let needle = format!("{src}|");
-            for entry in t.iter().map_err(store)? {
-                let (k, v) = entry.map_err(store)?;
-                if k.value().starts_with(needle.as_str()) {
-                    out.push(serde_json::from_slice(v.value())?);
-                }
+            for entry in t.range(lo.as_str()..hi.as_str()).map_err(store)? {
+                let (_k, v) = entry.map_err(store)?;
+                out.push(serde_json::from_slice(v.value())?);
             }
             Ok(out)
         })
@@ -539,6 +561,116 @@ impl KvStore {
                 return Ok(None);
             };
             Ok(Some(serde_json::from_slice(g.value())?))
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Single-round-trip BFS over the graph.
+    ///
+    /// Equivalent to repeatedly calling [`Self::edges_from`] / [`Self::edges_to`]
+    /// plus [`Self::get_node`] per frontier item, but runs the entire walk
+    /// inside one `spawn_blocking` + one redb read transaction. At depth 8
+    /// over a 50-node subgraph this collapses ~150 round trips into one
+    /// and keeps the snapshot coherent across the whole traversal.
+    ///
+    /// - `start` is never included in the output.
+    /// - `kinds = None` walks every [`EdgeRow::kind`]; otherwise only edges
+    ///   whose tag matches one of the supplied strings are followed.
+    /// - Returns `(row, depth)` pairs in BFS discovery order so callers can
+    ///   group by distance without re-sorting.
+    pub async fn graph_bfs(
+        &self,
+        start: String,
+        depth: usize,
+        dir: BfsDir,
+        kinds: Option<Vec<String>>,
+    ) -> Result<Vec<(NodeRow, usize)>> {
+        if depth == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(NodeRow, usize)>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let nodes = rtxn.open_table(NODES).map_err(store)?;
+            let edges = rtxn.open_table(EDGES).map_err(store)?;
+
+            // Decode an edge key "<src>|<kind>|<dst>" → (src, kind, dst).
+            // The kind tags we actually write never contain `|` (see
+            // EdgeKind::tag) so a strict 3-way split is safe.
+            let decode = |k: &str| -> Option<(String, String, String)> {
+                let (src, rest) = k.split_once('|')?;
+                let (kind, dst) = rest.split_once('|')?;
+                Some((src.to_string(), kind.to_string(), dst.to_string()))
+            };
+            let kind_ok = |k: &str| {
+                kinds
+                    .as_ref()
+                    .is_none_or(|allow| allow.iter().any(|a| a == k))
+            };
+
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::from([start.clone()]);
+            let mut frontier: std::collections::VecDeque<(String, usize)> =
+                std::collections::VecDeque::from([(start, 0)]);
+            let mut out: Vec<(NodeRow, usize)> = Vec::new();
+
+            // Step helper: emit every neighbour id reachable from `cur` via
+            // the configured direction + kind filter.
+            let step = |cur: &str| -> Result<Vec<String>> {
+                let mut ids = Vec::new();
+                if dir.walks_out() {
+                    // Prefix scan: every key starting with "<cur>|".
+                    let lo = format!("{cur}|");
+                    let hi = format!("{cur}|\u{10FFFF}");
+                    for entry in edges.range(lo.as_str()..hi.as_str()).map_err(store)? {
+                        let (k, _v) = entry.map_err(store)?;
+                        if let Some((_src, kind, dst)) = decode(k.value())
+                            && kind_ok(&kind)
+                        {
+                            ids.push(dst);
+                        }
+                    }
+                }
+                if dir.walks_in() {
+                    // No reverse index — scan the whole edges table.
+                    // Tracked in the session RESEARCH.md as a follow-up
+                    // (add (dst, kind, src) side table for O(log N) reverse
+                    // lookup). This path is still one spawn_blocking and one
+                    // read txn, so it's already strictly better than the
+                    // pre-refactor per-node full-table scan it replaced.
+                    let needle = format!("|{cur}");
+                    for entry in edges.iter().map_err(store)? {
+                        let (k, _v) = entry.map_err(store)?;
+                        if k.value().ends_with(needle.as_str())
+                            && let Some((src, kind, _dst)) = decode(k.value())
+                            && kind_ok(&kind)
+                        {
+                            ids.push(src);
+                        }
+                    }
+                }
+                Ok(ids)
+            };
+
+            while let Some((cur, d)) = frontier.pop_front() {
+                if d >= depth {
+                    continue;
+                }
+                for nid in step(&cur)? {
+                    if !seen.insert(nid.clone()) {
+                        continue;
+                    }
+                    // Node resolution reuses the same read txn — no extra
+                    // spawn_blocking, no snapshot churn.
+                    if let Some(g) = nodes.get(nid.as_str()).map_err(store)? {
+                        let row: NodeRow = serde_json::from_slice(g.value())?;
+                        out.push((row, d + 1));
+                    }
+                    frontier.push_back((nid, d + 1));
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| Error::Store(format!("join: {e}")))?

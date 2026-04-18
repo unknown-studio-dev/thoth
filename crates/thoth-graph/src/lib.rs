@@ -19,12 +19,12 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thoth_core::Result;
-use thoth_store::{EdgeRow, KvStore, NodeRow};
+use thoth_store::{BfsDir, EdgeRow, KvStore, NodeRow};
 
 /// A node in the code graph.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,6 +376,10 @@ impl Graph {
     /// Core BFS that also records the depth each node was reached at.
     /// `only = None` walks every [`EdgeKind`]; otherwise only edges whose
     /// kind is in the slice are followed. `start` is never returned.
+    ///
+    /// Delegates to [`KvStore::graph_bfs`] so the full walk lives in one
+    /// `spawn_blocking` + one redb read transaction (see the N+1 note in
+    /// `thoth-store::kv::graph_bfs`).
     async fn bfs_depth_tagged(
         &self,
         start: &str,
@@ -383,54 +387,35 @@ impl Graph {
         dir: Direction,
         only: Option<&[EdgeKind]>,
     ) -> Result<Vec<(Node, usize)>> {
-        if depth == 0 {
-            return Ok(Vec::new());
-        }
-        let mut seen: HashSet<String> = HashSet::from([start.to_string()]);
-        let mut frontier: VecDeque<(String, usize)> = VecDeque::from([(start.to_string(), 0)]);
-        let mut out = Vec::new();
-
-        while let Some((cur, d)) = frontier.pop_front() {
-            if d >= depth {
-                continue;
-            }
-            let next_ids = self.step(&cur, dir, only).await?;
-            for nid in next_ids {
-                if !seen.insert(nid.clone()) {
-                    continue;
+        // Deduplicate kind tags — `Graph::impact` passes a fixed 3-slot
+        // array that sometimes repeats `Calls` to pad. `graph_bfs` uses
+        // the tag strings directly, so we collect them here.
+        let kinds: Option<Vec<String>> = only.map(|ks| {
+            let mut seen: HashSet<&'static str> = HashSet::new();
+            let mut out = Vec::with_capacity(ks.len());
+            for k in ks {
+                if seen.insert(k.tag()) {
+                    out.push(k.tag().to_string());
                 }
-                if let Some(node) = self.get(&nid).await? {
-                    out.push((node, d + 1));
-                }
-                frontier.push_back((nid, d + 1));
             }
-        }
-        Ok(out)
+            out
+        });
+        let hits = self
+            .kv
+            .graph_bfs(start.to_string(), depth, direction_to_bfs_dir(dir), kinds)
+            .await?;
+        Ok(hits
+            .into_iter()
+            .map(|(row, d)| (row_to_node(row), d))
+            .collect())
     }
+}
 
-    async fn step(
-        &self,
-        cur: &str,
-        dir: Direction,
-        only: Option<&[EdgeKind]>,
-    ) -> Result<Vec<String>> {
-        let allow = |k: EdgeKind| only.is_none_or(|ks| ks.contains(&k));
-        let mut out = Vec::new();
-        if matches!(dir, Direction::Out | Direction::Both) {
-            for e in self.outgoing(cur).await? {
-                if allow(e.kind) {
-                    out.push(e.to);
-                }
-            }
-        }
-        if matches!(dir, Direction::In | Direction::Both) {
-            for e in self.incoming(cur).await? {
-                if allow(e.kind) {
-                    out.push(e.from);
-                }
-            }
-        }
-        Ok(out)
+fn direction_to_bfs_dir(d: Direction) -> BfsDir {
+    match d {
+        Direction::Out => BfsDir::Out,
+        Direction::In => BfsDir::In,
+        Direction::Both => BfsDir::Both,
     }
 }
 
