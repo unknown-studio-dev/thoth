@@ -33,3 +33,8 @@ lance = ["thoth-store/lance"]
 tokio       = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile    = { workspace = true }
 async-trait = { workspace = true }
+criterion   = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "recall"
+harness = false
