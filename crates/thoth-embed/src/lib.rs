@@ -9,6 +9,9 @@
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
+#[cfg(any(feature = "voyage", feature = "openai", feature = "cohere"))]
+pub(crate) mod http;
+
 #[cfg(feature = "voyage")]
 pub mod voyage;
 

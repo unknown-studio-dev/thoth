@@ -7,16 +7,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thoth_core::{Embedder, Error, Result};
 
+use crate::http::HttpEmbedderBase;
+
 const DEFAULT_BASE_URL: &str = "https://api.cohere.com/v2";
+const PROVIDER: &str = "cohere";
 
 /// Handle to the Cohere embeddings endpoint.
 #[derive(Debug, Clone)]
 pub struct CohereEmbedder {
-    client: reqwest::Client,
-    api_key: String,
-    model: String,
-    dim: usize,
-    base_url: String,
+    base: HttpEmbedderBase,
 }
 
 impl CohereEmbedder {
@@ -26,11 +25,7 @@ impl CohereEmbedder {
     /// Construct from key / model / dimensionality.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>, dim: usize) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            api_key: api_key.into(),
-            model: model.into(),
-            dim,
-            base_url: DEFAULT_BASE_URL.to_string(),
+            base: HttpEmbedderBase::new(api_key, model, dim, DEFAULT_BASE_URL),
         }
     }
 
@@ -41,17 +36,14 @@ impl CohereEmbedder {
 
     /// Read `COHERE_API_KEY` and build an `embed-english-v3.0` client.
     pub fn from_env() -> Result<Self> {
-        let key = std::env::var("COHERE_API_KEY")
-            .map_err(|_| Error::Config("COHERE_API_KEY not set".to_string()))?;
-        if key.trim().is_empty() {
-            return Err(Error::Config("COHERE_API_KEY is empty".to_string()));
-        }
-        Ok(Self::embed_english_v3(key))
+        Ok(Self::embed_english_v3(HttpEmbedderBase::key_from_env(
+            "COHERE_API_KEY",
+        )?))
     }
 
     /// Override the base URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        self.base.base_url = url.into();
         self
     }
 }
@@ -65,26 +57,12 @@ impl Embedder for CohereEmbedder {
         let mut out = Vec::with_capacity(texts.len());
         for batch in texts.chunks(Self::MAX_BATCH) {
             let req = EmbedRequest {
-                model: &self.model,
+                model: &self.base.model,
                 texts: batch.iter().map(|s| s.to_string()).collect(),
                 input_type: "search_document",
                 embedding_types: vec!["float"],
             };
-            let url = format!("{}/embed", self.base_url);
-            let resp = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&req)
-                .send()
-                .await
-                .map_err(provider)?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(Error::Provider(format!("cohere {status}: {body}")));
-            }
-            let body: EmbedResponse = resp.json().await.map_err(provider)?;
+            let body: EmbedResponse = self.base.post_json("/embed", &req, PROVIDER).await?;
             // Cohere preserves input order in the `float` array.
             for v in body.embeddings.float {
                 out.push(v);
@@ -92,7 +70,7 @@ impl Embedder for CohereEmbedder {
         }
         if out.len() != texts.len() {
             return Err(Error::Provider(format!(
-                "cohere: expected {} embeddings, got {}",
+                "{PROVIDER}: expected {} embeddings, got {}",
                 texts.len(),
                 out.len()
             )));
@@ -101,11 +79,11 @@ impl Embedder for CohereEmbedder {
     }
 
     fn dim(&self) -> usize {
-        self.dim
+        self.base.dim
     }
 
     fn model_id(&self) -> &str {
-        &self.model
+        &self.base.model
     }
 }
 
@@ -128,8 +106,4 @@ struct EmbedResponse {
 struct EmbedBuckets {
     #[serde(default)]
     float: Vec<Vec<f32>>,
-}
-
-fn provider(e: impl std::fmt::Display) -> Error {
-    Error::Provider(e.to_string())
 }
