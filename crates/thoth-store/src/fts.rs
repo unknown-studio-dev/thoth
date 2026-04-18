@@ -89,14 +89,24 @@ impl FtsIndex {
         let dir2 = dir.clone();
         tokio::task::spawn_blocking(move || -> Result<Self> {
             let schema = build_schema();
+            // `get_field` is infallible in practice — `build_schema` right
+            // above this line registers every name we look up — but returning
+            // an error (instead of panicking) means a future schema drift
+            // surfaces as a clean open-time failure the caller can handle,
+            // rather than an abort inside `spawn_blocking`.
+            let get = |name: &str| -> Result<Field> {
+                schema
+                    .get_field(name)
+                    .map_err(|e| Error::Store(format!("fts schema missing field `{name}`: {e}")))
+            };
             let fields = Fields {
-                id: schema.get_field("id").unwrap(),
-                path: schema.get_field("path").unwrap(),
-                symbol: schema.get_field("symbol").unwrap(),
-                body: schema.get_field("body").unwrap(),
-                start_line: schema.get_field("start_line").unwrap(),
-                end_line: schema.get_field("end_line").unwrap(),
-                language: schema.get_field("language").unwrap(),
+                id: get("id")?,
+                path: get("path")?,
+                symbol: get("symbol")?,
+                body: get("body")?,
+                start_line: get("start_line")?,
+                end_line: get("end_line")?,
+                language: get("language")?,
             };
 
             let mmap = tantivy::directory::MmapDirectory::open(&dir2).map_err(store)?;

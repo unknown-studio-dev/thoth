@@ -326,23 +326,38 @@ fn merge_hooks(existing: &mut Value, bundle: &Value) {
     // event (per-event stripping would leave those orphaned).
     strip_hooks(existing);
 
-    let settings_hooks = existing
+    let Some(root) = existing.as_object_mut() else {
+        // Callers (install / setup) pre-check `is_object()` and bail with a
+        // user-facing message; this branch is unreachable in normal flows.
+        // Skip silently so unit tests that hand us non-object fixtures don't
+        // blow up with an opaque panic.
+        return;
+    };
+    let hooks_entry = root.entry("hooks".to_string()).or_insert_with(|| json!({}));
+    // User hand-edited `"hooks"` to a non-object (string, array, null …).
+    // Thoth owns this key — reset it rather than panicking on
+    // `as_object_mut().expect()`.
+    if !hooks_entry.is_object() {
+        *hooks_entry = json!({});
+    }
+    let settings_hooks = hooks_entry
         .as_object_mut()
-        .expect("settings root must be an object")
-        .entry("hooks".to_string())
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .expect("hooks must be an object");
+        .expect("hooks_entry was just normalised to an object above");
 
     for (event, entries) in bundle_events {
         let Some(bundle_list) = entries.as_array() else {
             continue;
         };
-        let dest = settings_hooks
+        let dest_entry = settings_hooks
             .entry(event.clone())
-            .or_insert_with(|| json!([]))
+            .or_insert_with(|| json!([]));
+        if !dest_entry.is_array() {
+            // Same reasoning: per-event slot is thoth-managed on re-install.
+            *dest_entry = json!([]);
+        }
+        let dest = dest_entry
             .as_array_mut()
-            .expect("each event's entry must be an array");
+            .expect("dest_entry was just normalised to an array above");
 
         for entry in bundle_list {
             let mut tagged = entry.clone();
@@ -395,14 +410,21 @@ fn merge_mcp(existing: &mut Value, template: &Value) {
     let Some(entry) = template_servers.get(MCP_SERVER_KEY) else {
         return;
     };
-    let servers = existing
-        .as_object_mut()
-        .expect("settings root must be an object")
+    let Some(root) = existing.as_object_mut() else {
+        // Callers pre-check `is_object()`; unreachable in normal flows.
+        return;
+    };
+    let servers_entry = root
         .entry("mcpServers".to_string())
         .or_insert_with(|| json!({}));
-    let servers = servers
+    // User hand-edited `mcpServers` into a non-object — reset, as thoth
+    // owns the entry it's about to insert.
+    if !servers_entry.is_object() {
+        *servers_entry = json!({});
+    }
+    let servers = servers_entry
         .as_object_mut()
-        .expect("mcpServers must be an object");
+        .expect("servers_entry was just normalised to an object above");
     servers.insert(MCP_SERVER_KEY.to_string(), entry.clone());
 }
 
@@ -857,11 +879,15 @@ pub async fn mcp_install(scope: Scope, root: &Path) -> anyhow::Result<()> {
         // PATH) can still spawn it.
         entry.insert("command".to_string(), Value::String(thoth_mcp_bin.clone()));
 
-        let env = entry
-            .entry("env".to_string())
-            .or_insert_with(|| json!({}))
+        let env_entry = entry.entry("env".to_string()).or_insert_with(|| json!({}));
+        // Embedded BUNDLE_MCP always ships `env: {}`; this guards against
+        // a future template edit silently converting it to the wrong shape.
+        if !env_entry.is_object() {
+            *env_entry = json!({});
+        }
+        let env = env_entry
             .as_object_mut()
-            .expect("env must be an object");
+            .expect("env_entry was just normalised to an object above");
         env.insert(
             "THOTH_ROOT".to_string(),
             Value::String(root_abs.display().to_string()),
@@ -926,7 +952,9 @@ async fn read_mcp_config(path: &Path) -> anyhow::Result<Value> {
 /// into `.claude/settings.json`.
 pub async fn statusline_install(scope: Scope) -> anyhow::Result<()> {
     let settings_path = scope.settings_path()?;
-    let claude_dir = settings_path.parent().unwrap();
+    let claude_dir = settings_path
+        .parent()
+        .with_context(|| format!("settings path has no parent: {}", settings_path.display()))?;
     let script_path = claude_dir.join("thoth-statusline.sh");
 
     // Write the bundled script.
@@ -942,10 +970,7 @@ pub async fn statusline_install(scope: Scope) -> anyhow::Result<()> {
     });
     write_settings(&settings_path, &settings).await?;
 
-    println!(
-        "✓ statusline installed: {}",
-        script_path.display()
-    );
+    println!("✓ statusline installed: {}", script_path.display());
     Ok(())
 }
 
@@ -961,7 +986,10 @@ pub async fn statusline_uninstall(scope: Scope) -> anyhow::Result<()> {
     write_settings(&settings_path, &settings).await?;
 
     // Delete the script file.
-    let script_path = settings_path.parent().unwrap().join("thoth-statusline.sh");
+    let script_path = settings_path
+        .parent()
+        .with_context(|| format!("settings path has no parent: {}", settings_path.display()))?
+        .join("thoth-statusline.sh");
     let _ = tokio::fs::remove_file(&script_path).await;
 
     Ok(())
@@ -1080,7 +1108,10 @@ async fn run_session_start(root: &Path, buf: &mut String) -> anyhow::Result<()> 
          `mcp__thoth__thoth_remember_lesson`. These write to \
          ./.thoth/MEMORY.md and ./.thoth/LESSONS.md — the single source of truth."
     );
-    let _ = writeln!(buf, "- Do NOT write to auto-memory paths outside `.thoth/`.");
+    let _ = writeln!(
+        buf,
+        "- Do NOT write to auto-memory paths outside `.thoth/`."
+    );
     let _ = writeln!(
         buf,
         "- Before any Write/Edit/Bash: a `thoth_recall` must have been logged \
@@ -1184,7 +1215,6 @@ async fn curate_quiet(root: &Path, buf: &mut String) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
 
 async fn run_user_prompt(root: &Path, payload: &Value, buf: &mut String) -> anyhow::Result<()> {
     use std::fmt::Write;
@@ -1406,8 +1436,7 @@ async fn maybe_spawn_background_review(root: &Path) {
     // Resolve the thoth binary path — prefer the same binary that's
     // running now (so cargo-installed dev builds work), else fall back
     // to "thoth" on PATH.
-    let thoth_bin = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("thoth"));
+    let thoth_bin = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("thoth"));
 
     let backend = &disc.background_review_backend;
 
@@ -2089,8 +2118,7 @@ reflect_debt_nudge = 3
     fn skill_slug_falls_back_to_draft_dir_name() {
         // No frontmatter → slug comes from `<leaf>.draft` → `<leaf>`.
         let body = "# no frontmatter\n";
-        let slug =
-            skill_slug_from(body, Path::new("/tmp/thoth/skills/my-reflex.draft")).unwrap();
+        let slug = skill_slug_from(body, Path::new("/tmp/thoth/skills/my-reflex.draft")).unwrap();
         assert_eq!(slug, "my-reflex");
     }
 }
