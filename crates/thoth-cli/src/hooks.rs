@@ -1139,9 +1139,11 @@ async fn run_session_start(root: &Path, buf: &mut String) -> anyhow::Result<()> 
         }
     }
 
-    // Print MEMORY.md + LESSONS.md verbatim; Claude Code picks stdout up
-    // as additional context. Keep it compact.
-    for name in ["MEMORY.md", "LESSONS.md"] {
+    // Print USER.md (user-authored prefs) + MEMORY.md + LESSONS.md verbatim;
+    // Claude Code picks stdout up as additional context. Keep it compact.
+    // USER.md is injected first so user preferences frame the MEMORY/LESSONS
+    // that follow. Missing USER.md is silently skipped (REQ-01).
+    for name in ["USER.md", "MEMORY.md", "LESSONS.md"] {
         let p = root.join(name);
         let Ok(body) = tokio::fs::read_to_string(&p).await else {
             continue;
@@ -2201,6 +2203,58 @@ mod promote_tests {
         assert!(
             body.contains("new body"),
             "live SKILL.md should reflect the draft: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_injects_user_md() {
+        // When both USER.md and MEMORY.md exist under `.thoth/`, the
+        // SessionStart banner must render USER.md *before* MEMORY.md so
+        // user-authored prefs frame the auto-memory that follows.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("USER.md"), "user pref body\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("MEMORY.md"), "memory body\n")
+            .await
+            .unwrap();
+
+        let mut buf = String::new();
+        run_session_start(root, &mut buf).await.unwrap();
+
+        let user_idx = buf.find("### USER.md").expect("USER.md section missing");
+        let mem_idx = buf
+            .find("### MEMORY.md")
+            .expect("MEMORY.md section missing");
+        assert!(
+            user_idx < mem_idx,
+            "USER.md must come before MEMORY.md: buf={buf}"
+        );
+        assert!(buf.contains("user pref body"));
+        assert!(buf.contains("memory body"));
+    }
+
+    #[tokio::test]
+    async fn session_start_skips_missing_user_md() {
+        // USER.md is optional — when it is absent, the hook must still
+        // render MEMORY.md and emit no USER.md header (silent skip).
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("MEMORY.md"), "memory body\n")
+            .await
+            .unwrap();
+
+        let mut buf = String::new();
+        run_session_start(root, &mut buf).await.unwrap();
+
+        assert!(
+            !buf.contains("### USER.md"),
+            "no USER.md header when file absent: {buf}"
+        );
+        assert!(
+            buf.contains("### MEMORY.md"),
+            "MEMORY.md must still render: {buf}"
         );
     }
 }
