@@ -118,6 +118,12 @@ const MEMORY_PENDING_MD: &str = "MEMORY.pending.md";
 const LESSONS_PENDING_MD: &str = "LESSONS.pending.md";
 const LESSONS_QUARANTINED_MD: &str = "LESSONS.quarantined.md";
 const MEMORY_HISTORY_JSONL: &str = "memory-history.jsonl";
+/// Rotate `memory-history.jsonl` once it crosses this byte budget. The
+/// current file moves to `<name>.prev` (overwriting the previous rotation)
+/// so on-disk cost is bounded at ~2× this value. Readers in
+/// [`thoth_memory::reflection`] filter by timestamp, so rotated entries
+/// are already outside the session window and safe to shed.
+const MEMORY_HISTORY_CAP_BYTES: u64 = 512 * 1024;
 const SKILLS_DIR: &str = "skills";
 const SKILL_MD: &str = "SKILL.md";
 
@@ -594,8 +600,11 @@ impl MarkdownStore {
 
     /// Append a line to `<root>/memory-history.jsonl`. Failures are
     /// swallowed (memory changes must not abort because a log write failed).
+    /// Rotates the file to `memory-history.jsonl.prev` once it crosses
+    /// [`MEMORY_HISTORY_CAP_BYTES`].
     pub async fn append_history(&self, entry: &HistoryEntry) -> Result<()> {
         let path = self.root.join(MEMORY_HISTORY_JSONL);
+        rotate_if_oversize(&path, MEMORY_HISTORY_CAP_BYTES).await;
         let json = serde_json::to_string(&HistoryEntryOnDisk::from(entry))
             .unwrap_or_else(|_| "{}".to_string());
         let mut line = json;
@@ -859,6 +868,26 @@ async fn read_or_empty(path: &Path) -> Result<String> {
     }
 }
 
+/// Rotate `path` to `<path>.prev` if its current size meets or exceeds
+/// `cap_bytes`. The previous rotation is overwritten. Any IO failure is
+/// swallowed — logs are not load-bearing and the caller must still be able
+/// to append. No-op when the file does not yet exist.
+pub async fn rotate_if_oversize(path: &Path, cap_bytes: u64) {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return;
+    };
+    if meta.len() < cap_bytes {
+        return;
+    }
+    let prev = match path.file_name().and_then(|s| s.to_str()) {
+        Some(name) => path.with_file_name(format!("{name}.prev")),
+        None => return,
+    };
+    if let Err(e) = tokio::fs::rename(path, &prev).await {
+        tracing::warn!(error = %e, path = %path.display(), "log rotation failed");
+    }
+}
+
 /// Append `chunk` to `path`, creating the file if it does not exist.
 async fn append_atomic(path: &Path, chunk: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -957,6 +986,41 @@ async fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 }
 
 // ---- tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rotate_if_oversize_moves_to_prev_when_cap_crossed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-history.jsonl");
+        tokio::fs::write(&path, vec![b'x'; 1024])
+            .await
+            .expect("seed log");
+
+        rotate_if_oversize(&path, 512).await;
+
+        let prev = dir.path().join("memory-history.jsonl.prev");
+        assert!(prev.exists(), "rotated .prev must exist");
+        assert!(!path.exists(), "original must be gone (ready for fresh append)");
+    }
+
+    #[tokio::test]
+    async fn rotate_if_oversize_is_noop_below_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory-history.jsonl");
+        tokio::fs::write(&path, vec![b'x'; 100])
+            .await
+            .expect("seed log");
+
+        rotate_if_oversize(&path, 10_000).await;
+
+        assert!(path.exists(), "small file must stay in place");
+        let prev = dir.path().join("memory-history.jsonl.prev");
+        assert!(!prev.exists(), "no rotation below cap");
+    }
+}
 
 #[cfg(test)]
 mod single_pass_grep_tests {
