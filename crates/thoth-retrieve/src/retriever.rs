@@ -162,13 +162,25 @@ impl Retriever {
             .filter_map(|c| c.symbol.clone())
             .take(8)
             .collect();
-        let graph_hits = filter_scope(self.graph_stage(&seeds).await?, scope);
+
+        // Stages 3 (graph), 4 (markdown), 4b (lessons), 5 (episodic) are all
+        // independent once `seeds` are known — run them concurrently.
+        let (graph_hits, md_hits, lesson_hits, ep_hits) = tokio::join!(
+            self.graph_stage(&seeds),
+            self.markdown_stage(&search_text),
+            self.lessons_stage(&search_text),
+            self.episodic_stage(&search_text, k * 2),
+        );
+        let graph_hits = filter_scope(graph_hits?, scope);
+        let md_hits = md_hits?;
+        let lesson_hits = lesson_hits?;
+        let ep_hits = ep_hits?;
+
         for (rank, cand) in graph_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
 
         // 4. markdown grep (scope doesn't apply — MEMORY.md is global)
-        let md_hits = self.markdown_stage(&search_text).await?;
         for (rank, cand) in md_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
@@ -178,14 +190,12 @@ impl Retriever {
         //     today they share `RetrievalSource::Markdown` and only differ by
         //     path (`LESSONS.md` vs `MEMORY.md`), which is enough for callers
         //     to tell them apart in renders.
-        let lesson_hits = self.lessons_stage(&search_text).await?;
         for (rank, cand) in lesson_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
 
         // 5. episodic log — past queries / answers / outcomes. Scope filters
         //    do not apply; episodes are cross-cutting.
-        let ep_hits = self.episodic_stage(&search_text, k * 2).await?;
         for (rank, cand) in ep_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
@@ -274,20 +284,30 @@ impl Retriever {
     }
 
     async fn graph_stage(&self, seeds: &[String]) -> Result<Vec<Candidate>> {
+        use futures::StreamExt;
+        let results = futures::stream::iter(seeds)
+            .map(|seed| async move {
+                let ns = self.graph.neighbors(seed, 1).await?;
+                let cands: Vec<Candidate> = ns
+                    .into_iter()
+                    .map(|n| Candidate {
+                        id: chunk_id(&n.path, n.line, n.line),
+                        path: n.path,
+                        start_line: n.line,
+                        end_line: n.line,
+                        symbol: Some(n.fqn),
+                        source: RetrievalSource::Graph,
+                        preview: None,
+                    })
+                    .collect();
+                Ok::<Vec<Candidate>, thoth_core::Error>(cands)
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
         let mut out = Vec::new();
-        for seed in seeds {
-            let ns = self.graph.neighbors(seed, 1).await?;
-            for n in ns {
-                out.push(Candidate {
-                    id: chunk_id(&n.path, n.line, n.line),
-                    path: n.path,
-                    start_line: n.line,
-                    end_line: n.line,
-                    symbol: Some(n.fqn),
-                    source: RetrievalSource::Graph,
-                    preview: None,
-                });
-            }
+        for batch in results {
+            out.extend(batch?);
         }
         dedupe(&mut out);
         Ok(out)
