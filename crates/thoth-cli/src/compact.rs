@@ -99,11 +99,20 @@ pub async fn run_compact(
         bail!("MEMORY.md and LESSONS.md are both empty — nothing to compact");
     }
 
-    let prompt = render_prompt(&facts, &lessons);
-    let response = call_backend(&prompt, backend, model)
+    // Load cap so the retry loop has a concrete target to shoot for.
+    let mem_cfg = thoth_memory::MemoryConfig::load_or_default(root).await;
+    let cap = mem_cfg.cap_memory_bytes;
+
+    let backend_owned = backend.to_string();
+    let model_owned = model.to_string();
+    let caller = move |prompt: String| {
+        let b = backend_owned.clone();
+        let m = model_owned.clone();
+        Box::pin(async move { call_backend(&prompt, &b, &m).await }) as BackendFuture<'_>
+    };
+    let out = compact_with_caller(&facts, &lessons, cap, caller)
         .await
         .context("compact: LLM call failed")?;
-    let out = parse_response(&response).context("compact: response parse failed")?;
 
     // Sanity: refuse to wipe the store if the LLM returned a trivially
     // empty or suspiciously small result. `persist_review` doesn't need
@@ -279,7 +288,86 @@ fn print_dry_run(out: &CompactOutput) {
 
 // ------------------------------------------------------------- prompt/parse
 
-fn render_prompt(facts: &[Fact], lessons: &[Lesson]) -> String {
+/// Boxed future returned by the backend caller. Declared so tests can swap
+/// in a mock closure without wiring `call_backend` itself.
+pub type BackendFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>>;
+
+/// Orchestrate the LLM call with a retry-on-oversize loop (DESIGN-SPEC
+/// REQ-08 / decision #8).
+///
+/// Flow:
+/// 1. Render the prompt (attempt 0) including hard DROP rules + the byte
+///    cap the output must fit under.
+/// 2. Invoke `caller`.
+/// 3. Parse JSON. Estimate the rewritten `MEMORY.md` size from the
+///    returned facts. If it fits under `cap_memory_bytes`, accept.
+/// 4. Otherwise bump `attempt` and rebuild the prompt with a louder
+///    "previous output was still X bytes, drop more" preamble.
+/// 5. Give up after 2 retries (3 total attempts) and return the final
+///    parsed response anyway — `run_compact` still has the shrink-ratio
+///    guard to refuse catastrophic results.
+pub(crate) async fn compact_with_caller<F>(
+    facts: &[Fact],
+    lessons: &[Lesson],
+    cap_memory_bytes: usize,
+    mut caller: F,
+) -> anyhow::Result<CompactOutput>
+where
+    F: FnMut(String) -> BackendFuture<'static>,
+{
+    const MAX_RETRIES: u32 = 2;
+    let mut last_oversize: Option<usize> = None;
+    let mut last_out: Option<CompactOutput> = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        let prompt = render_prompt(facts, lessons, cap_memory_bytes, attempt, last_oversize);
+        let response = caller(prompt).await.context("compact: LLM call failed")?;
+        let out = parse_response(&response).context("compact: response parse failed")?;
+
+        let projected = project_memory_bytes(&out.facts);
+        if cap_memory_bytes == 0 || projected <= cap_memory_bytes {
+            return Ok(out);
+        }
+        last_oversize = Some(projected);
+        last_out = Some(out);
+    }
+
+    // Fall through: return the last oversize response. `run_compact`'s
+    // shrink-ratio guard catches pathological outputs, and the user can
+    // still inspect with `--dry-run`.
+    Ok(last_out.unwrap_or_default())
+}
+
+/// Rough projection of how many bytes `rewrite_facts` would write, used
+/// by the retry loop. Mirrors `MarkdownStore::rewrite_facts` — header +
+/// per-entry `### `-style render — without requiring the caller to
+/// actually construct `Fact` values.
+fn project_memory_bytes(facts: &[CompactFact]) -> usize {
+    // Header "# MEMORY.md\n"
+    let mut total: usize = 12;
+    for f in facts {
+        // "### <first-line>\n\n<body>\n\n" plus an optional tag line.
+        // We approximate by counting the whole text + two newlines +
+        // a "### \n\n" framing overhead (~8 bytes).
+        total = total.saturating_add(f.text.len()).saturating_add(8);
+        if !f.tags.is_empty() {
+            // "tags: a, b, c\n" → ~6 + joined + 2
+            let joined: usize = f.tags.iter().map(|t| t.len()).sum::<usize>()
+                + f.tags.len().saturating_sub(1) * 2;
+            total = total.saturating_add(6 + joined + 2);
+        }
+    }
+    total
+}
+
+fn render_prompt(
+    facts: &[Fact],
+    lessons: &[Lesson],
+    cap_memory_bytes: usize,
+    attempt: u32,
+    last_oversize: Option<usize>,
+) -> String {
     // Serialise every fact/lesson into a numbered list the LLM can
     // cite. We don't truncate — compact's whole point is for the model
     // to see every entry so it can merge across the full set. The 158F
@@ -303,8 +391,23 @@ fn render_prompt(facts: &[Fact], lessons: &[Lesson]) -> String {
         ));
     }
 
+    let retry_preamble = match (attempt, last_oversize) {
+        (0, _) => String::new(),
+        (n, Some(bytes)) => format!(
+            "## RETRY {n} of 2\n\
+             Your previous response projected to {bytes} bytes of MEMORY.md, \
+             which exceeds the hard cap of {cap} bytes. You MUST be more \
+             aggressive: drop more low-value entries, merge harder, and \
+             shorten wording. Do NOT invent new information — only drop or merge.\n\n",
+            n = n,
+            bytes = bytes,
+            cap = cap_memory_bytes
+        ),
+        (n, None) => format!("## RETRY {n} of 2\nBe more aggressive with compression.\n\n"),
+    };
+
     format!(
-        r#"You are consolidating a project's long-term memory. The facts and lessons below accumulated over many sessions and contain heavy redundancy — multiple rewordings of the same underlying point, often with slightly different wording or detail level.
+        r#"{retry_preamble}You are consolidating a project's long-term memory. The facts and lessons below accumulated over many sessions and contain heavy redundancy — multiple rewordings of the same underlying point, often with slightly different wording or detail level.
 
 Your job: produce a **replacement** list — fewer entries, each one a merged canonical version. This overwrites the current files, so an entry you omit is GONE.
 
@@ -314,25 +417,37 @@ Your job: produce a **replacement** list — fewer entries, each one a merged ca
 ## Lessons ({n_lessons} total)
 {lessons_block}
 
-## Rules
-1. Preserve every distinct insight. Near-duplicates (same subject, different wording) merge into ONE entry that keeps the best detail from each source (file paths, commit hashes, dates, numeric constants — all of these matter and must survive).
-2. Drop entries that are pure restatements with no added information.
-3. Keep entries terse but specific. Prefer the longer/more-specific wording when merging.
-4. Do NOT invent facts. Every output entry must trace to at least one input entry.
-5. Target 15-30% of the original size (aim for high compression, but never drop unique info).
-6. Keep tags from source entries; merge tag lists when merging entries.
-7. Preserve absolute dates (e.g. "2026-04-17"). Never rewrite dates to relative form.
+## Hard DROP rules (these entries MUST NOT appear in the output)
+- **Session-handoff entries**: anything whose subject is a session id, a "handoff to next session", a "TODO for next session", a per-session checklist, or a pointer to `.hoangsa/sessions/**` / `.thoth/sessions/**`. These are ephemeral by construction.
+- **Commit-SHA-only memories**: entries whose body is just a commit hash (7-40 hex chars) with no accompanying invariant or lesson. A dangling sha is useless as long-term memory — drop it.
+- **Bare ISO dates / timestamps / file paths** with no invariant attached (e.g. "2026-04-17" or "/path/to/thing" standing alone with no "because X" / "use Y" context).
+- **Workflow scaffolding** from HOANGSA/agent scripts: "worker T-0X did Y", "wave N complete", "task envelope", "acceptance: cargo test …".
+- **Self-referential memory bookkeeping**: "compacted on <date>", "backup written to …", "reviewed lessons".
+- **Pure restatements** of another entry with no added specificity.
+
+## Merge rules
+1. Preserve every distinct insight that survives the DROP rules. Near-duplicates (same subject, different wording) merge into ONE entry that keeps the best detail from each source (file paths, commit hashes embedded INSIDE a fact with context, dates attached to a rule — all of these matter and must survive).
+2. Keep entries terse but specific. Prefer the longer/more-specific wording when merging.
+3. Do NOT invent facts. Every output entry must trace to at least one input entry.
+4. Target 15-30% of the original size — but drop more if needed to fit under the size budget below.
+5. Keep tags from source entries; merge tag lists when merging entries.
+6. Preserve absolute dates attached to an invariant (e.g. "as of 2026-04-17, the API returns X"). Never rewrite dates to relative form.
+
+## Size budget
+The rewritten `MEMORY.md` must fit under **{cap} bytes** total. Count conservatively: header + `### ` framing + each fact body + tag line + blank separators. If the full set cannot fit, drop the lowest-signal entries first (DROP rules above name the usual suspects).
 
 ## Output
 Return ONLY valid JSON (no markdown fences, no commentary) matching this schema:
 {{"facts":[{{"text":"...","tags":["..."]}}, ...],"lessons":[{{"trigger":"...","advice":"..."}}, ...]}}
 
-Remember: anything you omit is permanently deleted from memory. Lean toward keeping rather than dropping when uncertain.
+Remember: anything you omit is permanently deleted from memory. Lean toward keeping rather than dropping when uncertain — but do not retain entries that match the hard DROP rules.
 "#,
+        retry_preamble = retry_preamble,
         n_facts = facts.len(),
         facts_block = facts_block,
         n_lessons = lessons.len(),
         lessons_block = lessons_block,
+        cap = cap_memory_bytes,
     )
 }
 
@@ -351,6 +466,9 @@ fn parse_response(text: &str) -> anyhow::Result<CompactOutput> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -373,5 +491,112 @@ mod tests {
     fn safe_ratio_handles_zero_denominator() {
         assert!((safe_ratio(0, 0) - 1.0).abs() < 1e-6);
         assert!((safe_ratio(5, 10) - 0.5).abs() < 1e-6);
+    }
+
+    /// REQ-08: the compact prompt must instruct the LLM to drop
+    /// session-handoff entries, commit-sha-only memories, and other
+    /// ephemeral scaffolding.
+    #[test]
+    fn compact_drops_session_handoff_entries() {
+        let prompt = render_prompt(&[], &[], 3072, 0, None);
+
+        // The "hard DROP" section must exist and explicitly name session-
+        // handoff entries + commit-SHA-only memories.
+        assert!(
+            prompt.contains("Hard DROP rules"),
+            "prompt missing 'Hard DROP rules' section: {prompt}"
+        );
+        assert!(
+            prompt.to_lowercase().contains("session-handoff"),
+            "prompt must mention session-handoff as a drop category"
+        );
+        assert!(
+            prompt.to_lowercase().contains("commit-sha"),
+            "prompt must mention commit-sha-only as a drop category"
+        );
+        assert!(
+            prompt.contains(".hoangsa/sessions") || prompt.contains(".thoth/sessions"),
+            "prompt should flag session dirs as ephemeral"
+        );
+        // Size budget must surface the cap so the LLM knows the target.
+        assert!(
+            prompt.contains("3072 bytes"),
+            "prompt must surface the byte cap"
+        );
+    }
+
+    /// REQ-08: when the LLM returns an output that projects above
+    /// `cap_memory_bytes`, `compact_with_caller` retries — up to 2 times
+    /// (3 attempts total) — before giving up.
+    #[tokio::test]
+    async fn compact_retries_on_oversize_output() {
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // Oversize payload on the first two calls, compact payload on the
+        // third. Each "fact" body is ~120 bytes so a list of 50 blows
+        // past a 512-byte cap easily.
+        let big_fact = "x".repeat(120);
+        let oversize_json = {
+            let mut facts = Vec::new();
+            for _ in 0..50 {
+                facts.push(format!(r#"{{"text":"{big_fact}","tags":[]}}"#));
+            }
+            format!(r#"{{"facts":[{}],"lessons":[]}}"#, facts.join(","))
+        };
+        let small_json =
+            r#"{"facts":[{"text":"tiny","tags":[]}],"lessons":[]}"#.to_string();
+
+        let calls_clone = Arc::clone(&calls);
+        let caller = move |_prompt: String| -> BackendFuture<'static> {
+            let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+            let oversize = oversize_json.clone();
+            let small = small_json.clone();
+            Box::pin(async move {
+                if n < 2 {
+                    Ok(oversize)
+                } else {
+                    Ok(small)
+                }
+            })
+        };
+
+        let out = compact_with_caller(&[], &[], 512, caller).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "should retry twice then accept on attempt 3"
+        );
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.facts[0].text, "tiny");
+    }
+
+    /// Companion to the retry test: confirms the loop caps at 2 retries
+    /// (3 total attempts) even when every response is oversize, and
+    /// returns the last parsed payload instead of hanging.
+    #[tokio::test]
+    async fn compact_gives_up_after_two_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let big = "y".repeat(120);
+        let oversize = format!(
+            r#"{{"facts":[{}],"lessons":[]}}"#,
+            (0..50)
+                .map(|_| format!(r#"{{"text":"{big}","tags":[]}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let calls_clone = Arc::clone(&calls);
+        let caller = move |_: String| -> BackendFuture<'static> {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            let payload = oversize.clone();
+            Box::pin(async move { Ok(payload) })
+        };
+
+        let _ = compact_with_caller(&[], &[], 512, caller).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "max retries = 2 means exactly 3 attempts"
+        );
     }
 }
