@@ -27,12 +27,23 @@
 //! ### LESSONS.md format
 //!
 //! Lessons are level-3 headings where the heading is the trigger and the
-//! body is the advice:
+//! body is the advice. Enforcement metadata is emitted as hidden HTML
+//! comments so human readers see plain prose while the loader can recover
+//! structured fields (tier, block message, suggested tier, success/failure
+//! counts) on round-trip:
 //!
 //! ```markdown
 //! ### when editing migrations
 //! Always run `sqlx prepare` after changing SQL. Failing to do so breaks CI.
+//! <!-- enforcement: Advise -->
+//! <!-- suggested_enforcement: Require -->
+//! <!-- block_message: never edit migrations directly -->
+//! <!-- success: 3 / failure: 0 -->
 //! ```
+//!
+//! Legacy lessons without these footer lines still load cleanly: missing
+//! `enforcement` defaults to [`Enforcement::Advise`] and the two optional
+//! fields default to `None`.
 //!
 //! ### SKILL.md format (agentskills.io frontmatter)
 //!
@@ -48,7 +59,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use thoth_core::{Fact, Lesson, MemoryKind, MemoryMeta, Result, Skill};
+use thoth_core::{Enforcement, Fact, Lesson, MemoryKind, MemoryMeta, Result, Skill};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 
@@ -768,6 +779,9 @@ fn parse_lessons(text: &str) -> Vec<Lesson> {
         let mut advice = String::new();
         let mut success_count = 0u64;
         let mut failure_count = 0u64;
+        let mut enforcement = Enforcement::default();
+        let mut suggested_enforcement: Option<Enforcement> = None;
+        let mut block_message: Option<String> = None;
 
         while let Some(next) = iter.peek() {
             if next.starts_with("### ") || next.starts_with("## ") || next.starts_with("# ") {
@@ -779,6 +793,29 @@ fn parse_lessons(text: &str) -> Vec<Lesson> {
                 failure_count = f;
                 continue;
             }
+            if let Some((key, value)) = parse_comment_kv(n) {
+                match key.as_str() {
+                    "enforcement" => {
+                        if let Some(e) = parse_enforcement(&value) {
+                            enforcement = e;
+                        }
+                        continue;
+                    }
+                    "suggested_enforcement" => {
+                        suggested_enforcement = parse_enforcement(&value);
+                        continue;
+                    }
+                    "block_message" => {
+                        let unescaped = value.replace("--&gt;", "-->");
+                        let trimmed = unescaped.trim();
+                        if !trimmed.is_empty() {
+                            block_message = Some(trimmed.to_string());
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             advice.push_str(n);
             advice.push('\n');
         }
@@ -789,9 +826,35 @@ fn parse_lessons(text: &str) -> Vec<Lesson> {
             advice: advice.trim_end().to_string(),
             success_count,
             failure_count,
+            enforcement,
+            suggested_enforcement,
+            block_message,
         });
     }
     out
+}
+
+/// Parse a single `<!-- key: value -->` footer line. Returns `None` when
+/// the line isn't a key/value HTML comment — non-footer lines fall through
+/// into the advice body. We deliberately reject the counter footer
+/// (`success: N / failure: N`) here so [`parse_counter_footer`] keeps
+/// owning that shape; otherwise `success:` would get misread as a generic
+/// key and swallow the counters.
+fn parse_comment_kv(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix("<!--")
+        .and_then(|s| s.strip_suffix("-->"))?
+        .trim();
+    if inner.starts_with("success:") && inner.contains('/') {
+        return None;
+    }
+    let (k, v) = inner.split_once(':')?;
+    let key = k.trim().to_string();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, v.trim().to_string()))
 }
 
 /// Parse the hidden `<!-- success: N / failure: N -->` counter footer that
@@ -933,9 +996,19 @@ fn render_fact(f: &Fact) -> String {
     out
 }
 
-/// Render a single [`Lesson`] as a level-3 heading block. When either
-/// counter is non-zero, a hidden `<!-- success: N / failure: N -->` footer
-/// is emitted so the counts survive round-trips through the file.
+/// Render a single [`Lesson`] as a level-3 heading block.
+///
+/// The trigger becomes the level-3 heading (the visible summary in
+/// `LESSONS.md`) and the advice follows as free prose. Enforcement-layer
+/// metadata — the current tier, the suggested tier, an optional
+/// `block_message`, and the success/failure counters — is emitted as hidden
+/// HTML comments so a human reader sees plain prose while the loader can
+/// round-trip every field.
+///
+/// The `enforcement` footer is always emitted (even when it equals the
+/// default [`Enforcement::Advise`]) so an author who hand-edits the file
+/// has a visible anchor to flip, and so a diff shows tier changes
+/// explicitly rather than silently mutating defaults.
 fn render_lesson(l: &Lesson) -> String {
     let mut out = String::new();
     out.push_str("### ");
@@ -945,6 +1018,28 @@ fn render_lesson(l: &Lesson) -> String {
         out.push_str(l.advice.trim_end());
         out.push('\n');
     }
+    // Enforcement tier — always render so the field is visible in LESSONS.md.
+    out.push_str(&format!(
+        "<!-- enforcement: {} -->\n",
+        render_enforcement(&l.enforcement)
+    ));
+    if let Some(sug) = &l.suggested_enforcement {
+        out.push_str(&format!(
+            "<!-- suggested_enforcement: {} -->\n",
+            render_enforcement(sug)
+        ));
+    }
+    if let Some(msg) = l
+        .block_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Single-line-escape any embedded `-->` so we never close the comment
+        // prematurely; the loader reverses this.
+        let escaped = msg.replace("-->", "--&gt;").replace('\n', " ");
+        out.push_str(&format!("<!-- block_message: {} -->\n", escaped));
+    }
     if l.success_count > 0 || l.failure_count > 0 {
         out.push_str(&format!(
             "<!-- success: {} / failure: {} -->\n",
@@ -953,6 +1048,51 @@ fn render_lesson(l: &Lesson) -> String {
     }
     out.push('\n');
     out
+}
+
+/// Render an [`Enforcement`] variant to the compact token used inside
+/// `<!-- enforcement: ... -->` footers.
+///
+/// Unit variants render as their PascalCase name; the only payload-carrying
+/// variant ([`Enforcement::RequireRecall`]) renders as
+/// `RequireRecall(turns=N)` so the parser can recover the turn budget.
+fn render_enforcement(e: &Enforcement) -> String {
+    match e {
+        Enforcement::Advise => "Advise".to_string(),
+        Enforcement::Require => "Require".to_string(),
+        Enforcement::Block => "Block".to_string(),
+        Enforcement::RequireRecall {
+            recall_within_turns,
+        } => format!("RequireRecall(turns={})", recall_within_turns),
+        Enforcement::WorkflowGate => "WorkflowGate".to_string(),
+    }
+}
+
+/// Parse the token emitted by [`render_enforcement`]. Returns `None` when
+/// the token is empty / unrecognised; callers fall back to
+/// [`Enforcement::default`] so legacy lessons or hand-typoed footers never
+/// crash the loader.
+fn parse_enforcement(token: &str) -> Option<Enforcement> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    match token {
+        "Advise" => Some(Enforcement::Advise),
+        "Require" => Some(Enforcement::Require),
+        "Block" => Some(Enforcement::Block),
+        "WorkflowGate" => Some(Enforcement::WorkflowGate),
+        other => {
+            // RequireRecall(turns=N)
+            let rest = other.strip_prefix("RequireRecall")?.trim();
+            let inner = rest.strip_prefix('(')?.strip_suffix(')')?.trim();
+            let n_str = inner.strip_prefix("turns=")?.trim();
+            let n: u32 = n_str.parse().ok()?;
+            Some(Enforcement::RequireRecall {
+                recall_within_turns: n,
+            })
+        }
+    }
 }
 
 /// Recursively copy `src` to `dest`. Creates `dest` (and parents) if needed.
@@ -1038,6 +1178,9 @@ mod single_pass_grep_tests {
             advice: advice.to_string(),
             success_count: 0,
             failure_count: 0,
+            enforcement: Default::default(),
+            suggested_enforcement: None,
+            block_message: None,
         }
     }
 
@@ -1171,6 +1314,186 @@ mod single_pass_grep_tests {
         assert!(
             results.is_empty(),
             "empty needle list must return empty results"
+        );
+    }
+}
+
+/// REQ-04 coverage: LESSONS.md carries a machine-readable enforcement
+/// footer and legacy entries (no footer) still load with the default tier.
+#[cfg(test)]
+mod trigger_render {
+    use super::*;
+    use tempfile::TempDir;
+    use thoth_core::{Enforcement, Lesson, MemoryKind, MemoryMeta};
+
+    async fn open_store() -> (TempDir, MarkdownStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        (dir, store)
+    }
+
+    fn lesson(trigger: &str, advice: &str) -> Lesson {
+        Lesson {
+            meta: MemoryMeta::new(MemoryKind::Reflective),
+            trigger: trigger.into(),
+            advice: advice.into(),
+            success_count: 0,
+            failure_count: 0,
+            enforcement: Enforcement::default(),
+            suggested_enforcement: None,
+            block_message: None,
+        }
+    }
+
+    /// Rendered LESSONS.md always carries the trigger heading and an
+    /// enforcement comment — even for the default Advise tier — so a
+    /// human diff-reviewer sees the tier explicitly.
+    #[tokio::test]
+    async fn render_emits_trigger_heading_and_enforcement_footer() {
+        let (_dir, store) = open_store().await;
+        store
+            .append_lesson(&lesson("when editing migrations", "run sqlx prepare"))
+            .await
+            .unwrap();
+
+        let raw = tokio::fs::read_to_string(store.root.join("LESSONS.md"))
+            .await
+            .unwrap();
+        assert!(
+            raw.contains("### when editing migrations"),
+            "trigger must appear as level-3 heading, got:\n{raw}"
+        );
+        assert!(
+            raw.contains("<!-- enforcement: Advise -->"),
+            "default enforcement tier must be rendered, got:\n{raw}"
+        );
+    }
+
+    /// Non-default tiers, `suggested_enforcement`, and `block_message`
+    /// all round-trip through the markdown file.
+    #[tokio::test]
+    async fn roundtrip_all_enforcement_fields() {
+        let (_dir, store) = open_store().await;
+        let mut l = lesson("when rm -rf /", "never run");
+        l.enforcement = Enforcement::Block;
+        l.suggested_enforcement = Some(Enforcement::Block);
+        l.block_message = Some("rm -rf is forbidden".into());
+        l.success_count = 4;
+        l.failure_count = 1;
+        store.rewrite_lessons(&[l.clone()]).await.unwrap();
+
+        let back = store.read_lessons().await.unwrap();
+        assert_eq!(back.len(), 1);
+        let got = &back[0];
+        assert_eq!(got.trigger, "when rm -rf /");
+        assert_eq!(got.advice, "never run");
+        assert_eq!(got.enforcement, Enforcement::Block);
+        assert_eq!(got.suggested_enforcement, Some(Enforcement::Block));
+        assert_eq!(got.block_message.as_deref(), Some("rm -rf is forbidden"));
+        assert_eq!(got.success_count, 4);
+        assert_eq!(got.failure_count, 1);
+    }
+
+    /// `RequireRecall { recall_within_turns }` carries a payload — verify
+    /// the `turns=N` projection round-trips cleanly.
+    #[tokio::test]
+    async fn roundtrip_require_recall_payload() {
+        let (_dir, store) = open_store().await;
+        let mut l = lesson("before edit", "recall first");
+        l.enforcement = Enforcement::RequireRecall {
+            recall_within_turns: 5,
+        };
+        store.rewrite_lessons(&[l]).await.unwrap();
+
+        let raw = tokio::fs::read_to_string(store.root.join("LESSONS.md"))
+            .await
+            .unwrap();
+        assert!(
+            raw.contains("<!-- enforcement: RequireRecall(turns=5) -->"),
+            "payload must render with turns=N, got:\n{raw}"
+        );
+
+        let back = store.read_lessons().await.unwrap();
+        assert_eq!(
+            back[0].enforcement,
+            Enforcement::RequireRecall {
+                recall_within_turns: 5
+            }
+        );
+    }
+
+    /// Legacy LESSONS.md — written before the enforcement layer — has no
+    /// footer comments. Loader must accept it and populate the default
+    /// Advise tier with `None` for the optional fields.
+    #[tokio::test]
+    async fn legacy_lessons_without_footer_load_with_advise_default() {
+        let (_dir, store) = open_store().await;
+        let legacy = "# LESSONS.md\n\
+            ### when editing migrations\n\
+            Always run sqlx prepare after changing SQL.\n\
+            \n\
+            ### when dropping tables\n\
+            Prefer soft-delete.\n\
+            <!-- success: 2 / failure: 0 -->\n\
+            \n";
+        tokio::fs::write(store.root.join("LESSONS.md"), legacy)
+            .await
+            .unwrap();
+
+        let lessons = store.read_lessons().await.unwrap();
+        assert_eq!(lessons.len(), 2);
+
+        assert_eq!(lessons[0].trigger, "when editing migrations");
+        assert_eq!(lessons[0].enforcement, Enforcement::Advise);
+        assert!(lessons[0].suggested_enforcement.is_none());
+        assert!(lessons[0].block_message.is_none());
+
+        // Counter footer on the second legacy lesson must still parse —
+        // the new comment-kv helper must not swallow it.
+        assert_eq!(lessons[1].success_count, 2);
+        assert_eq!(lessons[1].failure_count, 0);
+        assert_eq!(lessons[1].enforcement, Enforcement::Advise);
+    }
+
+    /// Unknown / malformed enforcement tokens must not crash the loader —
+    /// they fall back to the default Advise tier (per legacy-safe spec).
+    #[tokio::test]
+    async fn unknown_enforcement_token_falls_back_to_default() {
+        let (_dir, store) = open_store().await;
+        let raw = "# LESSONS.md\n\
+            ### trigger one\n\
+            body\n\
+            <!-- enforcement: NotATier -->\n\
+            \n";
+        tokio::fs::write(store.root.join("LESSONS.md"), raw)
+            .await
+            .unwrap();
+
+        let lessons = store.read_lessons().await.unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].enforcement, Enforcement::Advise);
+    }
+
+    /// A block message containing `-->` must not close the HTML comment
+    /// early; the renderer escapes `-->` and the loader reverses it.
+    #[tokio::test]
+    async fn block_message_with_comment_close_roundtrips() {
+        let (_dir, store) = open_store().await;
+        let mut l = lesson("trigger", "advice");
+        l.enforcement = Enforcement::Block;
+        l.block_message = Some("do not use x --> y notation".into());
+        store.rewrite_lessons(&[l]).await.unwrap();
+
+        let raw = tokio::fs::read_to_string(store.root.join("LESSONS.md"))
+            .await
+            .unwrap();
+        // The raw `-->` must be escaped so the comment ends where we intend.
+        assert!(!raw.contains("do not use x --> y"));
+
+        let back = store.read_lessons().await.unwrap();
+        assert_eq!(
+            back[0].block_message.as_deref(),
+            Some("do not use x --> y notation")
         );
     }
 }

@@ -621,7 +621,10 @@ mod tests {
 
         let d = ReflectionDebt::compute(dir.path()).await;
         assert_eq!(d.mutations, 3);
-        assert_eq!(d.remembers, 2, "replace on fact+preference must decrement debt");
+        assert_eq!(
+            d.remembers, 2,
+            "replace on fact+preference must decrement debt"
+        );
         assert_eq!(d.debt(), 1);
     }
 

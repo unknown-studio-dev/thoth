@@ -321,9 +321,10 @@ pub async fn apply(
             }
             Verdict::Drop(_) => match md.remove(c.kind, &c.query).await {
                 Ok(_) => report.dropped += 1,
-                Err(e) => report
-                    .errors
-                    .push(format!("remove failed for {:?} #{}: {}", c.kind, c.index, e)),
+                Err(e) => report.errors.push(format!(
+                    "remove failed for {:?} #{}: {}",
+                    c.kind, c.index, e
+                )),
             },
         }
     }
@@ -510,8 +511,7 @@ fn parse_llm_reply(reply: &str) -> anyhow::Result<Vec<LlmDecision>> {
         return Err(anyhow!("malformed bracket span in reply"));
     }
     let json = &reply[start..=end];
-    serde_json::from_str::<Vec<LlmDecision>>(json)
-        .with_context(|| format!("invalid JSON: {json}"))
+    serde_json::from_str::<Vec<LlmDecision>>(json).with_context(|| format!("invalid JSON: {json}"))
 }
 
 // ===========================================================================

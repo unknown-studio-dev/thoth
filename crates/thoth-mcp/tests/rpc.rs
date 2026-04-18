@@ -484,9 +484,7 @@ async fn mcp_remember_fact_returns_structured_cap_error() {
         Some(true),
         "cap-exceeded remember_fact must set isError=true: {result}"
     );
-    let text = result["content"][0]["text"]
-        .as_str()
-        .expect("content text");
+    let text = result["content"][0]["text"].as_str().expect("content text");
     let parsed: Value = serde_json::from_str(text)
         .unwrap_or_else(|e| panic!("content text must be structured JSON: err={e} text={text}"));
     assert_eq!(parsed["code"], "cap_exceeded");

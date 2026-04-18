@@ -22,8 +22,15 @@
 
 pub mod background_review;
 pub mod lesson_clusters;
+pub mod lesson_matcher;
+pub mod outcome_harvest;
+#[path = "override.rs"]
+pub mod r#override;
+pub mod promotion;
 pub mod reflection;
+pub mod rules;
 pub mod text_sim;
+pub mod workflow;
 pub mod working;
 pub use lesson_clusters::{
     DEFAULT_CLUSTER_JACCARD, DEFAULT_CLUSTER_MIN_SIZE, LessonCluster, detect_clusters,
@@ -268,7 +275,11 @@ pub fn check_content_policy(text: &str) -> Option<&'static str> {
 }
 
 fn truncate_first_line(text: &str) -> String {
-    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     if first.chars().count() <= 120 {
         first.to_string()
     } else {
@@ -329,6 +340,90 @@ struct ConfigFile {
     memory: MemoryConfig,
     #[serde(default)]
     discipline: DisciplineConfig,
+    // Parsed here so `[enforcement]` round-trips through the shared
+    // ConfigFile loader — consumers (harvester, promotion engine) will be
+    // wired in later tasks of the thoth-enforcement-layer plan.
+    #[serde(default)]
+    #[allow(dead_code)]
+    enforcement: EnforcementConfig,
+}
+
+/// Enforcement-layer policy (DESIGN-SPEC REQ-28).
+///
+/// Controls the auto-promote / auto-demote engine, the recall-window used
+/// by the outcome harvester, and the workflow-violation threshold consumed
+/// by the gate binary. All fields have serde defaults so an absent
+/// `[enforcement]` block deserialises to [`Self::default`] — the canonical
+/// `2 / 2 / 3 / 3 / true / true` starting point.
+///
+/// Ownership note: this struct is parsed by the same `config.toml` loader
+/// that owns `[memory]` and `[discipline]` (see `ConfigFile`). Keep defaults
+/// aligned with the table in DESIGN-SPEC §"Assumptions & Decisions" #10–#12.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct EnforcementConfig {
+    /// Successful applications of a lesson before it auto-promotes one
+    /// tier (e.g. `nudge` → `require`). Default `2` — first hit is noise,
+    /// second is pattern.
+    #[serde(default = "default_promote_threshold")]
+    pub promote_threshold: u32,
+    /// Violations of a lesson before it auto-demotes one tier
+    /// (`require` → `nudge` → `off`). Default `2`.
+    #[serde(default = "default_demote_threshold")]
+    pub demote_threshold: u32,
+    /// How many turns back the gate looks for a `thoth_recall` event when
+    /// enforcing `RequireRecall` rules. Default `3` — enough for a small
+    /// task without trapping long-running mutation bursts.
+    #[serde(default = "default_recall_window")]
+    pub recall_within_turns: u32,
+    /// Workflow violations within the rolling 7-day window that cause the
+    /// gate to hard-block further mutations (user must run
+    /// `thoth workflow reset`). Default `3`.
+    #[serde(default = "default_workflow_threshold")]
+    pub workflow_violation_threshold: u32,
+    /// Master switch for the auto-promotion engine. When `false` the
+    /// harvester still records outcomes but never rewrites lesson tiers —
+    /// operators must promote manually via `thoth lesson promote`.
+    /// Default `true`.
+    #[serde(default = "default_true")]
+    pub auto_promote: bool,
+    /// Master switch for the auto-demotion engine. Mirrors `auto_promote`
+    /// on the downward path. Default `true`.
+    #[serde(default = "default_true")]
+    pub auto_demote: bool,
+}
+
+fn default_promote_threshold() -> u32 {
+    2
+}
+
+fn default_demote_threshold() -> u32 {
+    2
+}
+
+fn default_recall_window() -> u32 {
+    3
+}
+
+fn default_workflow_threshold() -> u32 {
+    3
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for EnforcementConfig {
+    fn default() -> Self {
+        Self {
+            promote_threshold: default_promote_threshold(),
+            demote_threshold: default_demote_threshold(),
+            recall_within_turns: default_recall_window(),
+            workflow_violation_threshold: default_workflow_threshold(),
+            auto_promote: default_true(),
+            auto_demote: default_true(),
+        }
+    }
 }
 
 /// Enforcement policy for the memory-discipline loop.
@@ -1363,10 +1458,14 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
             .unwrap_or(0);
         let attempted_bytes = current_bytes + rendered.len();
         if attempted_bytes > cap {
-            return Err(
-                build_cap_error(MemoryKind::Preference, &path, current_bytes, cap, attempted_bytes)
-                    .await,
-            );
+            return Err(build_cap_error(
+                MemoryKind::Preference,
+                &path,
+                current_bytes,
+                cap,
+                attempted_bytes,
+            )
+            .await);
         }
         // Lazy init: write a header line if the file is missing so USER.md
         // matches the shape of MEMORY.md / LESSONS.md.
@@ -1394,11 +1493,7 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
                 .await;
             return Ok(());
         }
-        let mut f = match tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .await
-        {
+        let mut f = match tokio::fs::OpenOptions::new().append(true).open(&path).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(error = %e, "append_preference: open failed");
@@ -1453,9 +1548,14 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
         }
         let attempted_bytes = current_bytes + approx;
         if attempted_bytes > cap {
-            return Err(
-                build_cap_error(MemoryKind::Fact, &path, current_bytes, cap, attempted_bytes).await,
-            );
+            return Err(build_cap_error(
+                MemoryKind::Fact,
+                &path,
+                current_bytes,
+                cap,
+                attempted_bytes,
+            )
+            .await);
         }
         if let Err(e) = self.append_fact(f).await {
             tracing::warn!(error = %e, "append_fact_capped: underlying append failed");
@@ -1487,10 +1587,14 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
         }
         let attempted_bytes = current_bytes + approx;
         if attempted_bytes > cap {
-            return Err(
-                build_cap_error(MemoryKind::Lesson, &path, current_bytes, cap, attempted_bytes)
-                    .await,
-            );
+            return Err(build_cap_error(
+                MemoryKind::Lesson,
+                &path,
+                current_bytes,
+                cap,
+                attempted_bytes,
+            )
+            .await);
         }
         if let Err(e) = self.append_lesson(l).await {
             tracing::warn!(error = %e, "append_lesson_capped: underlying append failed");
@@ -1754,7 +1858,10 @@ mod cap_enforcement_tests {
             .expect_err("ambiguous replace should error");
         let msg = format!("{err}");
         assert!(msg.contains("ambiguous"), "unexpected error: {msg}");
-        assert!(msg.contains("2 candidates"), "should list candidate count: {msg}");
+        assert!(
+            msg.contains("2 candidates"),
+            "should list candidate count: {msg}"
+        );
         // Neither entry rewritten.
         let facts = store.read_facts().await.unwrap();
         assert_eq!(facts.len(), 2);
@@ -1788,7 +1895,10 @@ mod cap_enforcement_tests {
         let dir = tempdir().unwrap();
         let store = MarkdownStore::open(dir.path()).await.unwrap();
         store.append_fact(&fact("shared token here")).await.unwrap();
-        store.append_fact(&fact("shared token there")).await.unwrap();
+        store
+            .append_fact(&fact("shared token there"))
+            .await
+            .unwrap();
         // "shared" substring-matches both; Jaccard tie (both share only
         // "shared" with the query) so pick_entry must error.
         let err = store
@@ -1809,8 +1919,9 @@ mod cap_enforcement_tests {
             .append_preference("prefers dark mode", &["ui".to_string()], 1536)
             .await
             .expect("append_preference");
-        let body =
-            tokio::fs::read_to_string(dir.path().join("USER.md")).await.unwrap();
+        let body = tokio::fs::read_to_string(dir.path().join("USER.md"))
+            .await
+            .unwrap();
         assert!(body.contains("### prefers dark mode"));
         assert!(body.contains("tags: ui"));
         let size = store.size_bytes(MemoryKind::Preference).await.unwrap();
@@ -1822,13 +1933,12 @@ mod cap_enforcement_tests {
             .await
             .expect("history log created");
         assert!(
-            history.contains(r#""op":"append""#)
-                && history.contains(r#""kind":"preference""#),
+            history.contains(r#""op":"append""#) && history.contains(r#""kind":"preference""#),
             "history missing preference append entry: {history}"
         );
     }
 
-/// REQ-12: with `strict_content_policy = false` (default), a
+    /// REQ-12: with `strict_content_policy = false` (default), a
     /// commit-sha-only input must still be appended — the guard only
     /// emits a `tracing::warn!` and proceeds.
     #[tokio::test]
@@ -1884,10 +1994,7 @@ mod cap_enforcement_tests {
         );
         assert_eq!(check_content_policy("2025-04-18"), Some("date_only"));
         // Invariant keyword exempts the short input.
-        assert_eq!(
-            check_content_policy("must always use absolute paths"),
-            None,
-        );
+        assert_eq!(check_content_policy("must always use absolute paths"), None,);
     }
 }
 
@@ -1964,6 +2071,9 @@ mod history_tests {
             advice: advice.to_string(),
             success_count: 0,
             failure_count: 0,
+            enforcement: Default::default(),
+            suggested_enforcement: None,
+            block_message: None,
         }
     }
 
@@ -2046,4 +2156,121 @@ pub struct NudgeReport {
     pub lessons_added: u64,
     /// Skills proposed by the LLM and accepted.
     pub skills_added: u64,
+}
+
+#[cfg(test)]
+mod config {
+    //! Config-layer serde tests (DESIGN-SPEC REQ-28).
+    use super::*;
+
+    /// An empty `[enforcement]` table must deserialise to the canonical
+    /// `2 / 2 / 3 / 3 / true / true` default set.
+    #[test]
+    fn enforcement_defaults() {
+        // Empty table → all serde defaults.
+        let cfg: EnforcementConfig = toml::from_str("").expect("empty toml parses");
+        assert_eq!(cfg.promote_threshold, 2);
+        assert_eq!(cfg.demote_threshold, 2);
+        assert_eq!(cfg.recall_within_turns, 3);
+        assert_eq!(cfg.workflow_violation_threshold, 3);
+        assert!(cfg.auto_promote);
+        assert!(cfg.auto_demote);
+
+        // `Default` impl must match the serde path exactly.
+        let def = EnforcementConfig::default();
+        assert_eq!(def.promote_threshold, cfg.promote_threshold);
+        assert_eq!(def.demote_threshold, cfg.demote_threshold);
+        assert_eq!(def.recall_within_turns, cfg.recall_within_turns);
+        assert_eq!(
+            def.workflow_violation_threshold,
+            cfg.workflow_violation_threshold
+        );
+        assert_eq!(def.auto_promote, cfg.auto_promote);
+        assert_eq!(def.auto_demote, cfg.auto_demote);
+
+        // Missing `[enforcement]` section inside a bigger config also
+        // yields defaults — guards against accidental `deny_unknown_fields`
+        // regressions on `ConfigFile`.
+        let file: ConfigFile =
+            toml::from_str("[memory]\n").expect("config.toml without enforcement parses");
+        assert_eq!(file.enforcement.promote_threshold, 2);
+        assert!(file.enforcement.auto_promote);
+
+        // Partial override keeps untouched defaults intact.
+        let partial: EnforcementConfig =
+            toml::from_str("promote_threshold = 5\nauto_demote = false\n")
+                .expect("partial toml parses");
+        assert_eq!(partial.promote_threshold, 5);
+        assert_eq!(partial.demote_threshold, 2);
+        assert!(partial.auto_promote);
+        assert!(!partial.auto_demote);
+    }
+
+    // --- T-24 gap coverage: EnforcementConfig edge cases --------------------
+
+    /// A fully-populated `[enforcement]` block round-trips through TOML
+    /// without loss — guards serialize/deserialize symmetry.
+    #[test]
+    fn enforcement_full_override_roundtrips() {
+        let src = "promote_threshold = 7\n\
+                   demote_threshold = 8\n\
+                   recall_within_turns = 9\n\
+                   workflow_violation_threshold = 10\n\
+                   auto_promote = false\n\
+                   auto_demote = false\n";
+        let cfg: EnforcementConfig = toml::from_str(src).expect("full override parses");
+        assert_eq!(cfg.promote_threshold, 7);
+        assert_eq!(cfg.demote_threshold, 8);
+        assert_eq!(cfg.recall_within_turns, 9);
+        assert_eq!(cfg.workflow_violation_threshold, 10);
+        assert!(!cfg.auto_promote);
+        assert!(!cfg.auto_demote);
+
+        // Re-serialize and parse back — value-identical.
+        let s = toml::to_string(&cfg).expect("reserializes");
+        let back: EnforcementConfig = toml::from_str(&s).expect("reparses");
+        assert_eq!(back.promote_threshold, cfg.promote_threshold);
+        assert_eq!(back.demote_threshold, cfg.demote_threshold);
+        assert_eq!(back.recall_within_turns, cfg.recall_within_turns);
+        assert_eq!(
+            back.workflow_violation_threshold,
+            cfg.workflow_violation_threshold
+        );
+        assert_eq!(back.auto_promote, cfg.auto_promote);
+        assert_eq!(back.auto_demote, cfg.auto_demote);
+    }
+
+    /// Wrong value type (string where u32 expected) must fail to parse —
+    /// we do NOT want silent fallback to default that would mask a config
+    /// typo. Complements the positive default / partial tests above.
+    #[test]
+    fn enforcement_wrong_type_rejected() {
+        let bad = "promote_threshold = \"two\"\n";
+        let err = toml::from_str::<EnforcementConfig>(bad);
+        assert!(err.is_err(), "non-int must error, got {:?}", err);
+    }
+
+    /// Unknown keys in `[enforcement]` are ignored (no
+    /// `deny_unknown_fields`) — guards against a future regression that
+    /// would break `config.toml` forward-compat when new keys are added.
+    #[test]
+    fn enforcement_unknown_key_ignored() {
+        let src = "promote_threshold = 4\n\
+                   future_knob = 42\n";
+        let cfg: EnforcementConfig = toml::from_str(src).expect("unknown key must not error");
+        assert_eq!(cfg.promote_threshold, 4);
+        assert!(cfg.auto_promote);
+    }
+
+    /// Boolean flip of only `auto_promote` leaves `auto_demote` at its
+    /// default — exercises the per-field #[serde(default = ...)] wiring
+    /// distinct from the struct-level `#[serde(default)]`.
+    #[test]
+    fn enforcement_single_bool_flip() {
+        let src = "auto_promote = false\n";
+        let cfg: EnforcementConfig = toml::from_str(src).expect("parses");
+        assert!(!cfg.auto_promote);
+        assert!(cfg.auto_demote, "auto_demote default preserved");
+        assert_eq!(cfg.promote_threshold, 2);
+    }
 }

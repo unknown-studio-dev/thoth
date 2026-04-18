@@ -364,6 +364,14 @@ fn run(input: &Value) -> (Value, Option<String>, Option<TelemetryRecord>) {
         return (approve_json(None), None, telemetry);
     }
 
+    // T-16: rule-dispatch tier — runs BEFORE the recall-relevance engine.
+    // The first matching rule short-circuits the gate. On no match we fall
+    // through to the legacy `decide()` path below.
+    if let Some(short_circuit) = dispatch_rules(&root, &cfg, &actor, &tool_name, &tool_input, input)
+    {
+        return short_circuit;
+    }
+
     // Pull the recall pool — up to ~20 rows, within window_long.
     let recalls = match recent_recalls(&root, policy.window_long_secs) {
         Ok(v) => v,
@@ -1503,6 +1511,356 @@ fn ymd_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 // ===========================================================================
+// Rule dispatch (T-16, REQ-05 / REQ-06 / REQ-07 / REQ-09 / REQ-19)
+// ===========================================================================
+//
+// Sits structurally above the recall-relevance engine (`decide()`). Loads the
+// merged rule set (default → user → project → lessons → ignore) and walks
+// `effective()` looking for the first rule whose structured trigger matches
+// the current tool call. On match the rule's `Enforcement` decides what we
+// do; on no match the caller falls through to `decide()`.
+//
+// Errors at every layer (missing files, parse failures, missing markdown
+// store) are tolerated: a broken rule layer must never brick the editor —
+// it just degrades to "no rule matched, fall through".
+
+/// Compute a stable hash for the tool call envelope so an `OverrideManager`
+/// can match `(rule_id, tool_call_hash)` across separate gate invocations.
+/// Canonical form is `{tool_name, tool_input}` re-serialized through
+/// `serde_json::to_vec` (which sorts neither keys nor anything else, but is
+/// stable for the same in-memory `Value` shape we just parsed).
+fn tool_call_hash(input: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_vec(input).unwrap_or_default();
+    let digest = Sha256::digest(&canonical);
+    // Hex-encode without pulling another dep.
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Try to load every lesson currently on disk via [`MarkdownStore`]. Returns
+/// an empty vec on any failure — lesson rules are best-effort.
+fn load_lessons_blocking(root: &Path) -> Vec<thoth_core::memory::Lesson> {
+    use thoth_store::markdown::MarkdownStore;
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("[thoth-gate] tokio runtime: {e}");
+            return Vec::new();
+        }
+    };
+    rt.block_on(async {
+        match MarkdownStore::open(root).await {
+            Ok(store) => store.read_lessons().await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    })
+}
+
+/// Build a `ToolCall` view of the input payload for the lesson matcher.
+fn build_tool_call(tool_name: &str, tool_input: &Value) -> thoth_memory::lesson_matcher::ToolCall {
+    use thoth_memory::lesson_matcher::ToolCall;
+    let path = tool_input
+        .get("file_path")
+        .or_else(|| tool_input.get("notebook_path"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let command = tool_input
+        .get("command")
+        .and_then(Value::as_str)
+        .map(String::from);
+    // Concatenate Edit halves + Write content + NotebookEdit source so
+    // `content_regex` rules see the full mutation surface.
+    let mut content_parts: Vec<&str> = Vec::new();
+    for key in ["old_string", "new_string", "content", "new_source"] {
+        if let Some(s) = tool_input.get(key).and_then(Value::as_str) {
+            content_parts.push(s);
+        }
+    }
+    let content = if content_parts.is_empty() {
+        None
+    } else {
+        Some(content_parts.join("\n"))
+    };
+    let mut tc = ToolCall::new(tool_name);
+    tc.path = path;
+    tc.command = command;
+    tc.content = content;
+    tc
+}
+
+/// Telemetry helper for short-circuit verdicts emitted by the rule layer.
+fn rule_telemetry(
+    cfg: &GateConfig,
+    root: &Path,
+    actor: &str,
+    tool_name: &str,
+    tool_input: &Value,
+    decision: &str,
+    reason: &str,
+) -> Option<TelemetryRecord> {
+    cfg.telemetry_enabled.then(|| TelemetryRecord {
+        root: root.to_path_buf(),
+        ts_iso: now_iso(),
+        actor: actor.to_string(),
+        tool: tool_name.to_string(),
+        path: tool_input_path(tool_input),
+        decision: decision.to_string(),
+        reason: reason.to_string(),
+        recency_secs: None,
+        best_score: None,
+        considered: 0,
+        missed_tokens: Vec::new(),
+    })
+}
+
+/// Walk the merged rule set looking for the first matching rule. Returns
+/// `Some(short-circuit verdict)` for tiers that decide on their own and
+/// `None` to signal "fall through to recall-relevance engine".
+///
+/// `input` is the full hook envelope (used for `session_id` + canonical-JSON
+/// hashing); `tool_name` / `tool_input` are the parsed pieces.
+fn dispatch_rules(
+    root: &Path,
+    cfg: &GateConfig,
+    actor: &str,
+    tool_name: &str,
+    tool_input: &Value,
+    input: &Value,
+) -> Option<(Value, Option<String>, Option<TelemetryRecord>)> {
+    use thoth_core::memory::Enforcement;
+    use thoth_memory::lesson_matcher::LessonTriggerExt;
+    use thoth_memory::r#override::OverrideManager;
+    use thoth_memory::rules::layer_merge::load_from_paths;
+
+    // Layer paths. User TOML lives at `~/.thoth/rules.user.toml`, project at
+    // `<root>/rules.project.toml`, ignore at `<root>/rules.ignore`.
+    let user_toml = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".thoth").join("rules.user.toml"))
+        .unwrap_or_else(|| root.join("rules.user.toml"));
+    let project_toml = root.join("rules.project.toml");
+    let ignore_file = root.join("rules.ignore");
+
+    let lessons = load_lessons_blocking(root);
+    let merge = match load_from_paths(&user_toml, &project_toml, &ignore_file, &lessons) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[thoth-gate] rule load: {e}");
+            return None;
+        }
+    };
+    let effective = merge.effective();
+    if effective.is_empty() {
+        return None;
+    }
+
+    let call = build_tool_call(tool_name, tool_input);
+    let session_id = input
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    for rule in effective {
+        if !rule.trigger.matches(&call) {
+            continue;
+        }
+        match &rule.enforcement {
+            Enforcement::Block => {
+                let hash = tool_call_hash(input);
+                let mgr = OverrideManager::new(root);
+                let now_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let consumed = mgr
+                    .consume_if_match(&rule.id, &hash, now_secs)
+                    .unwrap_or(false);
+                if consumed {
+                    let reason = format!("override_consumed: {}", rule.id);
+                    let tel =
+                        rule_telemetry(cfg, root, actor, tool_name, tool_input, "pass", &reason);
+                    return Some((approve_json(Some(&reason)), None, tel));
+                }
+                let msg = rule
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "blocked by rule".to_string());
+                let tel =
+                    rule_telemetry(cfg, root, actor, tool_name, tool_input, "block", &rule.id);
+                return Some((block_json(&msg), Some(msg), tel));
+            }
+            Enforcement::RequireRecall {
+                recall_within_turns,
+            } => {
+                if let Err(msg) =
+                    check_require_recall(root, &rule.trigger.natural, *recall_within_turns)
+                {
+                    let tel = rule_telemetry(
+                        cfg,
+                        root,
+                        actor,
+                        tool_name,
+                        tool_input,
+                        "block",
+                        &format!("require_recall: {}", rule.id),
+                    );
+                    return Some((block_json(&msg), Some(msg), tel));
+                }
+                // Satisfied — keep walking; later rules in the same call
+                // chain may still want to fire.
+            }
+            Enforcement::WorkflowGate => {
+                if let Err(msg) = check_workflow_gate(root, &session_id, tool_name) {
+                    let tel = rule_telemetry(
+                        cfg,
+                        root,
+                        actor,
+                        tool_name,
+                        tool_input,
+                        "block",
+                        &format!("workflow_gate: {}", rule.id),
+                    );
+                    return Some((block_json(&msg), Some(msg), tel));
+                }
+            }
+            Enforcement::Require => {
+                // Inject machinery for `Require` lives in
+                // `UserPromptSubmit`/`SessionStart` hook surfaces (see
+                // hooks.rs); the gate just notes the match and falls
+                // through to the recall-relevance engine. Any actual
+                // text-injection happens out-of-band.
+            }
+            Enforcement::Advise => {
+                // Advisory rules are SessionStart-only banner inject —
+                // they have no PreToolUse effect.
+            }
+        }
+    }
+    None
+}
+
+// ===========================================================================
+// RequireRecall + WorkflowGate branches (T-17, REQ-09 / REQ-19)
+// ===========================================================================
+//
+// These two tiers sit structurally *above* the relevance engine: they're
+// triggered by a rule match in the enforcement config, not by the generic
+// recall-before-mutation contract. Both return `Err(msg)` on violation —
+// callers (the rule-dispatch path from T-16) turn that into an exit-2 block.
+// The helpers are pure so the unit test in this file can drive them
+// directly without spawning the binary.
+
+/// Shape of a recall event as persisted in `.thoth/gate.jsonl`. The gate
+/// writes its own telemetry there (one line per decision). A recall
+/// invocation is logged by the MCP server / UserPromptSubmit hook with
+/// `tool: "thoth_recall"` and the query text in `query` — we scan for
+/// that marker plus a substring match on the rule's trigger string.
+///
+/// "Turns" in `recall_within_turns` is approximated by "last N gate.jsonl
+/// rows" — each gate decision is a tool invocation, i.e. a turn.
+fn require_recall_satisfied(root: &Path, trigger: &str, recall_within_turns: u32) -> bool {
+    let path = root.join("gate.jsonl");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let needle = trigger.to_lowercase();
+    // Walk the tail of the file — the last `recall_within_turns` non-empty
+    // rows. If any of them is a `thoth_recall` event whose query or text
+    // field contains the trigger (case-insensitive), we're satisfied.
+    let window = recall_within_turns.max(1) as usize;
+    let tail: Vec<&str> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(window)
+        .collect();
+    for line in tail {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let tool = v.get("tool").and_then(Value::as_str).unwrap_or("");
+        let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+        let is_recall =
+            tool == "thoth_recall" || tool.ends_with("__thoth_recall") || kind == "query_issued";
+        if !is_recall {
+            continue;
+        }
+        if needle.is_empty() {
+            return true;
+        }
+        for field in ["query", "text", "reason"] {
+            if let Some(s) = v.get(field).and_then(Value::as_str)
+                && s.to_lowercase().contains(&needle)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `RequireRecall` branch: returns `Err(message)` if no matching
+/// `thoth_recall` event is found in `.thoth/gate.jsonl` within the
+/// configured turn window. The message is surfaced as the block reason.
+fn check_require_recall(
+    root: &Path,
+    trigger: &str,
+    recall_within_turns: u32,
+) -> Result<(), String> {
+    if require_recall_satisfied(root, trigger, recall_within_turns) {
+        Ok(())
+    } else {
+        Err(format!(
+            "RequireRecall: no `thoth_recall` matching `{trigger}` in last \
+             {recall_within_turns} turns. Call `thoth_recall({{\"query\": \"{trigger}\"}})` \
+             before proceeding."
+        ))
+    }
+}
+
+/// `WorkflowGate` branch: returns `Err(message)` if an active workflow
+/// exists for `session_id` whose *next* expected step doesn't match
+/// `tool_name`. A missing / inactive / empty-expected-steps workflow is
+/// vacuously OK (Phase 4a workflows have no step list).
+fn check_workflow_gate(root: &Path, session_id: &str, tool_name: &str) -> Result<(), String> {
+    use thoth_memory::workflow::WorkflowStateManager;
+    let mgr = WorkflowStateManager::new(root);
+    let state = match mgr.get(session_id) {
+        Ok(Some(s)) => s,
+        _ => return Ok(()),
+    };
+    if !matches!(state.status, thoth_memory::workflow::WorkflowStatus::Active) {
+        return Ok(());
+    }
+    // Vacuously pass Phase 4a (no expected_steps declared).
+    let gap = match mgr.detect_gap(session_id) {
+        Ok(g) => g,
+        Err(_) => return Ok(()),
+    };
+    let Some(next) = gap.first() else {
+        // All steps done; no gate to apply.
+        return Ok(());
+    };
+    if tool_name == next {
+        Ok(())
+    } else {
+        Err(format!(
+            "WorkflowGate: workflow `{}` expects next step `{next}`, got `{tool_name}`. \
+             Run the expected step or `thoth workflow reset` if the workflow is stale.",
+            state.workflow_name,
+        ))
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1632,10 +1990,7 @@ mod tests {
         assert_eq!(intent, Intent::ReadOnly);
         // And `thoth memory remove` / `preference` follow the same rule.
         let input = json!({"command": "thoth memory remove --kind lesson --query old"});
-        assert_eq!(
-            classify_intent("Bash", &input, &prefixes),
-            Intent::ReadOnly
-        );
+        assert_eq!(classify_intent("Bash", &input, &prefixes), Intent::ReadOnly);
         // MCP dispatch of `thoth_memory_replace` also passes ReadOnly.
         let input = json!({});
         assert_eq!(
@@ -2003,5 +2358,537 @@ gate_bash_readonly_prefixes = ["my-custom-tool "]
                 .iter()
                 .any(|p| p == "my-custom-tool ")
         );
+    }
+
+    // ======================================================================
+    // T-17: RequireRecall + WorkflowGate branches
+    // ======================================================================
+
+    mod gate {
+        pub(super) mod require_recall_and_workflow {
+            use crate::*;
+            use thoth_memory::workflow::WorkflowStateManager;
+
+            /// A recall row whose query contains the trigger within the
+            /// turn window satisfies `RequireRecall`.
+            #[test]
+            fn require_recall_matches_when_recent_query_contains_trigger() {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                std::fs::write(
+                    root.join("gate.jsonl"),
+                    r#"{"tool":"Edit","decision":"pass"}
+{"tool":"thoth_recall","query":"server.rs retriever","ts":"2026-04-18T00:00:00Z"}
+{"tool":"Edit","decision":"pass"}
+"#,
+                )
+                .unwrap();
+                assert!(check_require_recall(root, "retriever", 5).is_ok());
+            }
+
+            /// `query_issued` kind (DESIGN-SPEC wording) also counts as a
+            /// recall event, even when `tool` isn't explicitly thoth_recall.
+            #[test]
+            fn require_recall_accepts_query_issued_kind() {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                std::fs::write(
+                    root.join("gate.jsonl"),
+                    r#"{"kind":"query_issued","text":"retriever impl"}
+"#,
+                )
+                .unwrap();
+                assert!(check_require_recall(root, "retriever", 3).is_ok());
+            }
+
+            /// Trigger not present in any recent recall → block with an
+            /// actionable stderr message.
+            #[test]
+            fn require_recall_blocks_when_trigger_missing() {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                std::fs::write(
+                    root.join("gate.jsonl"),
+                    r#"{"tool":"thoth_recall","query":"something unrelated"}
+{"tool":"Edit","decision":"pass"}
+"#,
+                )
+                .unwrap();
+                let err = check_require_recall(root, "retriever", 3).unwrap_err();
+                assert!(err.contains("RequireRecall"), "{err}");
+                assert!(err.contains("retriever"), "{err}");
+            }
+
+            /// A recall outside the turn window must not satisfy the rule.
+            #[test]
+            fn require_recall_respects_turn_window() {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                // Matching recall at the top of the log; 4 unrelated rows after it.
+                // `recall_within_turns = 3` only sees the last 3 rows → miss.
+                std::fs::write(
+                    root.join("gate.jsonl"),
+                    r#"{"tool":"thoth_recall","query":"retriever changes"}
+{"tool":"Edit","decision":"pass"}
+{"tool":"Edit","decision":"pass"}
+{"tool":"Edit","decision":"pass"}
+{"tool":"Edit","decision":"pass"}
+"#,
+                )
+                .unwrap();
+                assert!(check_require_recall(root, "retriever", 3).is_err());
+                // Widening the window finds the old recall.
+                assert!(check_require_recall(root, "retriever", 8).is_ok());
+            }
+
+            /// Missing gate.jsonl fails closed — nothing to match.
+            #[test]
+            fn require_recall_missing_log_is_block() {
+                let tmp = tempfile::tempdir().unwrap();
+                assert!(check_require_recall(tmp.path(), "x", 3).is_err());
+            }
+
+            /// A tool call matching the active workflow's next expected
+            /// step passes the gate.
+            #[test]
+            fn workflow_gate_passes_when_tool_matches_next_step() {
+                let tmp = tempfile::tempdir().unwrap();
+                let mgr = WorkflowStateManager::new(tmp.path());
+                mgr.start_workflow_with_steps(
+                    "sess-1",
+                    "hoangsa",
+                    0,
+                    vec!["menu".into(), "prepare".into(), "cook".into()],
+                )
+                .unwrap();
+                assert!(check_workflow_gate(tmp.path(), "sess-1", "menu").is_ok());
+            }
+
+            /// A tool call diverging from the expected step is blocked with
+            /// the workflow name and expected step in the message.
+            #[test]
+            fn workflow_gate_blocks_on_divergence() {
+                let tmp = tempfile::tempdir().unwrap();
+                let mgr = WorkflowStateManager::new(tmp.path());
+                mgr.start_workflow_with_steps(
+                    "sess-2",
+                    "hoangsa",
+                    0,
+                    vec!["menu".into(), "prepare".into()],
+                )
+                .unwrap();
+                let err = check_workflow_gate(tmp.path(), "sess-2", "cook").unwrap_err();
+                assert!(err.contains("WorkflowGate"), "{err}");
+                assert!(err.contains("menu"), "{err}");
+                assert!(err.contains("hoangsa"), "{err}");
+            }
+
+            /// After completing a step, the gate advances to the next
+            /// expected step.
+            #[test]
+            fn workflow_gate_advances_with_completed_steps() {
+                let tmp = tempfile::tempdir().unwrap();
+                let mgr = WorkflowStateManager::new(tmp.path());
+                mgr.start_workflow_with_steps(
+                    "sess-3",
+                    "hoangsa",
+                    0,
+                    vec!["menu".into(), "prepare".into(), "cook".into()],
+                )
+                .unwrap();
+                mgr.advance_step("sess-3", "menu", 1).unwrap();
+                // `menu` is done → next expected = `prepare`.
+                assert!(check_workflow_gate(tmp.path(), "sess-3", "prepare").is_ok());
+                assert!(check_workflow_gate(tmp.path(), "sess-3", "menu").is_err());
+            }
+
+            /// Phase 4a workflows (no expected_steps) never gate.
+            #[test]
+            fn workflow_gate_vacuous_for_phase_4a() {
+                let tmp = tempfile::tempdir().unwrap();
+                let mgr = WorkflowStateManager::new(tmp.path());
+                mgr.start_workflow("sess-4", "simple", 0).unwrap();
+                assert!(check_workflow_gate(tmp.path(), "sess-4", "anything").is_ok());
+            }
+
+            /// Missing / unknown session IDs are vacuously OK — the gate
+            /// only fires when an active workflow is on record.
+            #[test]
+            fn workflow_gate_no_session_is_ok() {
+                let tmp = tempfile::tempdir().unwrap();
+                assert!(check_workflow_gate(tmp.path(), "ghost", "anything").is_ok());
+            }
+        }
+
+        // ==============================================================
+        // T-16: rule-dispatch wiring
+        // ==============================================================
+        //
+        // These tests drive `dispatch_rules` directly. Each test shoves a
+        // single project rule on disk (overriding any default with the
+        // same id is fine — the merger keys on id) and asserts the right
+        // tier path fires.
+        pub(super) mod rule_dispatch {
+            use crate::*;
+            use serde_json::json;
+            use thoth_memory::r#override::OverrideManager;
+            use thoth_memory::workflow::WorkflowStateManager;
+
+            fn cfg() -> GateConfig {
+                GateConfig {
+                    telemetry_enabled: false,
+                    ..GateConfig::default()
+                }
+            }
+
+            /// Isolate `$HOME` so the user-layer TOML lookup can't leak
+            /// onto a real `~/.thoth/rules.user.toml`. Returns the tmp
+            /// dir so the caller controls its lifetime.
+            fn isolated_home() -> tempfile::TempDir {
+                let h = tempfile::tempdir().unwrap();
+                // SAFETY: tests are single-threaded per binary in `cargo
+                // test --bin thoth-gate`; setting HOME here is fine.
+                unsafe {
+                    std::env::set_var("HOME", h.path());
+                }
+                h
+            }
+
+            fn write_project_rule(root: &std::path::Path, body: &str) {
+                std::fs::write(root.join("rules.project.toml"), body).unwrap();
+            }
+
+            /// No rule files anywhere → dispatch returns None and the
+            /// caller falls through to the recall-relevance engine.
+            #[test]
+            fn no_rule_files_falls_through() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                let input = json!({
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/foo.rs", "old_string": "a", "new_string": "b"}
+                });
+                let res = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Edit",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                );
+                assert!(res.is_none(), "dispatch should fall through with no rules");
+            }
+
+            /// A `Block` rule with no matching override returns a
+            /// block_json verdict carrying the rule message.
+            #[test]
+            fn block_tier_without_override_blocks() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                write_project_rule(
+                    tmp.path(),
+                    r#"
+[rules.no-rm-rf]
+enforcement = "Block"
+tool = "Bash"
+cmd_regex = "rm -rf"
+message = "rm -rf is forbidden"
+natural = "no rm -rf"
+"#,
+                );
+                let input = json!({
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "rm -rf /tmp/foo"}
+                });
+                let (verdict, stderr, _) = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Bash",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                )
+                .expect("rule should match");
+                assert_eq!(
+                    verdict.get("decision").and_then(Value::as_str),
+                    Some("block")
+                );
+                assert!(
+                    verdict
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .contains("rm -rf")
+                );
+                assert!(stderr.unwrap().contains("rm -rf"));
+            }
+
+            /// Block tier with a pre-approved override for `(rule_id,
+            /// hash)` short-circuits to approve and consumes the override.
+            #[test]
+            fn block_tier_consumes_matching_override() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                write_project_rule(
+                    tmp.path(),
+                    r#"
+[rules.block-edit-foo]
+enforcement = "Block"
+tool = "Edit"
+path_glob = "**/foo.rs"
+message = "no foo"
+natural = "no foo"
+"#,
+                );
+                let input = json!({
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/foo.rs", "old_string": "a", "new_string": "b"}
+                });
+                // Pre-approve an override for this exact tool-call hash.
+                let mgr = OverrideManager::new(tmp.path());
+                let hash = tool_call_hash(&input);
+                let req = mgr
+                    .request("block-edit-foo", "test reason", &hash, "sess-x", 100)
+                    .unwrap();
+                mgr.approve(&req.id, 110, 1).unwrap();
+
+                let (verdict, _, _) = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Edit",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                )
+                .expect("rule should match");
+                assert_eq!(
+                    verdict.get("decision").and_then(Value::as_str),
+                    Some("approve")
+                );
+                assert!(
+                    verdict
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .contains("override_consumed")
+                );
+                // Second call with same hash — override is now consumed
+                // (ttl=1 → moved to Consumed) → blocks again.
+                let (verdict2, _, _) = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Edit",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                )
+                .expect("rule should still match");
+                assert_eq!(
+                    verdict2.get("decision").and_then(Value::as_str),
+                    Some("block")
+                );
+            }
+
+            /// `RequireRecall` tier blocks when no matching recall exists
+            /// in `gate.jsonl`.
+            #[test]
+            fn require_recall_tier_blocks_without_recall() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                write_project_rule(
+                    tmp.path(),
+                    r#"
+[rules.needs-recall]
+tool = "Edit"
+path_glob = "**/retriever.rs"
+natural = "retriever"
+enforcement = { RequireRecall = { recall_within_turns = 3 } }
+"#,
+                );
+                // Empty gate.jsonl → no recall → block.
+                std::fs::write(tmp.path().join("gate.jsonl"), "").unwrap();
+                let input = json!({
+                    "tool_name": "Edit",
+                    "tool_input": {
+                        "file_path": "src/retriever.rs",
+                        "old_string": "a",
+                        "new_string": "b"
+                    }
+                });
+                let (verdict, _, _) = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Edit",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                )
+                .expect("rule should match");
+                assert_eq!(
+                    verdict.get("decision").and_then(Value::as_str),
+                    Some("block")
+                );
+                assert!(
+                    verdict
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .contains("retriever")
+                );
+            }
+
+            /// `RequireRecall` is satisfied → dispatch returns None
+            /// (falls through to legacy decide).
+            #[test]
+            fn require_recall_tier_passes_with_recall() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                write_project_rule(
+                    tmp.path(),
+                    r#"
+[rules.needs-recall]
+tool = "Edit"
+path_glob = "**/retriever.rs"
+natural = "retriever"
+enforcement = { RequireRecall = { recall_within_turns = 5 } }
+"#,
+                );
+                std::fs::write(
+                    tmp.path().join("gate.jsonl"),
+                    "{\"tool\":\"thoth_recall\",\"query\":\"retriever updates\"}\n",
+                )
+                .unwrap();
+                let input = json!({
+                    "tool_name": "Edit",
+                    "tool_input": {
+                        "file_path": "src/retriever.rs",
+                        "old_string": "a",
+                        "new_string": "b"
+                    }
+                });
+                let res = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Edit",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                );
+                assert!(res.is_none(), "satisfied RequireRecall should fall through");
+            }
+
+            /// `WorkflowGate` tier blocks when the tool diverges from the
+            /// next expected workflow step.
+            #[test]
+            fn workflow_gate_tier_blocks_on_divergence() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                write_project_rule(
+                    tmp.path(),
+                    r#"
+[rules.workflow]
+tool = "Bash"
+cmd_regex = "."
+enforcement = "WorkflowGate"
+natural = "workflow"
+"#,
+                );
+                let mgr = WorkflowStateManager::new(tmp.path());
+                mgr.start_workflow_with_steps(
+                    "sess-9",
+                    "hoangsa",
+                    0,
+                    vec!["menu".into(), "prepare".into()],
+                )
+                .unwrap();
+                let input = json!({
+                    "tool_name": "Bash",
+                    "session_id": "sess-9",
+                    "tool_input": {"command": "echo nope"}
+                });
+                let (verdict, _, _) = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Bash",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                )
+                .expect("rule should match");
+                assert_eq!(
+                    verdict.get("decision").and_then(Value::as_str),
+                    Some("block")
+                );
+                assert!(
+                    verdict
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .contains("WorkflowGate")
+                );
+            }
+
+            /// `Advise` tier never short-circuits — it's banner-only.
+            #[test]
+            fn advise_tier_falls_through() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                write_project_rule(
+                    tmp.path(),
+                    r#"
+[rules.advise-only]
+enforcement = "Advise"
+tool = "Edit"
+path_glob = "**/*.rs"
+natural = "advise"
+message = "FYI: editing rust"
+"#,
+                );
+                let input = json!({
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/x.rs", "old_string": "a", "new_string": "b"}
+                });
+                let res = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Edit",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                );
+                assert!(res.is_none(), "Advise rules must not short-circuit");
+            }
+
+            /// `Require` tier falls through too — inject machinery lives
+            /// out of band in the SessionStart hook.
+            #[test]
+            fn require_tier_falls_through() {
+                let _h = isolated_home();
+                let tmp = tempfile::tempdir().unwrap();
+                write_project_rule(
+                    tmp.path(),
+                    r#"
+[rules.require-only]
+enforcement = "Require"
+tool = "Edit"
+path_glob = "**/*.rs"
+natural = "require"
+"#,
+                );
+                let input = json!({
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/x.rs", "old_string": "a", "new_string": "b"}
+                });
+                let res = dispatch_rules(
+                    tmp.path(),
+                    &cfg(),
+                    "default",
+                    "Edit",
+                    input.get("tool_input").unwrap(),
+                    &input,
+                );
+                assert!(res.is_none(), "Require rules must not short-circuit");
+            }
+        }
     }
 }

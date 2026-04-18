@@ -947,7 +947,9 @@ async fn backfill_memory_caps(root: &Path) -> Result<()> {
                 .unwrap_or(body.len());
             let mut out = String::with_capacity(body.len() + patch.len() + 64);
             out.push_str(&body[..after_hdr]);
-            out.push_str("# Backfilled by `thoth setup` self-heal — byte caps for durable memory files.\n");
+            out.push_str(
+                "# Backfilled by `thoth setup` self-heal — byte caps for durable memory files.\n",
+            );
             out.push_str(&patch);
             out.push('\n');
             out.push_str(&body[after_hdr..]);
@@ -1040,7 +1042,9 @@ mod tests {
 
         let user = root.join("USER.md");
         assert!(user.exists(), "USER.md should be created");
-        let body = tokio::fs::read_to_string(&user).await.expect("read USER.md");
+        let body = tokio::fs::read_to_string(&user)
+            .await
+            .expect("read USER.md");
         assert!(body.contains("# USER.md"), "USER.md header missing");
         assert!(
             body.contains("preferences") || body.contains("first-person"),

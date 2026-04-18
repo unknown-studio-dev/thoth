@@ -214,6 +214,9 @@ impl CodeMemory {
             advice: advice.into(),
             success_count: 0,
             failure_count: 0,
+            enforcement: Default::default(),
+            suggested_enforcement: None,
+            block_message: None,
         };
         self.store.markdown.append_lesson(&lesson).await
     }

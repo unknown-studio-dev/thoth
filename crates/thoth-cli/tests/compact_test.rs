@@ -36,8 +36,7 @@ fn compact_short_circuits_when_thoth_dir_missing() {
     let (stdout, _stderr, ok) = run_compact(tmp.path(), &["--dry-run"]);
     assert!(ok, "missing `.thoth/` must not error out: stdout={stdout}");
     assert!(
-        stdout.to_lowercase().contains("nothing to compact")
-            || stdout.contains("no .thoth"),
+        stdout.to_lowercase().contains("nothing to compact") || stdout.contains("no .thoth"),
         "expected nothing-to-compact message, got: {stdout}"
     );
 }

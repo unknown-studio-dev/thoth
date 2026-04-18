@@ -65,10 +65,7 @@ fn migrate_drops_session_handoff_and_commit_sha() {
     std::fs::write(thoth.join("LESSONS.md"), "# LESSONS.md\n").unwrap();
 
     let (stdout, stderr, ok) = run_migrate(tmp.path());
-    assert!(
-        ok,
-        "migrate failed.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
+    assert!(ok, "migrate failed.\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
 
     let after = std::fs::read_to_string(thoth.join("MEMORY.md")).expect("read MEMORY.md");
 
@@ -104,7 +101,9 @@ fn migrate_moves_user_preference_to_user_md() {
     let memory_after = std::fs::read_to_string(thoth.join("MEMORY.md")).unwrap();
     // Moved out of MEMORY.md.
     assert!(
-        !memory_after.to_lowercase().contains("user prefers concise answers"),
+        !memory_after
+            .to_lowercase()
+            .contains("user prefers concise answers"),
         "user preference still in MEMORY.md after migrate:\n{memory_after}"
     );
 

@@ -8,10 +8,14 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use thoth_core::{Event, Fact, Lesson, MemoryKind, MemoryMeta, Outcome, Query, UserSignal};
+use thoth_core::{
+    Enforcement, Event, Fact, Lesson, LessonTrigger, MemoryKind, MemoryMeta, Outcome, Query,
+    UserSignal,
+};
 use thoth_memory::{
-    CapExceededError, DisciplineConfig, GuardedAppendError, MarkdownStoreMemoryExt,
-    MemoryConfig, MemoryKind as MdKind, MemoryManager,
+    CapExceededError, DisciplineConfig, GuardedAppendError, MarkdownStoreMemoryExt, MemoryConfig,
+    MemoryKind as MdKind, MemoryManager, r#override::OverrideManager,
+    workflow::WorkflowStateManager,
 };
 use thoth_parse::LanguageRegistry;
 use thoth_retrieve::{Indexer, RetrieveConfig, Retriever};
@@ -219,6 +223,13 @@ impl Server {
             "thoth_impact" => self.tool_impact(arguments).await,
             "thoth_symbol_context" => self.tool_symbol_context(arguments).await,
             "thoth_detect_changes" => self.tool_detect_changes(arguments).await,
+            "thoth_override_request" => self.tool_override_request(arguments).await,
+            "thoth_override_approve" => self.tool_override_approve(arguments).await,
+            "thoth_override_reject" => self.tool_override_reject(arguments).await,
+            "thoth_workflow_start" => self.tool_workflow_start(arguments).await,
+            "thoth_workflow_advance" => self.tool_workflow_advance(arguments).await,
+            "thoth_workflow_complete" => self.tool_workflow_complete(arguments).await,
+            "thoth_workflow_list" => self.tool_workflow_list().await,
             other => {
                 return Err(RpcError::new(
                     error_codes::METHOD_NOT_FOUND,
@@ -413,7 +424,11 @@ impl Server {
             .inner
             .store
             .markdown
-            .append_fact_guarded(&fact, mem_cfg.cap_memory_bytes, mem_cfg.strict_content_policy)
+            .append_fact_guarded(
+                &fact,
+                mem_cfg.cap_memory_bytes,
+                mem_cfg.strict_content_policy,
+            )
             .await
         {
             Ok(()) => {
@@ -432,24 +447,60 @@ impl Server {
     }
 
     async fn tool_remember_lesson(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        // `trigger` may arrive as either a legacy bare string (back-compat) or
+        // a structured `LessonTrigger` object with optional
+        // tool/path_glob/cmd_regex/content_regex + required `natural` text.
+        // Per REQ-03, `suggested_enforcement` is recorded as audit-only; the
+        // actual enforcement tier is always `Advise` at creation time and is
+        // promoted later by evidence-driven auto-promotion in the outcome
+        // harvester.
         #[derive(Deserialize)]
         struct Args {
-            trigger: String,
+            trigger: Value,
             advice: String,
+            #[serde(default)]
+            suggested_enforcement: Option<Enforcement>,
+            #[serde(default)]
+            block_message: Option<String>,
             #[serde(default)]
             stage: bool,
         }
         let Args {
             trigger,
             advice,
+            suggested_enforcement,
+            block_message,
             stage,
         } = serde_json::from_value(args)?;
+
+        let parsed_trigger: LessonTrigger = match trigger {
+            Value::String(s) => LessonTrigger::natural_only(s.trim()),
+            Value::Object(_) => serde_json::from_value(trigger)
+                .map_err(|e| anyhow::anyhow!("invalid trigger object: {e}"))?,
+            Value::Null => LessonTrigger::default(),
+            other => {
+                anyhow::bail!(
+                    "`trigger` must be a string or structured object, got: {}",
+                    other
+                );
+            }
+        };
+        // The `Lesson.trigger` string field is what the markdown store and the
+        // existing conflict check key off; render the natural-text slot into
+        // it. Structured matchers are surfaced via `data` in the response so
+        // callers (and tests) can confirm they round-tripped.
+        let trigger_natural = parsed_trigger.natural.trim().to_string();
         let lesson = Lesson {
             meta: MemoryMeta::new(MemoryKind::Reflective),
-            trigger: trigger.trim().to_string(),
+            trigger: trigger_natural.clone(),
             advice: advice.trim().to_string(),
             success_count: 0,
             failure_count: 0,
+            // REQ-03: creation-time enforcement is always `Advise` regardless
+            // of what the agent suggested.
+            enforcement: Enforcement::default(),
+            suggested_enforcement: suggested_enforcement.clone(),
+            block_message: block_message.clone(),
         };
         let cfg = DisciplineConfig::load_or_default(&self.inner.root).await;
         let mem_cfg = MemoryConfig::load_or_default(&self.inner.root).await;
@@ -483,7 +534,11 @@ impl Server {
             let text = format!("{note}: {}", lesson.trigger);
             let data = json!({
                 "trigger": lesson.trigger,
+                "structured_trigger": parsed_trigger,
                 "advice": lesson.advice,
+                "enforcement": lesson.enforcement,
+                "suggested_enforcement": lesson.suggested_enforcement,
+                "block_message": lesson.block_message,
                 "path": path.display().to_string(),
                 "staged": true,
                 "conflict": conflict.map(|l| json!({
@@ -509,7 +564,11 @@ impl Server {
                 let text = format!("committed to LESSONS.md: {}", lesson.trigger);
                 let data = json!({
                     "trigger": lesson.trigger,
+                    "structured_trigger": parsed_trigger,
                     "advice": lesson.advice,
+                    "enforcement": lesson.enforcement,
+                    "suggested_enforcement": lesson.suggested_enforcement,
+                    "block_message": lesson.block_message,
                     "path": path.display().to_string(),
                     "staged": false,
                     "conflict": Value::Null,
@@ -518,6 +577,235 @@ impl Server {
             }
             Err(e) => Ok(guarded_error_output(e)),
         }
+    }
+
+    // -- Enforcement: override request flow --------------------------------
+
+    /// Session id used by override/workflow records. Uses `CLAUDE_SESSION_ID`
+    /// when present (set by Claude Code hooks), else a stable `"local"` label.
+    fn session_id() -> String {
+        std::env::var("CLAUDE_SESSION_ID").unwrap_or_else(|_| "local".into())
+    }
+
+    fn override_manager(&self) -> OverrideManager {
+        OverrideManager::new(&self.inner.root)
+    }
+
+    fn workflow_manager(&self) -> WorkflowStateManager {
+        WorkflowStateManager::new(self.inner.root.clone())
+    }
+
+    /// `thoth_override_request` — agent files an override request against a
+    /// rule that just blocked a tool call. Writes to
+    /// `.thoth/override-requests/<uuid>.json` and returns the request id so
+    /// the agent can tell the user how to approve / reject it.
+    async fn tool_override_request(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            rule_id: String,
+            reason: String,
+            tool_call_hash: String,
+        }
+        let Args {
+            rule_id,
+            reason,
+            tool_call_hash,
+        } = serde_json::from_value(args)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mgr = self.override_manager();
+        let req = mgr.request(
+            rule_id.clone(),
+            reason,
+            tool_call_hash,
+            Self::session_id(),
+            now,
+        )?;
+        let path = self
+            .inner
+            .root
+            .join("override-requests")
+            .join(format!("{}.json", req.id));
+        let text = format!(
+            "override request filed for rule `{rule_id}`. \
+             User must run `thoth override approve {}` (or reject) before \
+             the blocked tool call can proceed.",
+            req.id,
+        );
+        let data = json!({
+            "request_id": req.id,
+            "rule_id": req.rule_id,
+            "status": req.status,
+            "path": path.display().to_string(),
+            "session_id": req.session_id,
+            "message": "waiting_for_approval",
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// `thoth_override_approve` — programmatic approval path (the CLI uses
+    /// the same underlying [`OverrideManager::approve`]). Exposed via MCP so
+    /// automation / tests can drive the full lifecycle without shelling out.
+    async fn tool_override_approve(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            request_id: String,
+            #[serde(default = "default_ttl_turns")]
+            ttl_turns: u32,
+        }
+        fn default_ttl_turns() -> u32 {
+            1
+        }
+        let Args {
+            request_id,
+            ttl_turns,
+        } = serde_json::from_value(args)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mgr = self.override_manager();
+        let req = mgr.approve(&request_id, now, ttl_turns)?;
+        let data = json!({
+            "request_id": req.id,
+            "rule_id": req.rule_id,
+            "status": req.status,
+            "ttl_turns": ttl_turns,
+        });
+        let text = format!("approved override `{}` (ttl {} turn(s))", req.id, ttl_turns);
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// `thoth_override_reject` — reject a pending override request.
+    async fn tool_override_reject(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            request_id: String,
+            #[serde(default)]
+            reason: Option<String>,
+        }
+        let Args { request_id, reason } = serde_json::from_value(args)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mgr = self.override_manager();
+        let req = mgr.reject(&request_id, now, reason.clone())?;
+        let data = json!({
+            "request_id": req.id,
+            "rule_id": req.rule_id,
+            "status": req.status,
+            "reason": reason,
+        });
+        let text = format!("rejected override `{}`", req.id);
+        Ok(ToolOutput::new(data, text))
+    }
+
+    // -- Enforcement: workflow gate (Phase 4a) ------------------------------
+
+    /// `thoth_workflow_start` — slash-command entry point declaring that a
+    /// workflow session has begun. Persists a Phase 4a state file under
+    /// `.thoth/workflow/<session_id>.json`.
+    async fn tool_workflow_start(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            workflow_name: String,
+            #[serde(default)]
+            expected_steps: Vec<String>,
+        }
+        let Args {
+            workflow_name,
+            expected_steps,
+        } = serde_json::from_value(args)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let session_id = Self::session_id();
+        let mgr = self.workflow_manager();
+        let state = if expected_steps.is_empty() {
+            mgr.start_workflow(session_id.clone(), workflow_name.clone(), now)?
+        } else {
+            mgr.start_workflow_with_steps(
+                session_id.clone(),
+                workflow_name.clone(),
+                now,
+                expected_steps,
+            )?
+        };
+        let data = json!({
+            "session_id": state.session_id,
+            "workflow_name": state.workflow_name,
+            "started_at": state.started_at,
+            "expected_steps": state.expected_steps,
+            "status": state.status,
+        });
+        let text = format!("workflow `{workflow_name}` started for session {session_id}");
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// `thoth_workflow_advance` — record a checkpoint step for the active
+    /// workflow in the current session (Phase 4b). Skipped expected steps
+    /// will be detected by the Stop hook via `detect_gap`.
+    async fn tool_workflow_advance(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            step_id: String,
+        }
+        let Args { step_id } = serde_json::from_value(args)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let session_id = Self::session_id();
+        let mgr = self.workflow_manager();
+        let state = mgr.advance_step(&session_id, step_id.clone(), now)?;
+        let gap = mgr.detect_gap(&session_id).unwrap_or_default();
+        let data = json!({
+            "session_id": state.session_id,
+            "workflow_name": state.workflow_name,
+            "step_id": step_id,
+            "completed_steps": state.completed_steps,
+            "expected_steps": state.expected_steps,
+            "remaining_steps": gap,
+            "advanced_at": now,
+            "status": state.status,
+        });
+        let text = format!(
+            "workflow `{}` advanced to step `{step_id}` (session {})",
+            state.workflow_name, state.session_id
+        );
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// `thoth_workflow_complete` — mark the active workflow for the current
+    /// session as completed. The Stop hook treats a missing complete call as
+    /// a Phase 4a violation.
+    async fn tool_workflow_complete(&self, _args: Value) -> anyhow::Result<ToolOutput> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let session_id = Self::session_id();
+        let mgr = self.workflow_manager();
+        let state = mgr.complete_workflow(&session_id, now)?;
+        let data = json!({
+            "session_id": state.session_id,
+            "workflow_name": state.workflow_name,
+            "completed_at": now,
+            "status": state.status,
+        });
+        let text = format!(
+            "workflow `{}` completed for session {}",
+            state.workflow_name, state.session_id
+        );
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// `thoth_workflow_list` — enumerate every workflow currently in the
+    /// `Active` state (primarily for CLI introspection & tests).
+    async fn tool_workflow_list(&self) -> anyhow::Result<ToolOutput> {
+        let mgr = self.workflow_manager();
+        let active = mgr.list_active()?;
+        let summaries: Vec<Value> = active
+            .iter()
+            .map(|s| {
+                json!({
+                    "session_id": s.session_id,
+                    "workflow_name": s.workflow_name,
+                    "started_at": s.started_at,
+                    "completed_steps": s.completed_steps,
+                    "status": s.status,
+                })
+            })
+            .collect();
+        let text = format!("{} active workflow(s)", active.len());
+        let data = json!({ "active": summaries, "count": active.len() });
+        Ok(ToolOutput::new(data, text))
     }
 
     async fn tool_remember_preference(&self, args: Value) -> anyhow::Result<ToolOutput> {
@@ -598,12 +886,7 @@ impl Server {
         }
         let Args { kind, query } = serde_json::from_value(args)?;
         let md_kind = parse_md_kind(&kind)?;
-        let idx = self
-            .inner
-            .store
-            .markdown
-            .remove(md_kind, &query)
-            .await?;
+        let idx = self.inner.store.markdown.remove(md_kind, &query).await?;
         let path = md_kind_path(&self.inner.root, md_kind);
         let text = format!("removed entry [{idx}] from {}", path.display());
         let data = json!({
@@ -1756,13 +2039,50 @@ fn tools_catalog() -> Vec<Tool> {
         Tool {
             name: "thoth_remember_lesson".to_string(),
             description: "Append a reflective lesson to LESSONS.md. Use this after a mistake \
-                          or surprise so future sessions can avoid the trap."
+                          or surprise so future sessions can avoid the trap. `trigger` may be \
+                          a plain string (legacy) or a structured object with optional \
+                          `tool` / `path_glob` / `cmd_regex` / `content_regex` matchers plus \
+                          a required `natural` description. `suggested_enforcement` is audit- \
+                          only — the lesson is always saved at `Advise` tier; promotion is \
+                          evidence-driven by the outcome harvester (REQ-03)."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "trigger": { "type": "string", "description": "When this lesson should be recalled." },
-                    "advice":  { "type": "string", "description": "The lesson / rule itself." }
+                    "trigger": {
+                        "oneOf": [
+                            {
+                                "type": "string",
+                                "description": "Legacy natural-language trigger."
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "tool":           { "type": "string", "description": "Tool name filter: Edit/Write/Bash/etc." },
+                                    "path_glob":      { "type": "string", "description": "Glob for Edit/Write/Read path." },
+                                    "cmd_regex":      { "type": "string", "description": "Regex for Bash command strings." },
+                                    "content_regex":  { "type": "string", "description": "Regex for Edit old_string/new_string." },
+                                    "natural":        { "type": "string", "description": "Human-readable trigger description." }
+                                },
+                                "required": ["natural"]
+                            }
+                        ]
+                    },
+                    "advice":  { "type": "string", "description": "The lesson / rule itself." },
+                    "suggested_enforcement": {
+                        "type": "string",
+                        "enum": ["Advise", "Require", "Block", "WorkflowGate"],
+                        "description": "Tier the proposer suggests. Audit only — stored lesson enforcement starts at Advise."
+                    },
+                    "block_message": {
+                        "type": "string",
+                        "description": "Message shown via stderr when this lesson blocks a tool call (used once promoted to Block)."
+                    },
+                    "stage": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Force staging to LESSONS.pending.md even in auto-commit mode."
+                    }
                 },
                 "required": ["trigger", "advice"]
             }),
@@ -2041,6 +2361,84 @@ fn tools_catalog() -> Vec<Tool> {
                 },
                 "required": ["slug", "body"]
             }),
+        },
+        Tool {
+            name: "thoth_override_request".to_string(),
+            description: "File an override request against a rule that just blocked a tool \
+                          call. Persists to `.thoth/override-requests/<uuid>.json` and waits \
+                          for user approval via `thoth override approve <uuid>`. Agent must \
+                          report the returned `request_id` to the user — approval is \
+                          single-use (TTL = 1 turn)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rule_id":        { "type": "string", "description": "Rule id to override." },
+                    "reason":         { "type": "string", "description": "Why the override is justified." },
+                    "tool_call_hash": { "type": "string", "description": "Hash of the blocked tool call (tool name + canonical args)." }
+                },
+                "required": ["rule_id", "reason", "tool_call_hash"]
+            }),
+        },
+        Tool {
+            name: "thoth_override_approve".to_string(),
+            description: "Approve a pending override request. Moves the file from \
+                          `override-requests/` to `overrides/` with status `approved` and the \
+                          requested `ttl_turns` (default 1). Normally invoked by the CLI, but \
+                          exposed via MCP for automation / testing."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "ttl_turns":  { "type": "integer", "minimum": 1, "default": 1 }
+                },
+                "required": ["request_id"]
+            }),
+        },
+        Tool {
+            name: "thoth_override_reject".to_string(),
+            description: "Reject a pending override request. Moves the file to \
+                          `override-rejected/` with status `rejected` and an optional reason."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "reason":     { "type": "string" }
+                },
+                "required": ["request_id"]
+            }),
+        },
+        Tool {
+            name: "thoth_workflow_start".to_string(),
+            description: "Declare that a workflow (typically driven by a slash command) has \
+                          started for the current session. The Phase 4a workflow gate counts \
+                          sessions that start a workflow but never call \
+                          `thoth_workflow_complete` as violations."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workflow_name": { "type": "string", "description": "Workflow identifier, e.g. `hoangsa:cook`." }
+                },
+                "required": ["workflow_name"]
+            }),
+        },
+        Tool {
+            name: "thoth_workflow_complete".to_string(),
+            description: "Mark the active workflow for the current session as completed. \
+                          Must be called before the session ends to avoid a Phase 4a \
+                          workflow-skip violation."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        Tool {
+            name: "thoth_workflow_list".to_string(),
+            description: "List every workflow currently in the `Active` state across all \
+                          sessions, by reading `.thoth/workflow/*.json`."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
         },
     ]
 }
@@ -2493,4 +2891,243 @@ async fn handle_socket_conn(server: Server, stream: tokio::net::UnixStream) -> a
         }
     }
     Ok(())
+}
+
+// ===========================================================================
+// Enforcement tool tests (T-14)
+// ===========================================================================
+
+#[cfg(test)]
+mod enforcement_tools {
+    //! Covers REQ-03 (structured trigger + suggested audit-only), plus the
+    //! override + workflow MCP surfaces introduced for the enforcement layer.
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    async fn fresh_server() -> (TempDir, Server) {
+        let td = TempDir::new().expect("tempdir");
+        let srv = Server::open(td.path())
+            .await
+            .expect("Server::open on fresh tempdir");
+        (td, srv)
+    }
+
+    fn call(name: &str, args: Value) -> Value {
+        json!({ "name": name, "arguments": args })
+    }
+
+    async fn dispatch(srv: &Server, name: &str, args: Value) -> ToolOutput {
+        srv.dispatch_tool(call(name, args))
+            .await
+            .expect("dispatch_tool")
+    }
+
+    // -- remember_lesson ----------------------------------------------------
+
+    #[tokio::test]
+    async fn remember_lesson_accepts_structured_trigger_roundtrip() {
+        let (_td, srv) = fresh_server().await;
+        let out = dispatch(
+            &srv,
+            "thoth_remember_lesson",
+            json!({
+                "trigger": {
+                    "tool": "Bash",
+                    "cmd_regex": "^rm\\s+-rf\\s+/",
+                    "natural": "don't nuke the root"
+                },
+                "advice": "always dry-run destructive bash commands",
+                "suggested_enforcement": "Block",
+                "block_message": "rm -rf / is never the answer"
+            }),
+        )
+        .await;
+
+        assert!(!out.is_error, "tool call must succeed, got: {}", out.text);
+        let st = &out.data["structured_trigger"];
+        assert_eq!(st["tool"], "Bash");
+        assert_eq!(st["cmd_regex"], "^rm\\s+-rf\\s+/");
+        assert_eq!(st["natural"], "don't nuke the root");
+    }
+
+    #[tokio::test]
+    async fn remember_lesson_suggested_ignored_saved_as_advise() {
+        // REQ-03: even when the proposer suggests `Block`, the stored lesson
+        // must come out at `Advise`.
+        let (_td, srv) = fresh_server().await;
+        let out = dispatch(
+            &srv,
+            "thoth_remember_lesson",
+            json!({
+                "trigger": { "natural": "skip tests on main" },
+                "advice": "never push without running tests",
+                "suggested_enforcement": "Block"
+            }),
+        )
+        .await;
+        assert!(!out.is_error, "tool call must succeed, got: {}", out.text);
+        assert_eq!(out.data["enforcement"], json!("Advise"));
+        assert_eq!(out.data["suggested_enforcement"], json!("Block"));
+    }
+
+    #[tokio::test]
+    async fn remember_lesson_legacy_string_trigger_still_works() {
+        let (_td, srv) = fresh_server().await;
+        let out = dispatch(
+            &srv,
+            "thoth_remember_lesson",
+            json!({
+                "trigger": "plain legacy trigger",
+                "advice": "still gets stored"
+            }),
+        )
+        .await;
+        assert!(!out.is_error, "legacy path failed: {}", out.text);
+        assert_eq!(out.data["trigger"], "plain legacy trigger");
+        assert_eq!(
+            out.data["structured_trigger"]["natural"],
+            "plain legacy trigger"
+        );
+        assert_eq!(out.data["enforcement"], json!("Advise"));
+    }
+
+    // -- override flow ------------------------------------------------------
+
+    #[tokio::test]
+    async fn override_request_then_approve_then_consume() {
+        let (td, srv) = fresh_server().await;
+
+        // 1. Agent files the request.
+        let req_out = dispatch(
+            &srv,
+            "thoth_override_request",
+            json!({
+                "rule_id": "no-rm-rf",
+                "reason": "legitimate cleanup of throwaway tempdir",
+                "tool_call_hash": "hash-abc"
+            }),
+        )
+        .await;
+        assert!(!req_out.is_error);
+        let request_id = req_out.data["request_id"].as_str().unwrap().to_string();
+        let path = td
+            .path()
+            .join("override-requests")
+            .join(format!("{request_id}.json"));
+        assert!(path.exists(), "pending request file must exist");
+
+        // 2. User (or automation) approves.
+        let approve_out = dispatch(
+            &srv,
+            "thoth_override_approve",
+            json!({ "request_id": request_id, "ttl_turns": 1 }),
+        )
+        .await;
+        assert!(!approve_out.is_error);
+        assert!(
+            td.path()
+                .join("overrides")
+                .join(format!("{request_id}.json"))
+                .exists()
+        );
+
+        // 3. Gate can now consume exactly once.
+        let mgr = OverrideManager::new(td.path());
+        assert!(mgr.consume_if_match("no-rm-rf", "hash-abc", 999).unwrap());
+        assert!(!mgr.consume_if_match("no-rm-rf", "hash-abc", 1000).unwrap());
+    }
+
+    #[tokio::test]
+    async fn override_reject_moves_file_and_records_reason() {
+        let (td, srv) = fresh_server().await;
+        let req_out = dispatch(
+            &srv,
+            "thoth_override_request",
+            json!({ "rule_id": "r1", "reason": "x", "tool_call_hash": "h1" }),
+        )
+        .await;
+        let request_id = req_out.data["request_id"].as_str().unwrap().to_string();
+
+        let reject_out = dispatch(
+            &srv,
+            "thoth_override_reject",
+            json!({ "request_id": request_id, "reason": "not safe" }),
+        )
+        .await;
+        assert!(!reject_out.is_error);
+        assert!(
+            td.path()
+                .join("override-rejected")
+                .join(format!("{request_id}.json"))
+                .exists()
+        );
+    }
+
+    // -- workflow flow ------------------------------------------------------
+
+    #[tokio::test]
+    async fn workflow_start_complete_list_roundtrip() {
+        // Force a deterministic session id so `list` finds the right state.
+        // SAFETY: tests in the same binary share env; we restore afterwards.
+        // SAFETY: env mutation is unsafe from Rust 2024 but acceptable in
+        // single-threaded test context.
+        unsafe {
+            std::env::set_var("CLAUDE_SESSION_ID", "sess-test-14");
+        }
+
+        let (td, srv) = fresh_server().await;
+
+        let start = dispatch(
+            &srv,
+            "thoth_workflow_start",
+            json!({ "workflow_name": "hoangsa:cook" }),
+        )
+        .await;
+        assert!(!start.is_error, "start failed: {}", start.text);
+        assert_eq!(start.data["workflow_name"], "hoangsa:cook");
+        assert!(
+            td.path()
+                .join("workflow")
+                .join("sess-test-14.json")
+                .exists()
+        );
+
+        let listed = dispatch(&srv, "thoth_workflow_list", json!({})).await;
+        assert!(!listed.is_error);
+        assert_eq!(listed.data["count"], 1);
+        assert_eq!(listed.data["active"][0]["session_id"], "sess-test-14");
+
+        let complete = dispatch(&srv, "thoth_workflow_complete", json!({})).await;
+        assert!(!complete.is_error, "complete failed: {}", complete.text);
+        assert_eq!(complete.data["status"], "completed");
+
+        let listed2 = dispatch(&srv, "thoth_workflow_list", json!({})).await;
+        assert_eq!(listed2.data["count"], 0);
+
+        unsafe {
+            std::env::remove_var("CLAUDE_SESSION_ID");
+        }
+    }
+
+    // -- catalog wiring -----------------------------------------------------
+
+    #[test]
+    fn tools_catalog_advertises_enforcement_surface() {
+        let names: Vec<String> = tools_catalog().into_iter().map(|t| t.name).collect();
+        for needed in [
+            "thoth_remember_lesson",
+            "thoth_override_request",
+            "thoth_override_approve",
+            "thoth_override_reject",
+            "thoth_workflow_start",
+            "thoth_workflow_complete",
+            "thoth_workflow_list",
+        ] {
+            assert!(
+                names.iter().any(|n| n == needed),
+                "tools catalog missing `{needed}`; have {names:?}"
+            );
+        }
+    }
 }

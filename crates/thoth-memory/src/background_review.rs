@@ -394,6 +394,9 @@ pub async fn persist_review(root: &Path, output: ReviewOutput) -> Result<ReviewR
             advice: entry.advice,
             success_count: 0,
             failure_count: 0,
+            enforcement: Default::default(),
+            suggested_enforcement: None,
+            block_message: None,
         };
         if let Err(e) = md.append_lesson(&lesson).await {
             tracing::warn!(error = %e, "background-review: failed to append lesson");
