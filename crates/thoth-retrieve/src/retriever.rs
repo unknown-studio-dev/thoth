@@ -297,26 +297,21 @@ impl Retriever {
         let md: &MarkdownStore = &self.store.markdown;
         // Cheap heuristic: split the query into meaningful tokens and union
         // the matches. Short tokens would match everything, so we filter.
-        let mut seen = std::collections::HashSet::new();
+        let toks = tokens(text);
+        let facts = md.grep_facts_multi(&toks).await?;
         let mut out = Vec::new();
-        for tok in tokens(text) {
-            let facts = md.grep_facts(&tok).await?;
-            for f in facts {
-                let preview = first_nonempty_line(&f.text);
-                let id = format!("memory.md:{}", blake3::hash(f.text.as_bytes()).to_hex());
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                out.push(Candidate {
-                    id,
-                    path: PathBuf::from("MEMORY.md"),
-                    start_line: 0,
-                    end_line: 0,
-                    symbol: None,
-                    source: RetrievalSource::Markdown,
-                    preview: Some(preview),
-                });
-            }
+        for f in facts {
+            let preview = first_nonempty_line(&f.text);
+            let id = format!("memory.md:{}", blake3::hash(f.text.as_bytes()).to_hex());
+            out.push(Candidate {
+                id,
+                path: PathBuf::from("MEMORY.md"),
+                start_line: 0,
+                end_line: 0,
+                symbol: None,
+                source: RetrievalSource::Markdown,
+                preview: Some(preview),
+            });
         }
         Ok(out)
     }
@@ -328,36 +323,31 @@ impl Retriever {
     /// so they never collide with fact ids from MEMORY.md.
     async fn lessons_stage(&self, text: &str) -> Result<Vec<Candidate>> {
         let md: &MarkdownStore = &self.store.markdown;
-        let mut seen = std::collections::HashSet::new();
+        let toks = tokens(text);
+        let lessons = md.grep_lessons_multi(&toks).await?;
         let mut out = Vec::new();
-        for tok in tokens(text) {
-            let lessons = md.grep_lessons(&tok).await?;
-            for l in lessons {
-                let advice_line = first_nonempty_line(&l.advice);
-                let preview = if advice_line.is_empty() {
-                    format!("lesson — {}", l.trigger.trim())
-                } else {
-                    format!("lesson — {} → {}", l.trigger.trim(), advice_line)
-                };
-                // Stable id on the trigger alone: advice edits (e.g. bumped
-                // success counters) must not spawn a new chunk.
-                let id = format!(
-                    "lessons.md:{}",
-                    blake3::hash(l.trigger.trim().to_lowercase().as_bytes()).to_hex()
-                );
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                out.push(Candidate {
-                    id,
-                    path: PathBuf::from("LESSONS.md"),
-                    start_line: 0,
-                    end_line: 0,
-                    symbol: None,
-                    source: RetrievalSource::Markdown,
-                    preview: Some(preview),
-                });
-            }
+        for l in lessons {
+            let advice_line = first_nonempty_line(&l.advice);
+            let preview = if advice_line.is_empty() {
+                format!("lesson — {}", l.trigger.trim())
+            } else {
+                format!("lesson — {} → {}", l.trigger.trim(), advice_line)
+            };
+            // Stable id on the trigger alone: advice edits (e.g. bumped
+            // success counters) must not spawn a new chunk.
+            let id = format!(
+                "lessons.md:{}",
+                blake3::hash(l.trigger.trim().to_lowercase().as_bytes()).to_hex()
+            );
+            out.push(Candidate {
+                id,
+                path: PathBuf::from("LESSONS.md"),
+                start_line: 0,
+                end_line: 0,
+                symbol: None,
+                source: RetrievalSource::Markdown,
+                preview: Some(preview),
+            });
         }
         Ok(out)
     }
