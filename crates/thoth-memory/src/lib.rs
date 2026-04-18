@@ -927,6 +927,17 @@ fn md_path(root: &Path, kind: MemoryKind) -> std::path::PathBuf {
     }
 }
 
+/// Map the three-surface `MemoryKind` onto the `kind` string field of
+/// `memory-history.jsonl` so replace/remove ops are discoverable by
+/// [`reflection::count_remembers`].
+fn history_kind(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Fact => "fact",
+        MemoryKind::Lesson => "lesson",
+        MemoryKind::Preference => "preference",
+    }
+}
+
 /// Split a markdown file into entry blocks on `### ` level-3 headings.
 ///
 /// Every block includes its own heading line and every following line until
@@ -1344,6 +1355,18 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
         };
         let body = join_entries(&preamble, &entries);
         tokio::fs::write(&path, body).await?;
+        // REQ-07: log `op=replace` so `reflection::count_remembers`
+        // decrements debt. Errors are non-fatal — the replace succeeded
+        // on disk, history is best-effort.
+        let _ = self
+            .append_history(&thoth_store::markdown::HistoryEntry {
+                op: "replace",
+                kind: history_kind(kind),
+                title: new_text.lines().next().unwrap_or(new_text).to_string(),
+                actor: None,
+                reason: None,
+            })
+            .await;
         Ok(idx)
     }
 
@@ -1357,7 +1380,7 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
         let (preamble, mut entries) = split_entries(&text);
         let idx = pick_entry(&entries, query)?;
         write_backup(&path).await?;
-        entries.remove(idx);
+        let removed = entries.remove(idx);
         let header = match kind {
             MemoryKind::Fact => "# MEMORY.md\n",
             MemoryKind::Lesson => "# LESSONS.md\n",
@@ -1370,6 +1393,25 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
         };
         let body = join_entries(&preamble, &entries);
         tokio::fs::write(&path, body).await?;
+        // REQ-07: log `op=remove` so `reflection::count_remembers`
+        // decrements debt. Title is the first line of the dropped
+        // entry for audit.
+        let title = removed
+            .lines()
+            .map(str::trim_start)
+            .map(|l| l.trim_start_matches('#').trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+        let _ = self
+            .append_history(&thoth_store::markdown::HistoryEntry {
+                op: "remove",
+                kind: history_kind(kind),
+                title,
+                actor: None,
+                reason: None,
+            })
+            .await;
         Ok(idx)
     }
 

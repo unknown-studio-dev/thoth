@@ -252,10 +252,12 @@ fn is_counted_mutation(line: &str, since_unix: Option<i64>) -> bool {
 }
 
 /// Count agent-driven writes to memory in `memory-history.jsonl`:
-/// either a direct `append` (auto mode) or a `stage` (review mode /
-/// `stage: true`). Both represent a real reflection by the agent, so
-/// both pay down debt. `promote` / `reject` / `quarantine` are
-/// curator/user actions downstream of the stage and deliberately
+/// either a direct `append` (auto mode), a `stage` (review mode /
+/// `stage: true`), or a `replace` / `remove` op. All four represent
+/// a real reflection by the agent — DESIGN-SPEC REQ-07 explicitly
+/// makes `replace`/`remove` count toward debt payoff to encourage
+/// consolidation over append. `promote` / `reject` / `quarantine`
+/// are curator/user actions downstream of the stage and deliberately
 /// skipped — otherwise a promote would double-count the same
 /// underlying reflection.
 async fn count_remembers(root: &Path, since_unix: Option<i64>) -> u32 {
@@ -272,7 +274,9 @@ fn is_counted_remember(line: &str, since_unix: Option<i64>) -> bool {
     };
     let op = val.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(op, "append" | "stage") || !matches!(kind, "fact" | "lesson") {
+    if !matches!(op, "append" | "stage" | "replace" | "remove")
+        || !matches!(kind, "fact" | "lesson" | "preference")
+    {
         return false;
     }
     if let Some(since) = since_unix {
@@ -583,6 +587,74 @@ mod tests {
         assert_eq!(d.mutations, 6);
         assert_eq!(d.remembers, 1);
         assert_eq!(d.debt(), 5);
+    }
+
+    /// DESIGN-SPEC REQ-07: a `replace` op on MEMORY.md / LESSONS.md /
+    /// USER.md is a real act of reflection (the agent consolidated an
+    /// existing entry instead of spraying a new one), so it must pay
+    /// down reflection debt just like an `append` / `stage` would.
+    #[tokio::test]
+    async fn reflection_debt_decrements_on_replace() {
+        let dir = tempdir().unwrap();
+        // 3 mutations, 0 remembers → debt = 3.
+        write(
+            &dir.path().join("gate.jsonl"),
+            &[
+                r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#,
+                r#"{"ts":"2026-04-17T10:01:00Z","tool":"Edit","decision":"pass","reason":""}"#,
+                r#"{"ts":"2026-04-17T10:02:00Z","tool":"Edit","decision":"pass","reason":""}"#,
+            ],
+        )
+        .await;
+        // One replace on a fact + one replace on a preference both pay
+        // down debt. A replace on a `skill` kind does NOT (skills live
+        // in their own directory and aren't covered by REQ-07).
+        write(
+            &dir.path().join("memory-history.jsonl"),
+            &[
+                r#"{"at_unix":1000,"at_rfc3339":"","op":"replace","kind":"fact","title":"t"}"#,
+                r#"{"at_unix":1001,"at_rfc3339":"","op":"replace","kind":"preference","title":"t"}"#,
+                r#"{"at_unix":1002,"at_rfc3339":"","op":"replace","kind":"skill","title":"t"}"#,
+            ],
+        )
+        .await;
+
+        let d = ReflectionDebt::compute(dir.path()).await;
+        assert_eq!(d.mutations, 3);
+        assert_eq!(d.remembers, 2, "replace on fact+preference must decrement debt");
+        assert_eq!(d.debt(), 1);
+    }
+
+    /// DESIGN-SPEC REQ-07: same rationale as replace, but for `remove`.
+    /// Removing an obsolete entry is a consolidation act and decrements
+    /// debt.
+    #[tokio::test]
+    async fn reflection_debt_decrements_on_remove() {
+        let dir = tempdir().unwrap();
+        write(
+            &dir.path().join("gate.jsonl"),
+            &[
+                r#"{"ts":"2026-04-17T10:00:00Z","tool":"Write","decision":"pass","reason":""}"#,
+                r#"{"ts":"2026-04-17T10:01:00Z","tool":"Edit","decision":"pass","reason":""}"#,
+            ],
+        )
+        .await;
+        write(
+            &dir.path().join("memory-history.jsonl"),
+            &[
+                r#"{"at_unix":1000,"at_rfc3339":"","op":"remove","kind":"fact","title":"t"}"#,
+                r#"{"at_unix":1001,"at_rfc3339":"","op":"remove","kind":"lesson","title":"t"}"#,
+                // `reject` is curator workflow (pending → trash), NOT the
+                // same as `remove`, and must NOT count.
+                r#"{"at_unix":1002,"at_rfc3339":"","op":"reject","kind":"fact","title":"t"}"#,
+            ],
+        )
+        .await;
+
+        let d = ReflectionDebt::compute(dir.path()).await;
+        assert_eq!(d.mutations, 2);
+        assert_eq!(d.remembers, 2, "remove on fact+lesson must decrement debt");
+        assert_eq!(d.debt(), 0);
     }
 
     #[tokio::test]
