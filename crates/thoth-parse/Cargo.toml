@@ -10,7 +10,7 @@ description = "tree-sitter wrapper, AST-aware chunking, file discovery and watch
 
 [features]
 # Users compile Thoth with the languages they care about.
-default       = ["lang-rust", "lang-python"]
+default       = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"]
 lang-rust     = ["dep:tree-sitter-rust"]
 lang-python   = ["dep:tree-sitter-python"]
 lang-javascript = ["dep:tree-sitter-javascript"]

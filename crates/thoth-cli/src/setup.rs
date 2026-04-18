@@ -191,7 +191,7 @@ pub async fn run(root: &Path, status: bool, accept_defaults: bool) -> Result<()>
         let theme = ColorfulTheme::default();
         let choice = Select::with_theme(&theme)
             .with_prompt("Thoth is already set up here — what would you like to do?")
-            .items(&[
+            .items([
                 "Reinstall hooks + MCP (self-heal, keep config.toml)",
                 "Reconfigure from scratch (rewrite config.toml)",
                 "Quit",
