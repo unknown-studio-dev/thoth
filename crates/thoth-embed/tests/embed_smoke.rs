@@ -157,9 +157,7 @@ mod openai_tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/embeddings"))
-            .respond_with(
-                ResponseTemplate::new(429).set_body_string(r#"{"error":"rate_limited"}"#),
-            )
+            .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"error":"rate_limited"}"#))
             .mount(&server)
             .await;
 

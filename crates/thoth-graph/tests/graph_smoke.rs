@@ -243,7 +243,12 @@ async fn impact_depth_zero_returns_empty() {
     let g = new_graph(dir.path()).await;
     build_fixture(&g).await;
 
-    assert!(g.impact("a::foo", BlastDir::Both, 0).await.unwrap().is_empty());
+    assert!(
+        g.impact("a::foo", BlastDir::Both, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -274,16 +279,10 @@ async fn out_neighbors_and_unresolved_filter_by_kind() {
     build_fixture(&g).await;
 
     // Imports: only external::thing — unresolved (no Node upserted).
-    let resolved = g
-        .out_neighbors("a::foo", EdgeKind::Imports)
-        .await
-        .unwrap();
+    let resolved = g.out_neighbors("a::foo", EdgeKind::Imports).await.unwrap();
     assert!(resolved.is_empty(), "unresolved imports are dropped");
 
-    let unresolved = g
-        .out_unresolved("a::foo", EdgeKind::Imports)
-        .await
-        .unwrap();
+    let unresolved = g.out_unresolved("a::foo", EdgeKind::Imports).await.unwrap();
     assert_eq!(unresolved, vec!["external::thing".to_string()]);
 
     // Calls: a::bar is resolved.
@@ -361,7 +360,9 @@ async fn imports_of_file_dedupes_and_includes_file_stem() {
     let dir = tempdir().unwrap();
     let g = new_graph(dir.path()).await;
 
-    g.upsert_node(node("file::sym", "file.rs", 1)).await.unwrap();
+    g.upsert_node(node("file::sym", "file.rs", 1))
+        .await
+        .unwrap();
     g.upsert_edges_batch(vec![
         edge("file::sym", "ext::one", EdgeKind::Imports),
         // Duplicate destination from the file-stem pseudo-source — must dedupe.
@@ -373,5 +374,8 @@ async fn imports_of_file_dedupes_and_includes_file_stem() {
 
     let mut imports = g.imports_of_file("file.rs").await.unwrap();
     imports.sort();
-    assert_eq!(imports, vec!["ext::one".to_string(), "ext::two".to_string()]);
+    assert_eq!(
+        imports,
+        vec!["ext::one".to_string(), "ext::two".to_string()]
+    );
 }
