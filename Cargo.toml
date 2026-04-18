@@ -1,8 +1,9 @@
 [workspace]
 # resolver = "3" enables MSRV-aware dependency resolution — cargo will pick
-# versions whose `rust-version` is <= ours (1.89), so MSRV-bumping upstreams
-# (notably the aws-sdk-* tree pulled in by lancedb → lance → object_store)
-# don't break our build.
+# versions whose `rust-version` is <= ours (1.91, set below in
+# `[workspace.package].rust-version`), so MSRV-bumping upstreams (notably
+# the aws-sdk-* tree pulled in by lancedb → lance → object_store) don't
+# break our build. Keep the declared MSRV in sync with the CI `msrv` job.
 resolver = "3"
 members = [
     "crates/thoth",
@@ -86,3 +87,20 @@ strip         = "symbols"
 [profile.dev]
 opt-level = 0
 debug     = true
+
+# Compile a handful of heavy dependencies with light optimisation even in
+# debug builds. These are leaf dependencies (no user code) so stepping
+# through them under a debugger is rarely wanted, and the cold-build time
+# savings are noticeable: libsqlite3-sys + tantivy dominate `cargo test`
+# wall time on this workspace.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 1
+
+[profile.dev.package.tantivy]
+opt-level = 1
+
+[profile.dev.package.tantivy-columnar]
+opt-level = 1
+
+[profile.dev.package.tantivy-sstable]
+opt-level = 1

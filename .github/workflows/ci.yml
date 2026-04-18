@@ -6,7 +6,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # Cache sccache artifacts under target/.
+  # Rely on Swatinem/rust-cache for cross-run caching; per-run incremental
+  # compilation buys little on CI and inflates cache size.
   CARGO_INCREMENTAL: 0
 
 concurrency:
@@ -46,6 +47,39 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
+
+  # Guard feature-gated code (lance, anthropic, notion, asana, voyage,
+  # openai, cohere, lang-go, …) against bit-rot. Default CI builds never
+  # exercise these, so a type error or missing cfg can ship silently.
+  # `--each-feature` is cheap: one check per feature, ~90% of powerset
+  # coverage without the combinatorial blow-up.
+  features-check:
+    name: features (cargo hack --each-feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --workspace --each-feature --no-dev-deps
+      - run: cargo hack check --workspace --feature-powerset --depth 2 --no-dev-deps --exclude-no-default-features
+        if: false  # Enable if per-feature coverage proves insufficient; expensive.
+
+  # Enforce the declared MSRV. Without this, an upstream crate bumping
+  # its rust-version above ours can break consumers on stable before we
+  # notice. Pinning dtolnay/rust-toolchain to the MSRV (not @stable) is
+  # the canonical way to assert the floor in CI.
+  msrv:
+    name: msrv (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain
+        uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
 
   # Optional dogfood gate: self-index this repo and run the precision@k gold
   # set. Kept in its own job so a recall regression shows up as a distinct
