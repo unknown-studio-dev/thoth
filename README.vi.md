@@ -502,6 +502,27 @@ Route rule về bounded context bằng cách set property / custom field
 `unmapped`). Đây là cam kết của ADR 0001: **PM chủ động opt record nào
 vào Thoth**, không auto-ingest hết.
 
+## Benchmarks
+
+### Microbench `graph_bfs`
+
+Criterion bench chạy trên synthetic 4-ary tree (~341 nodes, 5 levels),
+BFS depth 8. Chạy bằng `cargo bench -p thoth-store --bench graph_bfs`.
+
+| Direction | Điểm bắt đầu | Median | Ghi chú |
+|-----------|--------------|-------:|---------|
+| `Out` | root | **1.74 ms** | walk toàn bộ cây (340 nodes reachable) |
+| `In` | leaf sâu nhất | **13.5 µs** | leo 5 ancestor qua reverse index |
+| `Both` | leaf sâu nhất | **500 µs** | union walk — quay lại full tree |
+
+Reverse-edge index (`edges_by_dst`) là lý do `In` xuống còn chục
+microsecond: trước đó, mỗi bước frontier theo chiều ngược phải scan
+toàn bộ bảng `edges`. Số của `Out` bị chi phối bởi số lượng neighbour
+phải deserialize — mọi node reachable đều bị decode một lần.
+
+Số đo chi tiết cho các flow khác (indexing, recall, eval) nằm ở phần
+*Benchmarks* trong README tiếng Anh.
+
 ## Release flow
 
 * Tag `vX.Y.Z`

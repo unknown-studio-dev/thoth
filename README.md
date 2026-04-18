@@ -667,6 +667,23 @@ All graph tools run under **25 ms** (median of 3 runs):
 > few include redb page-cache warmup. Graph queries hit warm pages and are
 > effectively O(1) for local lookups.
 
+### `graph_bfs` microbenchmark
+
+Criterion bench against a synthetic 4-ary tree (~341 nodes, 5 levels),
+BFS depth 8. Run with `cargo bench -p thoth-store --bench graph_bfs`.
+
+| Direction | Start | Median | Notes |
+|-----------|-------|-------:|-------|
+| `Out` | root | **1.74 ms** | full tree walk (340 reachable nodes) |
+| `In` | deepest leaf | **13.5 µs** | 5-ancestor climb via reverse index |
+| `Both` | deepest leaf | **500 µs** | union walk — re-enters full tree |
+
+The reverse-edge index (`edges_by_dst`) is what keeps the `In` direction
+in the tens of microseconds: before it landed, `In` full-scanned the
+edges table on every frontier hop. The `Out` number is dominated by the
+sheer number of neighbours materialised — every reachable node is
+deserialized once.
+
 ## Release flow
 
 - Tag `vX.Y.Z` on `main`.

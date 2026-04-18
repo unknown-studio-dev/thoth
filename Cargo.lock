@@ -5914,6 +5914,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "criterion",
  "futures",
  "lancedb",
  "parking_lot",

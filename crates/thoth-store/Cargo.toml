@@ -55,7 +55,12 @@ vector = []
 lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
 
 [dev-dependencies]
-tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
-tempfile = { workspace = true }
-uuid     = { workspace = true }
-paste    = "1"
+tokio     = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile  = { workspace = true }
+uuid      = { workspace = true }
+paste     = "1"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "graph_bfs"
+harness = false

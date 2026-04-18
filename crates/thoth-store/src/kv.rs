@@ -1,9 +1,15 @@
 //! Key-value / graph store backed by [`redb`].
 //!
-//! Four logical tables live in a single `kv.redb` file:
+//! Five logical tables live in a single `kv.redb` file:
 //!
-//! - `nodes`  — graph nodes, keyed by fully-qualified name.
-//! - `edges`  — graph edges, keyed by `"<src>|<kind>|<dst>"`.
+//! - `nodes`          — graph nodes, keyed by fully-qualified name.
+//! - `edges`          — graph edges, keyed by `"<src>|<kind>|<dst>"`.
+//! - `edges_by_dst`   — reverse edge index, keyed by `"<dst>|<kind>|<src>"`.
+//!   Value is the same JSON-encoded `EdgeRow` as `edges` so a reverse
+//!   lookup is a single range-scan + decode (no point-lookup back into
+//!   `edges`). The cost is 2× edge-row storage; at thoth's scale that's
+//!   negligible and we save the O(|EDGES|) table scan that `edges_to`
+//!   used to do.
 //! - `symbols`— symbol → `(path, line_start, line_end)` lookups.
 //! - `meta`   — free-form metadata (config, cursor positions, ...).
 //!
@@ -23,8 +29,15 @@ use thoth_core::{Error, Result};
 
 const NODES: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("nodes");
 const EDGES: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("edges");
+const EDGES_BY_DST: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("edges_by_dst");
 const SYMBOLS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("symbols");
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
+
+/// Meta-key flag recording that every existing row in `edges` has been
+/// mirrored into `edges_by_dst`. Set once per database (the first open
+/// that sees the reverse table) and checked on every subsequent open so
+/// the backfill only runs once.
+const REV_EDGES_BACKFILLED: &str = "schema::edges_by_dst::backfilled";
 
 // ---- public payload types ---------------------------------------------------
 
@@ -113,13 +126,48 @@ impl KvStore {
         let db_path = path.clone();
         let db = tokio::task::spawn_blocking(move || -> Result<Database> {
             let db = Database::create(&db_path).map_err(store)?;
-            // Ensure all tables exist.
+            // Ensure all tables exist, and — if this is a DB that predates
+            // the reverse edge index — mirror every existing forward edge
+            // into `edges_by_dst`. The backfill is gated on a meta flag so
+            // subsequent opens skip it even on a warm DB.
             let wtxn = db.begin_write().map_err(store)?;
             {
                 let _ = wtxn.open_table(NODES).map_err(store)?;
                 let _ = wtxn.open_table(EDGES).map_err(store)?;
+                let _ = wtxn.open_table(EDGES_BY_DST).map_err(store)?;
                 let _ = wtxn.open_table(SYMBOLS).map_err(store)?;
                 let _ = wtxn.open_table(META).map_err(store)?;
+
+                let meta = wtxn.open_table(META).map_err(store)?;
+                let already_backfilled = meta
+                    .get(REV_EDGES_BACKFILLED)
+                    .map_err(store)?
+                    .is_some();
+                drop(meta);
+
+                if !already_backfilled {
+                    let edges = wtxn.open_table(EDGES).map_err(store)?;
+                    let rows: Vec<(String, Vec<u8>)> = edges
+                        .iter()
+                        .map_err(store)?
+                        .filter_map(|r| r.ok())
+                        .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+                        .collect();
+                    drop(edges);
+
+                    let mut rev = wtxn.open_table(EDGES_BY_DST).map_err(store)?;
+                    for (fwd_key, value) in &rows {
+                        if let Some(rev_key) = forward_to_reverse_key(fwd_key) {
+                            rev.insert(rev_key.as_str(), value.as_slice())
+                                .map_err(store)?;
+                        }
+                    }
+                    drop(rev);
+
+                    let mut meta = wtxn.open_table(META).map_err(store)?;
+                    meta.insert(REV_EDGES_BACKFILLED, &b"1"[..])
+                        .map_err(store)?;
+                }
             }
             wtxn.commit().map_err(store)?;
             Ok(db)
@@ -288,16 +336,26 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
-    /// Upsert a graph edge. Edge key is `"<src>|<kind>|<dst>"`.
+    /// Upsert a graph edge.
+    ///
+    /// Writes to both the forward table (`edges`, key `"<src>|<kind>|<dst>"`)
+    /// and the reverse index (`edges_by_dst`, key `"<dst>|<kind>|<src>"`)
+    /// in the same transaction so the two indexes can never disagree on
+    /// whether an edge exists.
     pub async fn put_edge(&self, row: EdgeRow) -> Result<()> {
         let db = self.db.clone();
-        let key = format!("{}|{}|{}", row.src, row.kind, row.dst);
+        let fwd_key = format!("{}|{}|{}", row.src, row.kind, row.dst);
+        let rev_key = format!("{}|{}|{}", row.dst, row.kind, row.src);
         let bytes = serde_json::to_vec(&row)?;
         tokio::task::spawn_blocking(move || -> Result<()> {
             let wtxn = db.begin_write().map_err(store)?;
             {
-                let mut t = wtxn.open_table(EDGES).map_err(store)?;
-                t.insert(key.as_str(), bytes.as_slice()).map_err(store)?;
+                let mut fwd = wtxn.open_table(EDGES).map_err(store)?;
+                fwd.insert(fwd_key.as_str(), bytes.as_slice())
+                    .map_err(store)?;
+                let mut rev = wtxn.open_table(EDGES_BY_DST).map_err(store)?;
+                rev.insert(rev_key.as_str(), bytes.as_slice())
+                    .map_err(store)?;
             }
             wtxn.commit().map_err(store)?;
             Ok(())
@@ -328,7 +386,8 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
-    /// Insert many graph edges in a single redb transaction.
+    /// Insert many graph edges in a single redb transaction. Updates both
+    /// the forward and reverse edge tables atomically.
     pub async fn put_edges_batch(&self, rows: Vec<EdgeRow>) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -337,11 +396,16 @@ impl KvStore {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let wtxn = db.begin_write().map_err(store)?;
             {
-                let mut t = wtxn.open_table(EDGES).map_err(store)?;
+                let mut fwd = wtxn.open_table(EDGES).map_err(store)?;
+                let mut rev = wtxn.open_table(EDGES_BY_DST).map_err(store)?;
                 for row in &rows {
-                    let key = format!("{}|{}|{}", row.src, row.kind, row.dst);
+                    let fwd_key = format!("{}|{}|{}", row.src, row.kind, row.dst);
+                    let rev_key = format!("{}|{}|{}", row.dst, row.kind, row.src);
                     let bytes = serde_json::to_vec(row)?;
-                    t.insert(key.as_str(), bytes.as_slice()).map_err(store)?;
+                    fwd.insert(fwd_key.as_str(), bytes.as_slice())
+                        .map_err(store)?;
+                    rev.insert(rev_key.as_str(), bytes.as_slice())
+                        .map_err(store)?;
                 }
             }
             wtxn.commit().map_err(store)?;
@@ -374,21 +438,20 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
-    /// List every incoming edge to `dst`. Walks the entire `edges` table;
-    /// fine at M3 scale but worth revisiting once edge counts grow.
+    /// List every incoming edge to `dst` via the `edges_by_dst` reverse
+    /// index — O(matches) range scan, symmetric with [`Self::edges_from`].
     pub async fn edges_to(&self, dst: impl Into<String>) -> Result<Vec<EdgeRow>> {
         let db = self.db.clone();
         let dst = dst.into();
         tokio::task::spawn_blocking(move || -> Result<Vec<EdgeRow>> {
             let rtxn = db.begin_read().map_err(store)?;
-            let t = rtxn.open_table(EDGES).map_err(store)?;
+            let t = rtxn.open_table(EDGES_BY_DST).map_err(store)?;
+            let lo = format!("{dst}|");
+            let hi = format!("{dst}|\u{10FFFF}");
             let mut out = Vec::new();
-            let needle = format!("|{dst}");
-            for entry in t.iter().map_err(store)? {
-                let (k, v) = entry.map_err(store)?;
-                if k.value().ends_with(needle.as_str()) {
-                    out.push(serde_json::from_slice(v.value())?);
-                }
+            for entry in t.range(lo.as_str()..hi.as_str()).map_err(store)? {
+                let (_k, v) = entry.map_err(store)?;
+                out.push(serde_json::from_slice(v.value())?);
             }
             Ok(out)
         })
@@ -508,7 +571,10 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
-    /// Delete every edge whose `src` or `dst` appears in `ids`.
+    /// Delete every edge whose `src` or `dst` appears in `ids`. Keeps the
+    /// forward and reverse edge tables consistent: every key removed from
+    /// `edges` has its mirror removed from `edges_by_dst` in the same
+    /// write transaction.
     pub async fn delete_edges_touching(&self, ids: &[String]) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
@@ -518,7 +584,10 @@ impl KvStore {
         tokio::task::spawn_blocking(move || -> Result<usize> {
             let rtxn = db.begin_read().map_err(store)?;
             let t = rtxn.open_table(EDGES).map_err(store)?;
-            let mut to_drop: Vec<String> = Vec::new();
+            // For every doomed edge we need both keys: the forward key is
+            // the row's own key in `edges`, the reverse key is derived from
+            // the decoded `(src, kind, dst)`.
+            let mut to_drop: Vec<(String, String)> = Vec::new();
             for entry in t.iter().map_err(store)? {
                 let (k, v) = entry.map_err(store)?;
                 let row: EdgeRow = match serde_json::from_slice(v.value()) {
@@ -526,7 +595,9 @@ impl KvStore {
                     Err(_) => continue,
                 };
                 if ids.contains(&row.src) || ids.contains(&row.dst) {
-                    to_drop.push(k.value().to_string());
+                    let fwd = k.value().to_string();
+                    let rev = format!("{}|{}|{}", row.dst, row.kind, row.src);
+                    to_drop.push((fwd, rev));
                 }
             }
             drop(t);
@@ -538,9 +609,11 @@ impl KvStore {
             let n = to_drop.len();
             let wtxn = db.begin_write().map_err(store)?;
             {
-                let mut t = wtxn.open_table(EDGES).map_err(store)?;
-                for k in &to_drop {
-                    t.remove(k.as_str()).map_err(store)?;
+                let mut fwd = wtxn.open_table(EDGES).map_err(store)?;
+                let mut rev = wtxn.open_table(EDGES_BY_DST).map_err(store)?;
+                for (fk, rk) in &to_drop {
+                    fwd.remove(fk.as_str()).map_err(store)?;
+                    rev.remove(rk.as_str()).map_err(store)?;
                 }
             }
             wtxn.commit().map_err(store)?;
@@ -594,14 +667,16 @@ impl KvStore {
             let rtxn = db.begin_read().map_err(store)?;
             let nodes = rtxn.open_table(NODES).map_err(store)?;
             let edges = rtxn.open_table(EDGES).map_err(store)?;
+            let edges_rev = rtxn.open_table(EDGES_BY_DST).map_err(store)?;
 
-            // Decode an edge key "<src>|<kind>|<dst>" → (src, kind, dst).
+            // Decode a 3-part `"a|b|c"` key. Used for both forward keys
+            // (`"<src>|<kind>|<dst>"`) and reverse keys (`"<dst>|<kind>|<src>"`).
             // The kind tags we actually write never contain `|` (see
             // EdgeKind::tag) so a strict 3-way split is safe.
             let decode = |k: &str| -> Option<(String, String, String)> {
-                let (src, rest) = k.split_once('|')?;
-                let (kind, dst) = rest.split_once('|')?;
-                Some((src.to_string(), kind.to_string(), dst.to_string()))
+                let (a, rest) = k.split_once('|')?;
+                let (b, c) = rest.split_once('|')?;
+                Some((a.to_string(), b.to_string(), c.to_string()))
             };
             let kind_ok = |k: &str| {
                 kinds
@@ -633,17 +708,14 @@ impl KvStore {
                     }
                 }
                 if dir.walks_in() {
-                    // No reverse index — scan the whole edges table.
-                    // Tracked in the session RESEARCH.md as a follow-up
-                    // (add (dst, kind, src) side table for O(log N) reverse
-                    // lookup). This path is still one spawn_blocking and one
-                    // read txn, so it's already strictly better than the
-                    // pre-refactor per-node full-table scan it replaced.
-                    let needle = format!("|{cur}");
-                    for entry in edges.iter().map_err(store)? {
+                    // Reverse index: edges_by_dst keys are
+                    // "<dst>|<kind>|<src>" so the same prefix-range trick
+                    // that `edges_from` uses gives us O(matches) here.
+                    let lo = format!("{cur}|");
+                    let hi = format!("{cur}|\u{10FFFF}");
+                    for entry in edges_rev.range(lo.as_str()..hi.as_str()).map_err(store)? {
                         let (k, _v) = entry.map_err(store)?;
-                        if k.value().ends_with(needle.as_str())
-                            && let Some((src, kind, _dst)) = decode(k.value())
+                        if let Some((_dst, kind, src)) = decode(k.value())
                             && kind_ok(&kind)
                         {
                             ids.push(src);
@@ -712,6 +784,15 @@ fn store<E: std::fmt::Display>(e: E) -> Error {
     Error::Store(e.to_string())
 }
 
+/// Flip a forward edge key (`"<src>|<kind>|<dst>"`) into the reverse
+/// shape (`"<dst>|<kind>|<src>"`) used by `edges_by_dst`. Returns `None`
+/// if the input isn't a 3-part key — those get skipped during backfill.
+fn forward_to_reverse_key(fwd: &str) -> Option<String> {
+    let (src, rest) = fwd.split_once('|')?;
+    let (kind, dst) = rest.split_once('|')?;
+    Some(format!("{dst}|{kind}|{src}"))
+}
+
 // ---- tests -----------------------------------------------------------------
 
 #[cfg(test)]
@@ -767,5 +848,125 @@ mod prefix_scan_tests {
             "expected 3 foo: keys, got {}",
             results.len()
         );
+    }
+
+    fn edge(src: &str, kind: &str, dst: &str) -> EdgeRow {
+        EdgeRow {
+            src: src.into(),
+            dst: dst.into(),
+            kind: kind.into(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    /// `edges_to` must use the reverse index and return every incoming
+    /// edge to `dst`, with no false positives from sibling dst names that
+    /// happen to share a prefix.
+    #[tokio::test]
+    async fn edges_to_range_scan_is_exact() {
+        let (_dir, kv) = open_store().await;
+
+        kv.put_edges_batch(vec![
+            edge("a", "calls", "target"),
+            edge("b", "calls", "target"),
+            edge("c", "imports", "target"),
+            // Same-prefix red herring: `target2` must not leak into the
+            // result for `target`.
+            edge("a", "calls", "target2"),
+            edge("unrelated", "calls", "other"),
+        ])
+        .await
+        .unwrap();
+
+        let mut srcs: Vec<String> = kv
+            .edges_to("target")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| format!("{}/{}", e.src, e.kind))
+            .collect();
+        srcs.sort();
+        assert_eq!(
+            srcs,
+            vec![
+                "a/calls".to_string(),
+                "b/calls".to_string(),
+                "c/imports".to_string(),
+            ]
+        );
+    }
+
+    /// Deleting edges through `delete_edges_touching` must purge both
+    /// tables so a subsequent `edges_to` returns no ghost rows.
+    #[tokio::test]
+    async fn delete_edges_touching_purges_reverse_index() {
+        let (_dir, kv) = open_store().await;
+
+        kv.put_edges_batch(vec![
+            edge("a", "calls", "target"),
+            edge("b", "calls", "target"),
+        ])
+        .await
+        .unwrap();
+
+        let removed = kv.delete_edges_touching(&["a".to_string()]).await.unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining: Vec<String> = kv
+            .edges_to("target")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.src)
+            .collect();
+        assert_eq!(remaining, vec!["b".to_string()]);
+    }
+
+    /// A DB created before `edges_by_dst` existed only has rows in
+    /// `edges`. Opening it must backfill the reverse index so `edges_to`
+    /// still returns every incoming edge on the first post-upgrade call.
+    #[tokio::test]
+    async fn open_backfills_reverse_index_from_legacy_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("kv.redb");
+
+        // Simulate a legacy DB: only the forward `edges` table has rows,
+        // and the backfill-done flag is cleared so the next `open` re-
+        // runs the migration path.
+        {
+            let kv = KvStore::open(&db_path).await.unwrap();
+            kv.put_edges_batch(vec![
+                edge("legacy_a", "calls", "legacy_target"),
+                edge("legacy_b", "imports", "legacy_target"),
+            ])
+            .await
+            .unwrap();
+
+            let db = kv.db.clone();
+            tokio::task::spawn_blocking(move || {
+                let wtxn = db.begin_write().unwrap();
+                {
+                    let mut rev = wtxn.open_table(EDGES_BY_DST).unwrap();
+                    rev.retain(|_, _| false).unwrap();
+                    let mut meta = wtxn.open_table(META).unwrap();
+                    meta.remove(REV_EDGES_BACKFILLED).unwrap();
+                }
+                wtxn.commit().unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        // Reopen — backfill runs here.
+        let kv = KvStore::open(&db_path).await.unwrap();
+        let mut got: Vec<String> = kv
+            .edges_to("legacy_target")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.src)
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["legacy_a".to_string(), "legacy_b".to_string()]);
     }
 }
