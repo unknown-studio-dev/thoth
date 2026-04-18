@@ -234,13 +234,14 @@ impl KvStore {
             let rtxn = db.begin_read().map_err(store)?;
             let t = rtxn.open_table(SYMBOLS).map_err(store)?;
             let mut out = Vec::new();
-            // redb does not expose true prefix scans on &str keys directly;
-            // walk the full range and filter. At M2's scale this is fine.
-            for entry in t.iter().map_err(store)? {
+            // Use a range scan starting at `prefix` and stop as soon as the
+            // key no longer shares the prefix — O(k) instead of O(N).
+            for entry in t.range(prefix.as_str()..).map_err(store)? {
                 let (k, v) = entry.map_err(store)?;
-                if k.value().starts_with(prefix.as_str()) {
-                    out.push(serde_json::from_slice(v.value())?);
+                if !k.value().starts_with(prefix.as_str()) {
+                    break;
                 }
+                out.push(serde_json::from_slice(v.value())?);
             }
             Ok(out)
         })
