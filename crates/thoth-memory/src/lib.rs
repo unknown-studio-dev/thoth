@@ -72,6 +72,37 @@ pub struct MemoryConfig {
     pub decay_floor: f32,
     /// Whether to invoke the LLM nudge at session end (Mode::Full only).
     pub enable_nudge: bool,
+    /// Hard cap for `MEMORY.md` in bytes. Default 3072 (DESIGN-SPEC REQ-02).
+    /// A `thoth_remember_fact` that would push the file above this cap
+    /// returns a structured [`CapExceededError`] instead of silently
+    /// appending — the agent must call `thoth_memory_replace` or
+    /// `thoth_memory_remove` first.
+    #[serde(default = "default_cap_memory_bytes")]
+    pub cap_memory_bytes: usize,
+    /// Hard cap for `USER.md` in bytes. Default 1536 (DESIGN-SPEC REQ-02).
+    #[serde(default = "default_cap_user_bytes")]
+    pub cap_user_bytes: usize,
+    /// Hard cap for `LESSONS.md` in bytes. Default 5120 (DESIGN-SPEC REQ-02).
+    #[serde(default = "default_cap_lessons_bytes")]
+    pub cap_lessons_bytes: usize,
+    /// FLEXIBLE content policy (DESIGN-SPEC REQ-12). When `false` (default)
+    /// MCP tool handlers only log a warning if a `remember_*` payload looks
+    /// like a bare commit sha / ISO date / file path with no invariant.
+    /// When `true`, such payloads are rejected with a structured error.
+    #[serde(default)]
+    pub strict_content_policy: bool,
+}
+
+fn default_cap_memory_bytes() -> usize {
+    3072
+}
+
+fn default_cap_user_bytes() -> usize {
+    1536
+}
+
+fn default_cap_lessons_bytes() -> usize {
+    5120
 }
 
 impl Default for MemoryConfig {
@@ -84,8 +115,62 @@ impl Default for MemoryConfig {
             decay_lambda: 0.02,
             decay_floor: 0.05,
             enable_nudge: true,
+            cap_memory_bytes: default_cap_memory_bytes(),
+            cap_user_bytes: default_cap_user_bytes(),
+            cap_lessons_bytes: default_cap_lessons_bytes(),
+            strict_content_policy: false,
         }
     }
+}
+
+/// Which markdown file a verb targets.
+///
+/// Distinct from [`thoth_core::MemoryKind`] (the five-class taxonomy) —
+/// this one only covers the three markdown surfaces exposed by the
+/// `thoth_memory_replace` / `thoth_memory_remove` / `thoth_remember_*`
+/// verbs introduced in DESIGN-SPEC REQ-04/05/06.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    /// `MEMORY.md` — project facts.
+    Fact,
+    /// `LESSONS.md` — lessons learned.
+    Lesson,
+    /// `USER.md` — user preferences.
+    Preference,
+}
+
+/// Structured error surfaced via MCP when a write would exceed a hard cap
+/// (DESIGN-SPEC REQ-03). The `entries` field lets the agent decide which
+/// record to `replace` / `remove` before retrying.
+#[derive(Debug, serde::Serialize)]
+pub struct CapExceededError {
+    /// Which markdown surface was over cap.
+    pub kind: MemoryKind,
+    /// Size of the file *before* the attempted write, in bytes.
+    pub current_bytes: usize,
+    /// Configured hard cap, in bytes.
+    pub cap_bytes: usize,
+    /// Size the file *would have reached* after the attempted write.
+    pub attempted_bytes: usize,
+    /// Snapshot of current entries so the agent can choose what to drop.
+    pub entries: Vec<MemoryEntryPreview>,
+    /// Suggested next verb — e.g. "Call thoth_memory_replace or thoth_memory_remove.".
+    pub hint: String,
+}
+
+/// Preview row describing one entry in a markdown memory file. Used inside
+/// [`CapExceededError::entries`] and by the read-side `preview` API.
+#[derive(Debug, serde::Serialize)]
+pub struct MemoryEntryPreview {
+    /// Zero-based index of the entry within the file (top → bottom).
+    pub index: usize,
+    /// First non-empty line of the entry, truncated to 120 chars.
+    pub first_line: String,
+    /// Byte size of the full entry (including its trailing newline).
+    pub bytes: usize,
+    /// Tags parsed off the entry's leading `#tag` markers, if any.
+    pub tags: Vec<String>,
 }
 
 /// TOML file schema — mirrors the `[memory]` and `[discipline]` tables in
@@ -796,6 +881,23 @@ fn fact_key(text: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    /// DESIGN-SPEC REQ-02: default caps for `MEMORY.md` / `USER.md` /
+    /// `LESSONS.md` must land on the 3072 / 1536 / 5120 byte budget and
+    /// `strict_content_policy` defaults off (REQ-12 is warn-only by default).
+    #[test]
+    fn memory_config_caps_default() {
+        let cfg = MemoryConfig::default();
+        assert_eq!(cfg.cap_memory_bytes, 3072);
+        assert_eq!(cfg.cap_user_bytes, 1536);
+        assert_eq!(cfg.cap_lessons_bytes, 5120);
+        assert!(!cfg.strict_content_policy);
+    }
 }
 
 #[cfg(test)]
