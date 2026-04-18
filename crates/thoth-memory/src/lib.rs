@@ -1383,6 +1383,15 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
                     hint: format!("io error: {e}"),
                 });
             }
+            let _ = self
+                .append_history(&thoth_store::markdown::HistoryEntry {
+                    op: "append",
+                    kind: history_kind(MemoryKind::Preference),
+                    title: text.lines().next().unwrap_or(text).to_string(),
+                    actor: None,
+                    reason: None,
+                })
+                .await;
             return Ok(());
         }
         let mut f = match tokio::fs::OpenOptions::new()
@@ -1415,6 +1424,15 @@ impl MarkdownStoreMemoryExt for MarkdownStore {
                 hint: format!("io error: {e}"),
             });
         }
+        let _ = self
+            .append_history(&thoth_store::markdown::HistoryEntry {
+                op: "append",
+                kind: history_kind(MemoryKind::Preference),
+                title: text.lines().next().unwrap_or(text).to_string(),
+                actor: None,
+                reason: None,
+            })
+            .await;
         Ok(())
     }
 
@@ -1797,6 +1815,17 @@ mod cap_enforcement_tests {
         assert!(body.contains("tags: ui"));
         let size = store.size_bytes(MemoryKind::Preference).await.unwrap();
         assert!(size > 0);
+
+        // Preference appends must be audit-logged — reflection::count_remembers
+        // counts `kind=preference` toward debt decrement, same as fact/lesson.
+        let history = tokio::fs::read_to_string(dir.path().join("memory-history.jsonl"))
+            .await
+            .expect("history log created");
+        assert!(
+            history.contains(r#""op":"append""#)
+                && history.contains(r#""kind":"preference""#),
+            "history missing preference append entry: {history}"
+        );
     }
 
 /// REQ-12: with `strict_content_policy = false` (default), a
