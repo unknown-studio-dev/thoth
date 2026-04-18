@@ -172,7 +172,13 @@ fn preview_line(text: &str) -> String {
     if first.len() <= 120 {
         first.to_string()
     } else {
-        let mut s = first[..120].to_string();
+        let cut = first
+            .char_indices()
+            .take_while(|(i, _)| *i <= 120)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let mut s = first[..cut].to_string();
         s.push('…');
         s
     }
