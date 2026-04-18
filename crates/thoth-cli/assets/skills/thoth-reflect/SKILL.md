@@ -5,11 +5,12 @@ description: >
   bug fix, a finished feature, a deployment, or whenever the user says
   "we're done", "wrap up", "summarize the session", "what did we learn",
   or "save what you learned". It drives a structured self-reflection
-  pass that decides whether to persist new facts, lessons, or skills to
-  Thoth's long-term memory. Also triggers on phrases like "reflect",
-  "postmortem", or "retrospective" applied to the current session.
+  pass that decides whether to persist new preferences, facts, lessons,
+  or skills to Thoth's long-term memory. Also triggers on phrases like
+  "reflect", "postmortem", or "retrospective" applied to the current
+  session.
 metadata:
-  version: "0.0.1"
+  version: "0.1.0"
 ---
 
 # Thoth Reflect
@@ -25,40 +26,46 @@ survive after the TTL sweeps the log clean.
 
 Call the Thoth MCP server:
 
-- `thoth_memory_show` — current `MEMORY.md` + `LESSONS.md` contents, so
-  you know what's already there and don't duplicate it.
+- `thoth_memory_show` — current `USER.md` + `MEMORY.md` + `LESSONS.md`
+  contents, so you know what's already there and don't duplicate it.
 - `resources/read thoth://memory/MEMORY.md` (same data, different wire
   shape — use whichever your client supports).
 
 If the session had enough tool calls to make a summary expensive, ask the
 user for a one-paragraph recap instead of reading the full log.
 
-### 2. Run the reflect prompt
+### 2. Decide across three surfaces
 
-Expand the MCP prompt `thoth.reflect`:
+Walk the session and ask three questions in order:
 
-```
-prompts/get {
-  "name": "thoth.reflect",
-  "arguments": {
-    "summary": "<one-paragraph summary of this session>",
-    "outcome": "<tests passed, user shipped, bug still open, etc.>"
-  }
-}
-```
+1. **Did the user reveal a durable preference?** Tone, language, testing
+   style, commit style, workflow choice — anything that would shape HOW
+   you respond in future sessions, regardless of project. Save as a
+   **preference** → USER.md.
+2. **Did we discover a project-specific invariant?** A non-obvious fact
+   about this repo's architecture, a naming convention, a gotcha that
+   lives across sessions. Save as a **fact** → MEMORY.md.
+3. **Did we learn a pattern worth replaying?** A situation where a
+   specific approach beat the obvious one — phrased as `when X → do Y`.
+   Save as a **lesson** → LESSONS.md.
 
-The server returns a user-role message telling you exactly what to
-decide. Follow it literally. It asks three questions:
-
-1. Is there a durable FACT worth saving?
-2. Is there a LESSON — a non-obvious pattern a future session would miss?
-3. If neither, reply `no memory needed`.
+If none of the three apply, reply `no memory needed` and stop.
 
 ### 3. Persist
 
-For each decision from step 2:
+For each decision from step 2, call the matching tool.
 
-**Facts** — call `thoth_remember_fact`:
+**Preference** (first-person, cross-project):
+
+```
+thoth_remember_preference {
+  "text": "User prefers concise Vietnamese responses in code review
+           contexts, with commit messages in English.",
+  "tags": ["style", "language"]
+}
+```
+
+**Fact** (project-specific invariant):
 
 ```
 thoth_remember_fact {
@@ -72,7 +79,7 @@ Keep the first line crisp — it becomes the MEMORY.md heading. Don't
 restate things already visible from the file tree (e.g. "this repo is a
 Rust workspace" is not a fact worth persisting).
 
-**Lessons** — call `thoth_remember_lesson`:
+**Lesson** (action-triggered advice):
 
 ```
 thoth_remember_lesson {
@@ -85,31 +92,59 @@ thoth_remember_lesson {
 Lessons fire when their `trigger` matches a future intent, so write the
 trigger as a situation description, not a command.
 
-### 4. Confirm and close
+### 4. Handle `cap_exceeded`
+
+If any of the three tools returns a structured `cap_exceeded` error, do
+NOT silently drop the entry. The error payload includes a `preview` list
+— pick a stale entry from it, then call `thoth_memory_replace` (to
+consolidate) or `thoth_memory_remove` (to drop), and retry the remember
+call. Reflection is exactly when the memory store is most likely to be
+near its cap, so you MUST know this path.
+
+See the `memory-discipline` skill for the full cap-exceeded flow.
+
+### 5. Confirm and close
 
 Write a two-line summary to the user:
 
 ```
 Saved to memory:
-  - fact:   "HTTP retry lives in crates/net/retry.rs"
-  - lesson: "trigger → advice"
+  - preference: "Vietnamese responses, English commits"
+  - fact:       "HTTP retry lives in crates/net/retry.rs"
+  - lesson:     "trigger → advice"
   (or) no durable memory this session.
 ```
 
-Don't dump the full MEMORY.md back — the user can open the file.
+Don't dump the full USER.md/MEMORY.md back — the user can open the files.
 
 ## Quality gates
 
-A memory entry is worth persisting only if:
+A memory entry is worth persisting only if it clears the bar for its
+surface:
 
+**Preference (USER.md)** — YES only if:
+- the user said or implied it directly ("I prefer X", correcting your
+  default behaviour, accepting an unusual choice without pushback),
+- it applies across projects, not just this one,
+- it's durable (style, language, workflow — not "use model X" for a
+  one-shot task).
+
+**Fact (MEMORY.md)** — YES only if:
 - it would save a future session a round-trip (e.g. a recall that failed
   and a chunk that wasn't indexed),
-- it encodes a **decision** or **convention**, not a raw file path,
+- it encodes a decision or convention, not a raw file path,
 - it wouldn't be obvious from a five-minute read of the README,
-- it's not already in MEMORY.md / LESSONS.md under a similar trigger.
+- it's not already in MEMORY.md under a similar heading.
 
-If none of those apply, emit `no memory needed` and stop. False positives
-pollute the store faster than missing entries hurt.
+**Lesson (LESSONS.md)** — YES only if:
+- the trigger is specific enough to fire in the right situation but
+  general enough to recur,
+- the advice encodes a non-obvious pattern (the obvious path failed, or
+  there's a hidden constraint),
+- it's not already in LESSONS.md under a similar trigger.
+
+If none of those clear the bar, emit `no memory needed` and stop. False
+positives pollute the store faster than missing entries hurt.
 
 ## Failure modes to avoid
 
@@ -121,3 +156,9 @@ pollute the store faster than missing entries hurt.
   of appending a near-duplicate.
 - **Lessons for one-off bugs.** A lesson earns its place by being likely
   to recur across sessions.
+- **Project facts saved as preferences.** If it's specific to this
+  repo's code, it belongs in MEMORY.md, not USER.md. Preferences cross
+  project boundaries.
+- **Cap-blind appends.** If MEMORY/LESSONS is near its cap, prefer
+  `thoth_memory_replace` (consolidate into an existing heading) over
+  adding a new entry that will push the file over the cap.

@@ -4,25 +4,32 @@ description: >
   This skill should be used before any non-trivial coding action — editing
   code, writing new files, running migrations, deploying, or answering a
   question that involves factual claims about this codebase. It forces the
-  agent to consult Thoth's persistent memory (MEMORY.md, LESSONS.md, the
-  indexed code graph) and acknowledge relevant lessons before acting.
-  Trigger phrases: "edit", "refactor", "implement", "fix the bug in",
-  "add a feature", "deploy", "why does this do", "how does X work".
+  agent to consult Thoth's persistent memory (USER.md, MEMORY.md,
+  LESSONS.md, the indexed code graph) and acknowledge relevant lessons
+  before acting. Trigger phrases: "edit", "refactor", "implement",
+  "fix the bug in", "add a feature", "deploy", "why does this do",
+  "how does X work".
 metadata:
-  version: "0.0.1"
+  version: "0.1.0"
 ---
 
 # Memory Discipline
 
 You are coding inside a repository that has a Thoth memory server attached
-via MCP. That server gives you three things you MUST use before taking any
+via MCP. That server gives you four things you MUST use before taking any
 load-bearing action:
 
 1. **Indexed code graph** — via `thoth_recall` (hybrid BM25 + symbol +
    vector search over the tree).
-2. **Declarative facts** — via `resources/read thoth://memory/MEMORY.md`.
-3. **Reflective lessons** — via `resources/read thoth://memory/LESSONS.md`
-   and the `thoth.nudge` prompt.
+2. **User preferences** — `.thoth/USER.md`, first-person style + workflow
+   choices that apply across projects.
+3. **Project facts** — `.thoth/MEMORY.md`, durable invariants about this
+   codebase.
+4. **Reflective lessons** — `.thoth/LESSONS.md`, action-triggered advice.
+
+USER.md + MEMORY.md + LESSONS.md are injected verbatim at SessionStart, so
+you already have them in context. The `thoth_recall` hit extends that with
+relevant code chunks.
 
 Skipping this loop causes drift. Past sessions spent hours fixing
 hallucinated APIs, re-learning patterns already documented in LESSONS.md,
@@ -40,46 +47,80 @@ intent is "add a retry wrapper around the HTTP client", recall
 
 Read the returned chunks. Every chunk has a `path:line-span` you can cite.
 
-### 2. Load lessons
+### 2. Honour USER.md + LESSONS.md
 
-Expand the `thoth.nudge` prompt with `arguments.intent` set to a
-one-sentence description of what you're about to do. The server returns a
-template that instructs you to:
+USER.md and LESSONS.md were already injected at SessionStart. Before
+acting, scan them for:
 
-- list every LESSONS.md entry whose `trigger` plausibly applies,
-- restate your plan naming each lesson you're honouring,
-- stop if a lesson advises against the plan.
-
-Follow that template verbatim. Do not skip the restatement — that step is
-what surfaces violated lessons to the user.
+- **USER.md** entries that shape HOW you respond (tone, language, commit
+  style, testing preferences). Apply them without being asked.
+- **LESSONS.md** triggers that match your planned action. Restate the
+  relevant lessons before proceeding — if a lesson advises against your
+  plan, stop and ask the user.
 
 ### 3. Act
 
-Proceed only after the restatement. If you edit code, quote the recalled
-chunk ids you relied on. If you're asserting a factual claim to the user
-("this function already handles retry"), cite at least one chunk id from
-the recall result.
+Proceed only after honouring preferences + lessons. If you edit code,
+quote the recalled chunk ids you relied on.
 
 ### 4. Reflect
 
 After the action completes (tests pass/fail, file saved, command run),
-expand `thoth.reflect` with:
+decide what to persist. Three surfaces, three tools:
 
-- `summary`: one paragraph of what you just did,
-- `outcome`: what happened (test output, user feedback, error, etc.).
+- **Preference** (`thoth_remember_preference`) — first-person, stable
+  across projects ("user prefers Vietnamese responses", "user runs
+  `make test` not `cargo test`"). Writes to USER.md.
+- **Fact** (`thoth_remember_fact`) — project-specific invariant
+  ("HTTP retry lives in crates/net/retry.rs"). Writes to MEMORY.md.
+- **Lesson** (`thoth_remember_lesson`) — action-triggered advice
+  ("when adding a retry → use RetryPolicy, not reqwest middleware").
+  Writes to LESSONS.md.
 
-The template asks you to decide whether to persist a `fact` or a `lesson`.
 Be conservative — only save memory that is specific, durable, and
-non-obvious. Then call the corresponding tool:
-
-- `thoth_remember_fact { text, tags }`
-- `thoth_remember_lesson { trigger, advice }`
+non-obvious.
 
 If the outcome was a success that validates a lesson you followed, call
 `thoth_lesson_outcome { signal: "success", triggers: [...] }` with the
 triggers of the lessons you honoured. On failure, call it with
 `signal: "failure"`. This bumps confidence counters so stale advice
 eventually dies.
+
+## Handling `cap_exceeded`
+
+All three `remember_*` tools return a structured error when the write
+would exceed `[memory].cap_*_bytes`. The error JSON has this shape:
+
+```json
+{
+  "code": "cap_exceeded",
+  "kind": "fact",
+  "current_bytes": 13784,
+  "cap_bytes": 16384,
+  "attempted_bytes": 14200,
+  "hint": "Call thoth_memory_replace or thoth_memory_remove to free space, then retry.",
+  "preview": [
+    {"index": 0, "first_line": "...", "bytes": 396, "tags": [...]}
+  ]
+}
+```
+
+When you see this, do NOT append to a sibling file or silently drop the
+new memory. Instead:
+
+1. Read the `preview` list. Each entry has `index`, `first_line`, and
+   `bytes`.
+2. Pick the entry(s) to consolidate or drop — prefer dropping stale
+   session-handoff / bare-SHA / outdated entries over real invariants.
+3. Call `thoth_memory_replace { kind, query, new_text }` to consolidate
+   (merges the new memory into an existing entry), or
+   `thoth_memory_remove { kind, query }` to free space outright.
+4. Retry the original `remember_*` call.
+
+For bulk cleanup of a legacy MEMORY.md / LESSONS.md that accumulated
+pre-cap entries, run `thoth memory migrate --llm` from the shell —
+classifier triages every entry as keep / move-to-USER.md / drop, then
+applies via the same replace/remove verbs.
 
 ## Anti-hallucination rules
 
@@ -88,8 +129,8 @@ eventually dies.
   find that in the indexed code — can you point me at it?"
 - **Quote chunk ids.** Citations look like `[chunk-id]` in your answer;
   the Thoth server uses them to validate that you grounded the response.
-- **Bail on deny.** If `thoth.nudge` surfaces a lesson whose advice is
-  "don't do X" and your plan is X, stop and ask the user.
+- **Bail on deny.** If a LESSONS.md trigger applies and the advice is
+  "don't do X", and your plan is X, stop and ask the user.
 
 ## When NOT to run the loop
 
@@ -105,28 +146,25 @@ saves hours of rework.
 ## Configuration
 
 The enforcement level comes from `<root>/config.toml` under
-`[discipline]`:
+`[discipline]` and `[memory]`:
 
-- `mode = "soft"` (default) — warn the user if you skip a step.
+- `mode = "nudge"` (default) — warn the user if you skip a step.
 - `mode = "strict"` — a PreToolUse gate hook will **block** every `Write`,
   `Edit`, `NotebookEdit`, and `Bash` tool call unless a `thoth_recall` was
-  logged within `gate_window_secs` (default 180s). The block response tells
-  you exactly what to do: run `thoth_recall`, then retry.
-- `gate_window_secs = 180` — how fresh a recall must be to satisfy the gate.
-- `gate_require_nudge = false` (default) — if true, the strict gate also
-  requires that the `thoth.nudge` prompt has been expanded inside the
-  window. This is the mode to pick when you want to force the agent to
-  actually reflect on lessons, not just run a perfunctory `thoth_recall`.
-- `reflect_cadence = "end"` (default) or `"every"` — when to reflect.
-- `nudge_before_write = true` (default) — require nudge before Write/Edit.
-- `grounding_check = false` (default) — if true, also expand
-  `thoth.grounding_check` on every factual claim.
+  logged within the gate window. The block response tells you exactly
+  what to do: run `thoth_recall`, then retry.
+- `gate_window_short_secs = 60` — recency shortcut; any recall within
+  this window passes without a relevance check.
+- `gate_window_long_secs = 1800` — relevance pool; the gate looks this
+  far back for a topically-matching recall when recency alone fails.
+- `gate_relevance_threshold = 0.30` — containment-based match threshold.
 - `memory_mode = "auto"` (default) or `"review"`. See below.
-- `quarantine_failure_ratio = 0.66` — lessons whose failure_count /
-  attempts exceeds this get auto-moved to `LESSONS.quarantined.md` by the
-  forget pass.
-- `quarantine_min_attempts = 5` — minimum attempts before a lesson is
-  eligible for quarantine.
+- `cap_memory_bytes = 16384` — hard cap for MEMORY.md.
+- `cap_user_bytes = 4096` — hard cap for USER.md.
+- `cap_lessons_bytes = 16384` — hard cap for LESSONS.md.
+- `strict_content_policy = false` — when true, ephemeral-looking inputs
+  (session-handoff prose, bare SHAs, date-only entries) are rejected at
+  the `remember_*` entry point instead of just warning.
 
 If the project has no `.thoth/` directory and `global_fallback = true`
 (the default), fall back to `~/.thoth/` memory. If neither exists, the
@@ -135,16 +173,15 @@ gate falls open (approves) with a warning and asks you to run
 
 ## Memory modes: `auto` vs `review`
 
-When you call `thoth_remember_fact` or `thoth_remember_lesson`, the
-server honours `memory_mode`:
+When you call `thoth_remember_*`, the server honours `memory_mode`:
 
-- **`auto`** — the entry is appended straight to `MEMORY.md` /
-  `LESSONS.md`. Fastest. Relies on the forget pass + confidence counters
-  to prune bad memory later. Good for solo use.
-- **`review`** — the entry is appended to `MEMORY.pending.md` /
-  `LESSONS.pending.md`. The user must run `thoth memory promote <kind>
-  <index>` (or call `thoth_memory_promote`) to accept. Rejected entries
-  are archived with a reason in `memory-history.jsonl`. Good for teams.
+- **`auto`** — the entry is appended straight to its target file.
+  Fastest. Relies on the forget pass + confidence counters to prune bad
+  memory later. Good for solo use.
+- **`review`** — the entry is appended to a `*.pending.md` sibling. The
+  user must run `thoth memory promote <kind> <index>` (or call
+  `thoth_memory_promote`) to accept. Rejected entries are archived with
+  a reason in `memory-history.jsonl`. Good for teams.
 
 Even in `auto` mode, the server refuses to silently **overwrite** an
 existing lesson — if a `trigger` already exists, the new lesson is
@@ -152,33 +189,15 @@ staged and flagged with `"conflict": {...}` in the tool output. When you
 see a conflict, do NOT try to auto-promote: flag it to the user via
 `thoth_request_review` and let them decide.
 
-Use `thoth_request_review` proactively whenever you're about to remember
-something you're not sure about: it writes a `request_review` entry to
-`memory-history.jsonl` so the user has a queue of things to audit.
-
-## Versioning + self-correction
+## Audit log
 
 Every memory mutation lands in `.thoth/memory-history.jsonl` (one JSON
 per line) with `op`, `kind`, `title`, `actor`, `reason`, and a timestamp.
-Ops include: `stage`, `promote`, `reject`, `quarantine`, `propose`,
-`request_review`. Inspect with `thoth memory log --limit 50`.
-
-Lessons that rack up failures get auto-quarantined. They're not deleted —
-they're moved to `LESSONS.quarantined.md` so the user can review and
-either restore them (manual edit) or leave them dead.
-
-## Proposing new skills
-
-When you've hit the same pattern in ≥5 lessons, consolidate them into a
-reusable skill via `thoth_skill_propose`:
-
-- `slug`: kebab-case directory name.
-- `body`: full SKILL.md text starting with `---\nname: ...` frontmatter.
-- `source_triggers`: the triggers of the lessons being consolidated.
-
-The draft lands at `.thoth/skills/<slug>.draft/SKILL.md` and an entry is
-written to the history log. The user promotes the draft via `thoth
-skills install .thoth/skills/<slug>.draft` once they've reviewed it.
+Ops include: `append`, `replace`, `remove`, `stage`, `promote`, `reject`,
+`quarantine`, `propose`, `request_review`. Inspect with
+`thoth memory log --limit 50`. This log is size-capped and
+self-truncates — old entries past the session window are intentionally
+shed since reflection debt counts from `.session-start` anyway.
 
 ## Why the strict gate exists
 
