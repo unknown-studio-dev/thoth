@@ -6,7 +6,7 @@ this file holds durable first-person preferences that apply across projects
 and sessions — "user prefers X", "user's style is Y", "user dislikes Z".
 
 Entries use the same `### heading` + blank line + body + `tags:` format as
-`MEMORY.md`. Kept small on purpose (default cap: 1536 bytes) so it loads
+`MEMORY.md`. Kept small on purpose (default cap: 4096 bytes) so it loads
 cheaply into every session.
 
 <!-- Example (delete once you have real entries):

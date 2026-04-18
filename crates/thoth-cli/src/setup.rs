@@ -589,9 +589,9 @@ fn render_toml(a: &SetupAnswers) -> String {
          # Byte caps for the three durable memory files. Writes that would\n\
          # push a file past its cap are rejected with a structured error;\n\
          # the agent is expected to curate (forget/compact) before retrying.\n\
-         cap_memory_bytes       = 3072\n\
-         cap_user_bytes         = 1536\n\
-         cap_lessons_bytes      = 5120\n\
+         cap_memory_bytes       = 16384\n\
+         cap_user_bytes         = 4096\n\
+         cap_lessons_bytes      = 16384\n\
          # Strict content policy — when true, REQ-12 violations (e.g.\n\
          # session-handoff prose, path-only entries) are hard-rejected.\n\
          # Default false: policy is warn-only.\n\
@@ -898,8 +898,77 @@ async fn install_integration(root: &Path) -> Result<()> {
 
 /// Re-run install without touching `config.toml`. Used by the
 /// already-bootstrapped branch.
+///
+/// Also backfills memory-state additions introduced after the user's
+/// original setup: creates missing `USER.md` from the embedded template
+/// and appends any `[memory]` cap keys that are absent from their
+/// existing `config.toml`. Existing values are left alone.
 async fn reinstall_integration(root: &Path) -> Result<()> {
+    seed_markdown(root).await?;
+    backfill_memory_caps(root).await?;
     install_integration(root).await
+}
+
+/// Append `cap_memory_bytes` / `cap_user_bytes` / `cap_lessons_bytes` /
+/// `strict_content_policy` to an existing `config.toml` if those keys
+/// are missing. Preserves user edits to values already present.
+async fn backfill_memory_caps(root: &Path) -> Result<()> {
+    let cfg_path = root.join("config.toml");
+    let Ok(body) = tokio::fs::read_to_string(&cfg_path).await else {
+        return Ok(());
+    };
+    let mut pending: Vec<&str> = Vec::new();
+    if !body.contains("cap_memory_bytes") {
+        pending.push("cap_memory_bytes       = 16384");
+    }
+    if !body.contains("cap_user_bytes") {
+        pending.push("cap_user_bytes         = 4096");
+    }
+    if !body.contains("cap_lessons_bytes") {
+        pending.push("cap_lessons_bytes      = 16384");
+    }
+    if !body.contains("strict_content_policy") {
+        pending.push("strict_content_policy  = false");
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    // Inject after the `[memory]` header so keys stay in their section.
+    // Fall back to appending at EOF if the section isn't present — the
+    // missing-section case means the file was hand-written without a
+    // [memory] block; the MemoryConfig parser accepts top-level keys too.
+    let patch = pending.join("\n");
+    let new_body = match body.find("[memory]") {
+        Some(hdr_start) => {
+            let after_hdr = body[hdr_start..]
+                .find('\n')
+                .map(|rel| hdr_start + rel + 1)
+                .unwrap_or(body.len());
+            let mut out = String::with_capacity(body.len() + patch.len() + 64);
+            out.push_str(&body[..after_hdr]);
+            out.push_str("# Backfilled by `thoth setup` self-heal — byte caps for durable memory files.\n");
+            out.push_str(&patch);
+            out.push('\n');
+            out.push_str(&body[after_hdr..]);
+            out
+        }
+        None => {
+            let mut out = body;
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("\n[memory]\n");
+            out.push_str(&patch);
+            out.push('\n');
+            out
+        }
+    };
+    tokio::fs::write(&cfg_path, new_body)
+        .await
+        .with_context(|| format!("backfill caps into {}", cfg_path.display()))?;
+    println!("✓ Backfilled [memory] caps into {}", cfg_path.display());
+    Ok(())
 }
 
 // ------------------------------------------------------ output helpers
@@ -988,9 +1057,9 @@ mod tests {
     #[test]
     fn render_toml_includes_memory_caps_and_policy() {
         let toml = render_toml(&SetupAnswers::default());
-        assert!(toml.contains("cap_memory_bytes       = 3072"));
-        assert!(toml.contains("cap_user_bytes         = 1536"));
-        assert!(toml.contains("cap_lessons_bytes      = 5120"));
+        assert!(toml.contains("cap_memory_bytes       = 16384"));
+        assert!(toml.contains("cap_user_bytes         = 4096"));
+        assert!(toml.contains("cap_lessons_bytes      = 16384"));
         assert!(toml.contains("strict_content_policy  = false"));
     }
 }

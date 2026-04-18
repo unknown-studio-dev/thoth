@@ -72,17 +72,20 @@ pub struct MemoryConfig {
     pub decay_floor: f32,
     /// Whether to invoke the LLM nudge at session end (Mode::Full only).
     pub enable_nudge: bool,
-    /// Hard cap for `MEMORY.md` in bytes. Default 3072 (DESIGN-SPEC REQ-02).
+    /// Hard cap for `MEMORY.md` in bytes. Default 16384 (~4K tokens).
     /// A `thoth_remember_fact` that would push the file above this cap
     /// returns a structured [`CapExceededError`] instead of silently
     /// appending — the agent must call `thoth_memory_replace` or
     /// `thoth_memory_remove` first.
+    ///
+    /// Sized so USER + MEMORY + LESSONS combined inject < ~10K tokens
+    /// (< 5% of a 200K context window) at SessionStart.
     #[serde(default = "default_cap_memory_bytes")]
     pub cap_memory_bytes: usize,
-    /// Hard cap for `USER.md` in bytes. Default 1536 (DESIGN-SPEC REQ-02).
+    /// Hard cap for `USER.md` in bytes. Default 4096 (~1K tokens).
     #[serde(default = "default_cap_user_bytes")]
     pub cap_user_bytes: usize,
-    /// Hard cap for `LESSONS.md` in bytes. Default 5120 (DESIGN-SPEC REQ-02).
+    /// Hard cap for `LESSONS.md` in bytes. Default 16384 (~4K tokens).
     #[serde(default = "default_cap_lessons_bytes")]
     pub cap_lessons_bytes: usize,
     /// FLEXIBLE content policy (DESIGN-SPEC REQ-12). When `false` (default)
@@ -94,15 +97,15 @@ pub struct MemoryConfig {
 }
 
 fn default_cap_memory_bytes() -> usize {
-    3072
+    16_384
 }
 
 fn default_cap_user_bytes() -> usize {
-    1536
+    4_096
 }
 
 fn default_cap_lessons_bytes() -> usize {
-    5120
+    16_384
 }
 
 impl Default for MemoryConfig {
@@ -1908,14 +1911,15 @@ mod cap_tests {
     use super::*;
 
     /// DESIGN-SPEC REQ-02: default caps for `MEMORY.md` / `USER.md` /
-    /// `LESSONS.md` must land on the 3072 / 1536 / 5120 byte budget and
-    /// `strict_content_policy` defaults off (REQ-12 is warn-only by default).
+    /// `LESSONS.md` sized for real-world projects (16K / 4K / 16K bytes).
+    /// Combined max injection ≈36 KB ≈9K tokens — under 5% of a 200K
+    /// context window. `strict_content_policy` defaults off (REQ-12).
     #[test]
     fn memory_config_caps_default() {
         let cfg = MemoryConfig::default();
-        assert_eq!(cfg.cap_memory_bytes, 3072);
-        assert_eq!(cfg.cap_user_bytes, 1536);
-        assert_eq!(cfg.cap_lessons_bytes, 5120);
+        assert_eq!(cfg.cap_memory_bytes, 16_384);
+        assert_eq!(cfg.cap_user_bytes, 4_096);
+        assert_eq!(cfg.cap_lessons_bytes, 16_384);
         assert!(!cfg.strict_content_policy);
     }
 }

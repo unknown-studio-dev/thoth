@@ -50,8 +50,7 @@ fn setup_creates_user_md_seed_and_config_caps() {
         "USER.md seed missing preference description: {user_body}"
     );
     assert!(
-        user_body.to_lowercase().contains("cap")
-            || user_body.contains("1536 bytes"),
+        user_body.to_lowercase().contains("cap"),
         "USER.md seed should mention its byte cap: {user_body}"
     );
 
@@ -59,15 +58,15 @@ fn setup_creates_user_md_seed_and_config_caps() {
     // the DESIGN-SPEC default values.
     let toml_body = std::fs::read_to_string(&config).expect("read config.toml");
     assert!(
-        toml_body.contains("cap_memory_bytes       = 3072"),
+        toml_body.contains("cap_memory_bytes       = 16384"),
         "cap_memory_bytes default missing: {toml_body}"
     );
     assert!(
-        toml_body.contains("cap_user_bytes         = 1536"),
+        toml_body.contains("cap_user_bytes         = 4096"),
         "cap_user_bytes default missing: {toml_body}"
     );
     assert!(
-        toml_body.contains("cap_lessons_bytes      = 5120"),
+        toml_body.contains("cap_lessons_bytes      = 16384"),
         "cap_lessons_bytes default missing: {toml_body}"
     );
     assert!(

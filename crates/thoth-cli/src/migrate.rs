@@ -19,10 +19,19 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use thoth_core::{Fact, Lesson};
 use thoth_memory::{MarkdownStoreMemoryExt, MemoryKind, check_content_policy};
 use thoth_store::markdown::MarkdownStore;
+
+use crate::review::call_backend;
+
+/// LLM backend knob surfaced on the CLI (`--llm --llm-backend cli`).
+#[derive(Debug, Clone)]
+pub struct LlmOpts {
+    pub backend: String,
+    pub model: String,
+}
 
 /// Verdict produced by [`classify_entry`] / [`classify_all`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,11 +332,23 @@ pub async fn apply(
 
 /// Entrypoint wired into `main.rs`: classify, confirm, apply. `assume_yes`
 /// short-circuits the interactive prompt (used by CI + `--yes`).
-pub async fn run(root: &Path, assume_yes: bool) -> anyhow::Result<MigrateReport> {
-    let classifications = classify_all(root).await?;
+pub async fn run(
+    root: &Path,
+    assume_yes: bool,
+    llm: Option<LlmOpts>,
+) -> anyhow::Result<MigrateReport> {
+    let mut classifications = classify_all(root).await?;
     if classifications.is_empty() {
         println!("migrate: MEMORY.md and LESSONS.md are empty — nothing to do");
         return Ok(MigrateReport::default());
+    }
+    if let Some(opts) = llm {
+        match refine_with_llm(&classifications, &opts).await {
+            Ok(refined) => classifications = refined,
+            Err(e) => {
+                eprintln!("migrate: LLM classifier failed ({e}); falling back to heuristic");
+            }
+        }
     }
     let confirmed = interactive_confirm(classifications, assume_yes)?;
     if confirmed.is_empty() {
@@ -370,6 +391,127 @@ fn load_user_cap(root: &Path) -> Option<ApplyConfig> {
 #[allow(dead_code)]
 fn _assert_fact_lesson_fields(f: &Fact, l: &Lesson) -> (String, String) {
     (f.text.clone(), l.advice.clone())
+}
+
+// ===========================================================================
+// LLM-based refinement
+// ===========================================================================
+
+/// Replace heuristic `Keep` / `MoveToUserMd` verdicts with LLM judgements.
+/// Content-policy `Drop`s are kept as-is — we trust the deterministic rule
+/// more than the LLM on those.
+///
+/// One round-trip: the prompt packs every non-policy-drop entry and asks
+/// for a JSON array back. On any parse / LLM failure the caller keeps the
+/// heuristic result (we return the error and let `run` log + fall through).
+async fn refine_with_llm(
+    classifications: &[Classification],
+    opts: &LlmOpts,
+) -> anyhow::Result<Vec<Classification>> {
+    let candidates: Vec<(usize, &Classification)> = classifications
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !matches!(c.verdict, Verdict::Drop(_)))
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(classifications.to_vec());
+    }
+
+    let prompt = build_llm_prompt(&candidates);
+    let reply = call_backend(&prompt, &opts.backend, &opts.model)
+        .await
+        .context("claude backend call failed")?;
+    let decisions = parse_llm_reply(&reply).context("parse LLM reply as JSON decisions")?;
+
+    let mut out = classifications.to_vec();
+    let mut refined = 0usize;
+    for (pos, original) in candidates {
+        let Some(decision) = decisions.iter().find(|d| d.index == pos) else {
+            continue;
+        };
+        let new_verdict = match decision.verdict.as_str() {
+            "drop" => Verdict::Drop(DropReason::SessionHandoff),
+            "move" => Verdict::MoveToUserMd,
+            _ => Verdict::Keep,
+        };
+        if new_verdict != original.verdict {
+            out[pos].verdict = new_verdict;
+            refined += 1;
+        }
+    }
+    eprintln!(
+        "migrate: LLM reclassified {refined}/{} candidates",
+        candidates_len(&out)
+    );
+    Ok(out)
+}
+
+fn candidates_len(v: &[Classification]) -> usize {
+    v.iter()
+        .filter(|c| !matches!(c.verdict, Verdict::Drop(_)))
+        .count()
+}
+
+fn build_llm_prompt(candidates: &[(usize, &Classification)]) -> String {
+    let mut prompt = String::from(
+        "You are triaging a coding agent's long-term memory. Each entry below \
+         belongs to either MEMORY.md (project facts) or LESSONS.md (action-\
+         triggered invariants). Classify each as:\n\
+         - \"keep\" — durable, reusable invariant or project fact\n\
+         - \"move\" — first-person user preference (style, tone, dislikes). \
+         Belongs in USER.md.\n\
+         - \"drop\" — ephemeral: session handoff, bare commit SHA, bare path/\
+         date, repeat of another entry, or content with no reusable signal.\n\n\
+         Reply with ONLY a JSON array. No prose. Schema:\n\
+         [{\"index\": <number>, \"verdict\": \"keep\"|\"move\"|\"drop\"}]\n\n\
+         Entries:\n",
+    );
+    for (i, c) in candidates {
+        let body = c.query.replace('\n', " ").trim().to_string();
+        let truncated = if body.len() > 400 {
+            let cut = body
+                .char_indices()
+                .take_while(|(bi, _)| *bi <= 400)
+                .last()
+                .map(|(bi, _)| bi)
+                .unwrap_or(0);
+            format!("{}…", &body[..cut])
+        } else {
+            body
+        };
+        use std::fmt::Write;
+        let _ = writeln!(
+            prompt,
+            "#{i} [{kind:?}] {truncated}",
+            kind = c.kind,
+            truncated = truncated
+        );
+    }
+    prompt
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LlmDecision {
+    index: usize,
+    verdict: String,
+}
+
+fn parse_llm_reply(reply: &str) -> anyhow::Result<Vec<LlmDecision>> {
+    // Claude sometimes wraps JSON in prose or fenced blocks; extract the
+    // first `[...]` span and parse that.
+    let start = reply
+        .find('[')
+        .ok_or_else(|| anyhow!("no `[` in reply: {reply}"))?;
+    let end = reply
+        .rfind(']')
+        .ok_or_else(|| anyhow!("no `]` in reply: {reply}"))?;
+    if end <= start {
+        return Err(anyhow!("malformed bracket span in reply"));
+    }
+    let json = &reply[start..=end];
+    serde_json::from_str::<Vec<LlmDecision>>(json)
+        .with_context(|| format!("invalid JSON: {json}"))
 }
 
 // ===========================================================================

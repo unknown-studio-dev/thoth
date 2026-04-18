@@ -474,6 +474,18 @@ enum MemoryCmd {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// Use an LLM (claude CLI / Anthropic API) to classify entries
+        /// instead of the offline keyword heuristic. Falls back to the
+        /// heuristic on per-entry LLM failures.
+        #[arg(long)]
+        llm: bool,
+        /// Backend for `--llm`: `cli` (default), `api`, or `auto`.
+        #[arg(long, default_value = "cli")]
+        llm_backend: String,
+        /// Model name passed to the backend. Defaults to Haiku — cheap and
+        /// fast for bulk classification.
+        #[arg(long, default_value = "claude-haiku-4-5")]
+        llm_model: String,
     },
 }
 
@@ -615,8 +627,25 @@ async fn main() -> anyhow::Result<()> {
                 reason,
             } => cmd_memory_reject(&cli.root, &kind, index, reason.as_deref(), cli.json).await?,
             MemoryCmd::Log { limit } => cmd_memory_log(&cli.root, limit, cli.json).await?,
-            MemoryCmd::Migrate { yes } => {
-                migrate::run(&cli.root, yes).await?;
+            MemoryCmd::Migrate {
+                yes,
+                llm,
+                llm_backend,
+                llm_model,
+            } => {
+                migrate::run(
+                    &cli.root,
+                    yes,
+                    if llm {
+                        Some(migrate::LlmOpts {
+                            backend: llm_backend,
+                            model: llm_model,
+                        })
+                    } else {
+                        None
+                    },
+                )
+                .await?;
             }
         },
         Cmd::Skills { cmd } => match cmd {
