@@ -150,8 +150,29 @@ const DEFAULT_BASH_READONLY_PREFIXES: &[&str] = &[
     "thoth memory forget",
     "thoth memory fact ",
     "thoth memory lesson ",
+    // REQ-09 / REQ-11: the migrate verb + the edit verbs it calls under
+    // the hood. These are audit-logged memory mutations (not code edits),
+    // so they're classified ReadOnly-for-gate-purposes — the gate exists
+    // to force a `recall` before *code* mutation, not before curation.
+    "thoth memory migrate",
+    "thoth memory replace ",
+    "thoth memory remove ",
+    "thoth memory preference ",
     "thoth skills list",
     "thoth eval ",
+];
+
+/// MCP tool names that the gate treats as curation — memory mutations
+/// that explicitly don't require a fresh `recall`. The MCP branch of
+/// `classify_intent` looks these up so the agent can call them the same
+/// way it can use `thoth_recall` / `thoth_remember_fact` under a debt
+/// lockdown.
+///
+/// Source: DESIGN-SPEC REQ-11.
+const DEFAULT_MCP_TOOL_READONLY: &[&str] = &[
+    "thoth_memory_replace",
+    "thoth_memory_remove",
+    "thoth_remember_preference",
 ];
 
 // ===========================================================================
@@ -439,8 +460,19 @@ fn classify_intent(tool_name: &str, tool_input: &Value, readonly_prefixes: &[Str
                 Intent::Mutation
             }
         }
-        // Anything else — Read, Grep, Glob, WebFetch, MCP tool dispatches,
-        // etc. Not our concern.
+        // MCP tool dispatches — Claude Code prefixes these with
+        // `mcp__<server>__`. REQ-11: the curation verbs map to ReadOnly so
+        // the agent can clean up memory under a debt lockdown.
+        name if name.starts_with("mcp__") => {
+            let tail = name.rsplit("__").next().unwrap_or(name);
+            if DEFAULT_MCP_TOOL_READONLY.iter().any(|t| *t == tail) {
+                Intent::ReadOnly
+            } else {
+                Intent::Ignored
+            }
+        }
+        // Anything else — Read, Grep, Glob, WebFetch, plain MCP tools
+        // we don't care about. Not our concern.
         _ => Intent::Ignored,
     }
 }
@@ -1567,6 +1599,32 @@ mod tests {
         // exact-first-word match.
         let intent = classify_intent("Bash", &input, &prefixes);
         assert_eq!(intent, Intent::ReadOnly);
+    }
+
+    #[test]
+    fn gate_whitelists_memory_replace() {
+        // REQ-11: the Bash prefix `thoth memory replace …` must classify
+        // as ReadOnly so the agent can curate memory under a debt
+        // lockdown.
+        let prefixes = DEFAULT_BASH_READONLY_PREFIXES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let input = json!({"command": "thoth memory replace --kind fact --query foo --text bar"});
+        let intent = classify_intent("Bash", &input, &prefixes);
+        assert_eq!(intent, Intent::ReadOnly);
+        // And `thoth memory remove` / `preference` follow the same rule.
+        let input = json!({"command": "thoth memory remove --kind lesson --query old"});
+        assert_eq!(
+            classify_intent("Bash", &input, &prefixes),
+            Intent::ReadOnly
+        );
+        // MCP dispatch of `thoth_memory_replace` also passes ReadOnly.
+        let input = json!({});
+        assert_eq!(
+            classify_intent("mcp__thoth__thoth_memory_replace", &input, &prefixes),
+            Intent::ReadOnly
+        );
     }
 
     #[test]

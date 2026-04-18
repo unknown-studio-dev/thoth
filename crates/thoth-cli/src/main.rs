@@ -55,6 +55,7 @@ use tracing::warn;
 mod compact;
 mod daemon;
 mod hooks;
+mod migrate;
 mod review;
 mod setup;
 
@@ -464,6 +465,16 @@ enum MemoryCmd {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// One-shot triage of legacy MEMORY.md / LESSONS.md into the
+    /// three-surface taxonomy (MEMORY / LESSONS / USER). Classifies each
+    /// entry as Keep / Move-to-USER.md / Drop per the DESIGN-SPEC §REQ-09
+    /// heuristics and applies via the audit-logged replace / remove /
+    /// `append_preference` verbs.
+    Migrate {
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -604,6 +615,9 @@ async fn main() -> anyhow::Result<()> {
                 reason,
             } => cmd_memory_reject(&cli.root, &kind, index, reason.as_deref(), cli.json).await?,
             MemoryCmd::Log { limit } => cmd_memory_log(&cli.root, limit, cli.json).await?,
+            MemoryCmd::Migrate { yes } => {
+                migrate::run(&cli.root, yes).await?;
+            }
         },
         Cmd::Skills { cmd } => match cmd {
             SkillsCmd::List => cmd_skills_list(&cli.root, cli.json).await?,
