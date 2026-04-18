@@ -829,6 +829,86 @@ mod decay_tests {
     }
 }
 
+/// REQ-04: verify that `append_fact` and `append_lesson` write an `op =
+/// "append"` entry to `memory-history.jsonl` so the reflection-debt counter
+/// in `thoth-memory` can count remembers correctly.
+#[cfg(test)]
+mod history_tests {
+    use tempfile::tempdir;
+    use thoth_core::{Fact, Lesson, MemoryKind, MemoryMeta};
+    use thoth_store::markdown::MarkdownStore;
+
+    fn fact(text: &str) -> Fact {
+        Fact {
+            meta: MemoryMeta::new(MemoryKind::Semantic),
+            text: text.to_string(),
+            tags: Vec::new(),
+        }
+    }
+
+    fn lesson(trigger: &str, advice: &str) -> Lesson {
+        Lesson {
+            meta: MemoryMeta::new(MemoryKind::Reflective),
+            trigger: trigger.to_string(),
+            advice: advice.to_string(),
+            success_count: 0,
+            failure_count: 0,
+        }
+    }
+
+    /// `append_fact` must emit an `op="append", kind="fact"` entry in
+    /// `memory-history.jsonl`.
+    #[tokio::test]
+    async fn append_fact_writes_history_entry() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store.append_fact(&fact("the sky is blue")).await.unwrap();
+
+        let history = store.read_history().await.unwrap();
+        assert_eq!(history.len(), 1, "expected exactly one history entry");
+        let entry = &history[0];
+        assert_eq!(entry.op, "append", "op should be 'append'");
+        assert_eq!(entry.kind, "fact", "kind should be 'fact'");
+        assert_eq!(entry.title, "the sky is blue");
+    }
+
+    /// `append_lesson` must emit an `op="append", kind="lesson"` entry in
+    /// `memory-history.jsonl`.
+    #[tokio::test]
+    async fn append_lesson_writes_history_entry() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store
+            .append_lesson(&lesson("when editing migrations", "run sqlx prepare"))
+            .await
+            .unwrap();
+
+        let history = store.read_history().await.unwrap();
+        assert_eq!(history.len(), 1, "expected exactly one history entry");
+        let entry = &history[0];
+        assert_eq!(entry.op, "append", "op should be 'append'");
+        assert_eq!(entry.kind, "lesson", "kind should be 'lesson'");
+        assert_eq!(entry.title, "when editing migrations");
+    }
+
+    /// Both operations together produce two distinct history entries.
+    #[tokio::test]
+    async fn fact_and_lesson_produce_two_history_entries() {
+        let dir = tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store.append_fact(&fact("gravity exists")).await.unwrap();
+        store
+            .append_lesson(&lesson("always write tests", "saves time"))
+            .await
+            .unwrap();
+
+        let history = store.read_history().await.unwrap();
+        assert_eq!(history.len(), 2, "expected two history entries");
+        assert_eq!(history[0].kind, "fact");
+        assert_eq!(history[1].kind, "lesson");
+    }
+}
+
 /// Stats produced by a forgetting pass.
 #[derive(Debug, Clone, Default)]
 pub struct ForgetReport {
