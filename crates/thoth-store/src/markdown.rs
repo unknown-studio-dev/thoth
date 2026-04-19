@@ -59,7 +59,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use thoth_core::{Enforcement, Fact, Lesson, MemoryKind, MemoryMeta, Result, Skill};
+use thoth_core::{Enforcement, Fact, FactScope, Lesson, MemoryKind, MemoryMeta, Result, Skill};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 
@@ -734,6 +734,7 @@ fn parse_facts(text: &str) -> Vec<Fact> {
         };
         let mut body = String::new();
         let mut tags = Vec::new();
+        let mut scope = FactScope::default();
 
         while let Some(next) = iter.peek() {
             if next.starts_with("### ") || next.starts_with("## ") || next.starts_with("# ") {
@@ -747,6 +748,11 @@ fn parse_facts(text: &str) -> Vec<Fact> {
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned)
                     .collect();
+            } else if let Some(rest) = n.strip_prefix("scope:") {
+                scope = match rest.trim() {
+                    "on-demand" | "on_demand" => FactScope::OnDemand,
+                    _ => FactScope::Always,
+                };
             } else if !n.trim().is_empty() || !body.is_empty() {
                 body.push_str(n);
                 body.push('\n');
@@ -763,6 +769,7 @@ fn parse_facts(text: &str) -> Vec<Fact> {
             meta: MemoryMeta::new(MemoryKind::Semantic),
             text: fact_text,
             tags,
+            scope,
         });
     }
     out
@@ -992,6 +999,9 @@ fn render_fact(f: &Fact) -> String {
         out.push_str(&f.tags.join(", "));
         out.push('\n');
     }
+    if f.scope == FactScope::OnDemand {
+        out.push_str("scope: on-demand\n");
+    }
     out.push('\n');
     out
 }
@@ -1168,6 +1178,7 @@ mod single_pass_grep_tests {
             meta: MemoryMeta::new(MemoryKind::Semantic),
             text: text.to_string(),
             tags: tags.iter().map(|s| s.to_string()).collect(),
+            scope: Default::default(),
         }
     }
 
@@ -1315,6 +1326,106 @@ mod single_pass_grep_tests {
             results.is_empty(),
             "empty needle list must return empty results"
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use tempfile::TempDir;
+    use thoth_core::{Fact, FactScope, MemoryKind, MemoryMeta};
+
+    async fn open_store() -> (TempDir, MarkdownStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn scope_on_demand_roundtrips_through_markdown() {
+        let (_dir, store) = open_store().await;
+        let f = Fact {
+            meta: MemoryMeta::new(MemoryKind::Semantic),
+            text: "detailed auth flow diagram".to_string(),
+            tags: vec!["auth".into()],
+            scope: FactScope::OnDemand,
+        };
+        store.append_fact(&f).await.unwrap();
+
+        let raw = tokio::fs::read_to_string(store.root.join("MEMORY.md"))
+            .await
+            .unwrap();
+        assert!(
+            raw.contains("scope: on-demand"),
+            "on-demand scope must be rendered, got:\n{raw}"
+        );
+
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].scope, FactScope::OnDemand);
+    }
+
+    #[tokio::test]
+    async fn scope_always_does_not_emit_scope_line() {
+        let (_dir, store) = open_store().await;
+        let f = Fact {
+            meta: MemoryMeta::new(MemoryKind::Semantic),
+            text: "core identity fact".to_string(),
+            tags: vec![],
+            scope: FactScope::Always,
+        };
+        store.append_fact(&f).await.unwrap();
+
+        let raw = tokio::fs::read_to_string(store.root.join("MEMORY.md"))
+            .await
+            .unwrap();
+        assert!(
+            !raw.contains("scope:"),
+            "always-scope must not emit scope line, got:\n{raw}"
+        );
+
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts[0].scope, FactScope::Always);
+    }
+
+    #[tokio::test]
+    async fn legacy_facts_without_scope_default_to_always() {
+        let (_dir, store) = open_store().await;
+        let legacy = "# MEMORY.md\n\
+            ### auth uses JWT\n\
+            tokens are signed with RS256\n\
+            tags: auth\n\
+            \n";
+        tokio::fs::write(store.root.join("MEMORY.md"), legacy)
+            .await
+            .unwrap();
+
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].scope, FactScope::Always);
+    }
+
+    #[tokio::test]
+    async fn mixed_scopes_roundtrip() {
+        let (_dir, store) = open_store().await;
+        let always = Fact {
+            meta: MemoryMeta::new(MemoryKind::Semantic),
+            text: "project uses Rust".to_string(),
+            tags: vec![],
+            scope: FactScope::Always,
+        };
+        let on_demand = Fact {
+            meta: MemoryMeta::new(MemoryKind::Semantic),
+            text: "detailed CI pipeline config".to_string(),
+            tags: vec!["ci".into()],
+            scope: FactScope::OnDemand,
+        };
+        store.rewrite_facts(&[always, on_demand]).await.unwrap();
+
+        let facts = store.read_facts().await.unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].scope, FactScope::Always);
+        assert_eq!(facts[1].scope, FactScope::OnDemand);
     }
 }
 

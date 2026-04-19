@@ -189,6 +189,7 @@ impl CodeMemory {
             meta: MemoryMeta::new(MemoryKind::Semantic),
             text: text.into(),
             tags,
+            scope: Default::default(),
         };
         self.store.markdown.append_fact(&fact).await
     }

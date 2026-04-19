@@ -71,6 +71,18 @@ impl MemoryMeta {
     }
 }
 
+/// Whether a fact is always injected at session start or only retrieved
+/// on demand. Inspired by MemPalace's L0/L1 layered memory stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FactScope {
+    /// Always included in `thoth_wakeup` output — core identity / essential context.
+    #[default]
+    Always,
+    /// Only surfaced when a `thoth_recall` query matches.
+    OnDemand,
+}
+
 /// A fact recorded in `MEMORY.md` (or its derived index).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fact {
@@ -80,6 +92,9 @@ pub struct Fact {
     pub text: String,
     /// Optional tags for filtering.
     pub tags: Vec<String>,
+    /// Whether this fact is always injected or only on-demand.
+    #[serde(default)]
+    pub scope: FactScope,
 }
 
 /// A lesson learned from a mistake, stored in `LESSONS.md`.

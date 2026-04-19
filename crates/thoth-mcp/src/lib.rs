@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 pub mod proto;
+pub mod sanitize;
 pub mod server;
 
 pub use server::{Server, run_socket, run_stdio, socket_path};

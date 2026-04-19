@@ -15,6 +15,7 @@ mod hooks;
 mod index_cmd;
 mod memory_cmd;
 mod migrate;
+mod mine_cmd;
 mod override_cmd;
 mod query_cmd;
 mod resolve;
@@ -251,6 +252,13 @@ enum Cmd {
     Stats {
         #[arg(long, default_value_t = 1)]
         weeks: u32,
+    },
+
+    /// Ingest Claude Code conversation JSONL into episodic memory.
+    Mine {
+        /// Path to a .jsonl file or directory containing them.
+        #[arg(required = true)]
+        source: PathBuf,
     },
 
     /// Manage the global project registry.
@@ -516,6 +524,7 @@ async fn main() -> anyhow::Result<()> {
                 max_sessions,
             } => archive_cmd::cmd_archive_curate(&root, &backend, &model, max_sessions).await?,
         },
+        Cmd::Mine { source } => mine_cmd::run_mine(&root, &source, cli.json).await?,
         Cmd::Projects { cmd } => match cmd {
             resolve::ProjectsCmd::List => resolve::cmd_projects_list()?,
             resolve::ProjectsCmd::Which => resolve::cmd_projects_which(&root)?,

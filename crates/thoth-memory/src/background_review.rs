@@ -350,6 +350,7 @@ pub async fn persist_review(root: &Path, output: ReviewOutput) -> Result<ReviewR
             meta: thoth_core::MemoryMeta::new(thoth_core::MemoryKind::Semantic),
             text: entry.text,
             tags: entry.tags,
+            scope: Default::default(),
         };
         if let Err(e) = md.append_fact(&fact).await {
             tracing::warn!(error = %e, "background-review: failed to append fact");

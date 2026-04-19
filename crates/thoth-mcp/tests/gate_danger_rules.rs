@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use blake3;
 use serde_json::{Value, json};
 
 /// Spawn `thoth-gate` with an isolated `$HOME` and `$THOTH_ROOT`, feed

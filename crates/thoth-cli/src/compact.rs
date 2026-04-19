@@ -236,6 +236,7 @@ pub async fn run_compact(
             meta: MemoryMeta::new(MemoryKind::Semantic),
             text: f.text,
             tags: f.tags,
+            scope: Default::default(),
         })
         .collect();
     let new_lessons: Vec<Lesson> = out

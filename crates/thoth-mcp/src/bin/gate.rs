@@ -137,6 +137,7 @@ const DEFAULT_BASH_READONLY_PREFIXES: &[&str] = &[
     "thoth curate",
     "thoth compact",
     "thoth review",
+    "thoth mine",
     "thoth query ",
     "thoth impact ",
     "thoth context ",

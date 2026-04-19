@@ -413,6 +413,7 @@ mod history_tests {
             meta: MemoryMeta::new(MemoryKind::Semantic),
             text: text.to_string(),
             tags: Vec::new(),
+            scope: Default::default(),
         }
     }
 

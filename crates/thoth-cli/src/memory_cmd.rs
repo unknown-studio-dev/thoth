@@ -183,6 +183,7 @@ pub async fn run_fact(root: &Path, text: String, tags: Option<String>) -> Result
         meta: MemoryMeta::new(MemoryKind::Semantic),
         text,
         tags,
+        scope: Default::default(),
     };
     store.markdown.append_fact(&fact).await?;
     println!(

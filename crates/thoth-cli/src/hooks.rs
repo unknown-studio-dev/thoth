@@ -1062,8 +1062,8 @@ pub async fn exec(event: HookEvent, root: &Path) -> anyhow::Result<()> {
         HookEvent::SessionStart => run_session_start(root, &mut buf).await,
         HookEvent::UserPromptSubmit => run_user_prompt(root, &payload, &mut buf).await,
         HookEvent::PostToolUse => run_post_tool(root, &payload, &mut buf).await,
-        HookEvent::Stop => run_stop(root, &payload).await,
-        HookEvent::PreCompact => run_pre_compact(root, &payload).await,
+        HookEvent::Stop => run_stop(root, &payload, &mut buf).await,
+        HookEvent::PreCompact => run_pre_compact(root, &payload, &mut buf).await,
     };
     if let Err(e) = result {
         eprintln!("thoth: hook error: {e}");
@@ -1084,6 +1084,34 @@ async fn read_stdin_json() -> anyhow::Result<Value> {
     Ok(serde_json::from_str(&buf).unwrap_or(Value::Null))
 }
 
+const SAVE_REMINDER_INTERVAL: u64 = 15;
+
+fn hook_state_dir(root: &Path) -> PathBuf {
+    root.join("hook_state")
+}
+
+fn message_count_path(root: &Path) -> PathBuf {
+    hook_state_dir(root).join("message_count")
+}
+
+async fn read_message_count(root: &Path) -> u64 {
+    tokio::fs::read_to_string(message_count_path(root))
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+async fn write_message_count(root: &Path, count: u64) {
+    let dir = hook_state_dir(root);
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let _ = tokio::fs::write(message_count_path(root), count.to_string()).await;
+}
+
+async fn reset_message_count(root: &Path) {
+    let _ = tokio::fs::write(message_count_path(root), "0").await;
+}
+
 async fn run_session_start(root: &Path, buf: &mut String) -> anyhow::Result<()> {
     use std::fmt::Write;
     if !root.exists() {
@@ -1096,6 +1124,8 @@ async fn run_session_start(root: &Path, buf: &mut String) -> anyhow::Result<()> 
     if let Err(e) = thoth_memory::mark_session_start(root).await {
         tracing::warn!(error = %e, "mark_session_start failed");
     }
+
+    reset_message_count(root).await;
 
     // Policy banner — always emitted, even when MEMORY.md / LESSONS.md
     // are empty. This is the only signal in the default wiring that
@@ -1272,13 +1302,22 @@ async fn run_user_prompt(root: &Path, payload: &Value, buf: &mut String) -> anyh
             .await;
     }
 
-    // Reflection-debt heartbeat. If the agent has been editing
-    // without persisting anything, prepend a visible reminder to the
-    // recall block below so the agent sees it at every prompt — the
-    // single most load-bearing moment for the reflect loop.
-    //
-    // Deliberately cheap: two file reads (config + two JSONL tails).
-    // Worst case < 5 ms on a session-sized log.
+    // Message counter — track how many user prompts since last save reminder.
+    let count = read_message_count(root).await + 1;
+    write_message_count(root, count).await;
+
+    if count > 0 && count % SAVE_REMINDER_INTERVAL == 0 {
+        let _ = writeln!(buf, "### Memory save reminder");
+        let _ = writeln!(
+            buf,
+            "You have exchanged {count} messages this session. \
+             If you learned anything important (decisions, preferences, lessons), \
+             persist them now with `thoth_remember_fact` or `thoth_remember_lesson` \
+             before context is lost."
+        );
+        let _ = writeln!(buf);
+    }
+
     let discipline = thoth_memory::DisciplineConfig::load_or_default(root).await;
     let debt = thoth_memory::ReflectionDebt::compute(root).await;
     if debt.should_nudge(&discipline) {
@@ -1708,10 +1747,24 @@ pub(crate) async fn run_workflow_close_check(root: &Path, payload: &Value) -> an
     Ok(())
 }
 
-async fn run_stop(root: &Path, payload: &Value) -> anyhow::Result<()> {
+async fn run_stop(root: &Path, payload: &Value, buf: &mut String) -> anyhow::Result<()> {
+    use std::fmt::Write;
     if !root.exists() {
         return Ok(());
     }
+
+    let count = read_message_count(root).await;
+    if count >= 5 {
+        let _ = writeln!(buf, "### End-of-session save reminder");
+        let _ = writeln!(
+            buf,
+            "Session ending after {count} messages. If you discovered anything \
+             worth remembering (facts, lessons, preferences), persist them now \
+             with `thoth_remember_fact` / `thoth_remember_lesson` before the \
+             session closes."
+        );
+    }
+    reset_message_count(root).await;
 
     // T-18: workflow close check. For every active workflow whose
     // session matches this Stop event (or — when the payload omits
@@ -1798,11 +1851,20 @@ async fn run_stop(root: &Path, payload: &Value) -> anyhow::Result<()> {
 /// PreCompact: fires right before context compression. Saves a marker
 /// so the agent knows context was compressed, and triggers a forget
 /// pass to clean up before the window shrinks.
-async fn run_pre_compact(root: &Path, _payload: &Value) -> anyhow::Result<()> {
+async fn run_pre_compact(root: &Path, _payload: &Value, buf: &mut String) -> anyhow::Result<()> {
+    use std::fmt::Write;
     if !root.exists() {
         return Ok(());
     }
     eprintln!("thoth: pre-compact — saving state before context compression");
+
+    let _ = writeln!(buf, "### Context compaction imminent");
+    let _ = writeln!(
+        buf,
+        "Your conversation context is about to be compressed. Any unsaved \
+         insights, decisions, or lessons will be lost. Persist critical \
+         information NOW with `thoth_remember_fact` / `thoth_remember_lesson`."
+    );
 
     if let Some(mut d) = crate::daemon::DaemonClient::try_connect(root).await {
         // Run forget pass to clean up before compression

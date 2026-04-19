@@ -9,8 +9,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thoth_core::{
-    Enforcement, Event, Fact, Lesson, LessonTrigger, MemoryKind, MemoryMeta, Outcome, Query,
-    UserSignal,
+    Enforcement, Event, Fact, FactScope, Lesson, LessonTrigger, MemoryKind, MemoryMeta, Outcome,
+    Query, UserSignal,
 };
 use thoth_memory::{
     CapExceededError, DisciplineConfig, GuardedAppendError, MarkdownStoreMemoryExt, MemoryConfig,
@@ -413,9 +413,11 @@ impl Server {
             tags,
             log_event,
         } = serde_json::from_value(args)?;
+        let sanitized = crate::sanitize::sanitize_query(&query);
+        let clean_query = sanitized.clean_query;
         let scope_str = scope.as_deref().unwrap_or("curated");
         let mut q = Query {
-            text: query.clone(),
+            text: clean_query.clone(),
             top_k: top_k.unwrap_or(8).max(1),
             ..Query::text("")
         };
@@ -553,17 +555,25 @@ impl Server {
             text: String,
             #[serde(default)]
             tags: Vec<String>,
-            /// If set, force staging even when the discipline config says
-            /// `memory_mode = "auto"`. The agent should set this whenever
-            /// it's uncertain — matches the `thoth_request_review` intent.
             #[serde(default)]
             stage: bool,
+            #[serde(default)]
+            scope: Option<String>,
         }
-        let Args { text, tags, stage } = serde_json::from_value(args)?;
+        let Args {
+            text,
+            tags,
+            stage,
+            scope,
+        } = serde_json::from_value(args)?;
         let fact = Fact {
             meta: MemoryMeta::new(MemoryKind::Semantic),
             text: text.trim().to_string(),
             tags,
+            scope: match scope.as_deref() {
+                Some("on-demand" | "on_demand") => FactScope::OnDemand,
+                _ => FactScope::Always,
+            },
         };
         let cfg = DisciplineConfig::load_or_default(&self.inner.root).await;
         let mem_cfg = MemoryConfig::load_or_default(&self.inner.root).await;
@@ -1436,29 +1446,57 @@ impl Server {
         struct Args {
             #[serde(default)]
             scope: Option<String>,
+            #[serde(default)]
+            include_on_demand: Option<bool>,
         }
-        let scope = serde_json::from_value::<Args>(args)
-            .ok()
-            .and_then(|a| a.scope)
+        let parsed = serde_json::from_value::<Args>(args).ok();
+        let scope = parsed
+            .as_ref()
+            .and_then(|a| a.scope.clone())
             .unwrap_or_else(|| "all".to_string());
+        let include_on_demand = parsed
+            .as_ref()
+            .and_then(|a| a.include_on_demand)
+            .unwrap_or(false);
 
         let md = &self.inner.store.markdown;
         let mut text = String::new();
         let mut fact_count = 0usize;
+        let mut on_demand_count = 0usize;
         let mut lesson_count = 0usize;
 
         if scope == "all" || scope == "facts" {
             let facts = md.read_facts().await?;
-            fact_count = facts.len();
-            text.push_str(&format!("=== MEMORY ({fact_count} facts) ===\n"));
+            let total = facts.len();
+            let mut shown = Vec::new();
             for (i, f) in facts.iter().enumerate() {
+                if f.scope == FactScope::OnDemand && !include_on_demand {
+                    on_demand_count += 1;
+                    continue;
+                }
+                shown.push((i, f));
+            }
+            fact_count = shown.len();
+            if on_demand_count > 0 {
+                text.push_str(&format!(
+                    "=== MEMORY ({fact_count} always + {on_demand_count} on-demand, {total} total) ===\n"
+                ));
+            } else {
+                text.push_str(&format!("=== MEMORY ({fact_count} facts) ===\n"));
+            }
+            for (i, f) in &shown {
                 let heading = first_nonempty_line(&f.text);
                 let tags = if f.tags.is_empty() {
                     String::new()
                 } else {
                     format!(" | tags: {}", f.tags.join(", "))
                 };
-                text.push_str(&format!("F{:02} | {heading}{tags}\n", i + 1));
+                let scope_marker = if f.scope == FactScope::OnDemand {
+                    " [on-demand]"
+                } else {
+                    ""
+                };
+                text.push_str(&format!("F{:02} | {heading}{tags}{scope_marker}\n", i + 1));
             }
             text.push('\n');
         }
@@ -1481,6 +1519,7 @@ impl Server {
 
         let data = json!({
             "facts": fact_count,
+            "facts_on_demand": on_demand_count,
             "lessons": lesson_count,
         });
         Ok(ToolOutput::new(data, text))
@@ -2748,6 +2787,12 @@ fn tools_catalog() -> Vec<Tool> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional tags for later filtering."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["always", "on-demand"],
+                        "default": "always",
+                        "description": "always = injected every session start; on-demand = only surfaced via thoth_recall."
                     }
                 },
                 "required": ["text"]
@@ -2870,11 +2915,11 @@ fn tools_catalog() -> Vec<Tool> {
         },
         Tool {
             name: "thoth_wakeup".to_string(),
-            description: "Compact one-line-per-entry index of all facts and lessons. \
-                          Use at session start to see what's stored without loading \
-                          full content. Then call thoth_memory_detail for specific \
-                          entries. Much cheaper than thoth_memory_show for large \
-                          memory sets."
+            description: "Compact one-line-per-entry index of facts and lessons. \
+                          By default only shows `always`-scope facts (core context). \
+                          Pass `include_on_demand: true` to also show on-demand facts. \
+                          Use at session start for a cheap overview, then call \
+                          thoth_memory_detail for specific entries."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -2884,6 +2929,11 @@ fn tools_catalog() -> Vec<Tool> {
                         "enum": ["all", "facts", "lessons"],
                         "default": "all",
                         "description": "Which memory surface to index."
+                    },
+                    "include_on_demand": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, also include on-demand facts (normally only surfaced via thoth_recall)."
                     }
                 }
             }),

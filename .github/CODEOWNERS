@@ -1,0 +1,14 @@
+# Default owner for everything
+* @pirumu
+
+# Core types — changes here affect every crate
+crates/thoth-core/ @pirumu
+
+# MCP server — security-sensitive (handles untrusted LLM input)
+crates/thoth-mcp/ @pirumu
+
+# Enforcement gate — security-sensitive
+crates/thoth-mcp/src/bin/gate.rs @pirumu
+
+# On-disk format — needs design review
+crates/thoth-store/src/markdown.rs @pirumu

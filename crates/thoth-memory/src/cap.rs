@@ -876,6 +876,7 @@ mod cap_enforcement_tests {
             meta: MemoryMeta::new(CoreKind::Semantic),
             text: text.to_string(),
             tags: Vec::new(),
+            scope: Default::default(),
         }
     }
 
@@ -1077,8 +1078,6 @@ mod cap_enforcement_tests {
 
 #[cfg(test)]
 mod cap_tests {
-    use super::*;
-
     /// DESIGN-SPEC REQ-02: default caps for `MEMORY.md` / `USER.md` /
     /// `LESSONS.md` sized for real-world projects (16K / 4K / 16K bytes).
     /// Combined max injection ≈36 KB ≈9K tokens — under 5% of a 200K

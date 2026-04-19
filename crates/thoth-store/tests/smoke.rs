@@ -221,6 +221,7 @@ async fn markdown_facts_and_lessons_roundtrip() {
         meta: MemoryMeta::new(MemoryKind::Semantic),
         text: "auth uses JWT with RS256".into(),
         tags: vec!["auth".into(), "security".into()],
+        scope: Default::default(),
     };
     md.append_fact(&fact).await.unwrap();
 
