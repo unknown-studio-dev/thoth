@@ -16,6 +16,13 @@ pub enum ProjectsCmd {
         #[arg(long)]
         rm_local: bool,
     },
+    /// Rename all hash-based project directories to human-readable slugs
+    /// and update projects.json + hooks + CLAUDE.md.
+    MigrateSlugs {
+        /// Print what would happen without modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Resolve the `.thoth/` data root via a 4-step chain:
@@ -41,17 +48,58 @@ pub fn resolve_root(explicit: Option<&Path>) -> PathBuf {
     if let Some(home) = home_dir()
         && let Ok(cwd) = std::env::current_dir()
     {
+        let projects = home.join(".thoth").join("projects");
         let slug = project_slug(&cwd);
-        return home.join(".thoth").join("projects").join(slug);
+        let new_path = projects.join(&slug);
+        if new_path.is_dir() {
+            return new_path;
+        }
+        let legacy = legacy_project_slug(&cwd);
+        let legacy_path = projects.join(&legacy);
+        if legacy_path.is_dir() {
+            return legacy_path;
+        }
+        return new_path;
     }
     local
 }
 
-/// Deterministic 12-char hex slug from a project path.
+/// Human-readable slug from a project path: last two path components,
+/// lowercased, non-alphanumeric replaced with `-`, collapsed.
+///
+/// Example: `/Users/nat/Desktop/thoth` → `desktop-thoth`
 pub fn project_slug(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let components: Vec<&str> = canonical
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    let n = components.len();
+    let parts = if n >= 2 { &components[n - 2..] } else { &components[..] };
+    sanitize_slug(&parts.join("-"))
+}
+
+/// Legacy 12-char hex slug (blake3 hash). Used for backwards-compatible
+/// resolution of projects created before the readable-slug migration.
+pub fn legacy_project_slug(path: &Path) -> String {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
     hash.to_hex()[..12].to_string()
+}
+
+fn sanitize_slug(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    let mut prev_dash = false;
+    for c in raw.chars().flat_map(|c| c.to_lowercase()) {
+        if c.is_ascii_alphanumeric() {
+            result.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            result.push('-');
+            prev_dash = true;
+        }
+    }
+    result.trim_matches('-').to_string()
 }
 
 /// Register a project in `~/.thoth/projects.json` so `thoth projects list`
@@ -93,12 +141,23 @@ pub fn is_global_root(root: &Path) -> bool {
 }
 
 /// Compute the global root for the current working directory.
-/// Used by `thoth setup --global`.
+/// Used by `thoth setup --global`. Returns the readable-slug path,
+/// or the legacy hash path if it already exists (not yet migrated).
 pub fn global_root_for_cwd() -> anyhow::Result<PathBuf> {
     let home = home_dir().ok_or_else(|| anyhow::anyhow!("$HOME not set"))?;
     let cwd = std::env::current_dir()?;
+    let projects = home.join(".thoth").join("projects");
     let slug = project_slug(&cwd);
-    Ok(home.join(".thoth").join("projects").join(slug))
+    let new_path = projects.join(&slug);
+    if new_path.is_dir() {
+        return Ok(new_path);
+    }
+    let legacy = legacy_project_slug(&cwd);
+    let legacy_path = projects.join(&legacy);
+    if legacy_path.is_dir() {
+        return Ok(legacy_path);
+    }
+    Ok(new_path)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -193,6 +252,88 @@ pub async fn cmd_projects_migrate(dry_run: bool, rm_local: bool) -> anyhow::Resu
     Ok(())
 }
 
+pub async fn cmd_projects_migrate_slugs(dry_run: bool) -> anyhow::Result<()> {
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("$HOME not set"))?;
+    let registry_path = home.join(".thoth").join("projects.json");
+    if !registry_path.is_file() {
+        println!("No projects registered. Nothing to migrate.");
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&registry_path)?;
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&content).unwrap_or_default();
+
+    let projects_dir = home.join(".thoth").join("projects");
+    let mut new_map = serde_json::Map::new();
+    let mut migrated = 0u32;
+
+    for (old_slug, path_val) in &map {
+        let Some(path_str) = path_val.as_str() else {
+            new_map.insert(old_slug.clone(), path_val.clone());
+            continue;
+        };
+        let project_path = Path::new(path_str);
+        let new_slug = project_slug(project_path);
+
+        if *old_slug == new_slug {
+            new_map.insert(old_slug.clone(), path_val.clone());
+            continue;
+        }
+
+        let old_dir = projects_dir.join(old_slug);
+        let new_dir = projects_dir.join(&new_slug);
+
+        println!("  {old_slug} → {new_slug}  ({path_str})");
+
+        if !old_dir.is_dir() {
+            println!("    ⚠ old directory missing, registering new slug only");
+            new_map.insert(new_slug, path_val.clone());
+            migrated += 1;
+            continue;
+        }
+        if new_dir.is_dir() {
+            println!("    ⚠ target already exists, skipping rename");
+            new_map.insert(new_slug, path_val.clone());
+            migrated += 1;
+            continue;
+        }
+
+        if dry_run {
+            new_map.insert(new_slug, path_val.clone());
+            migrated += 1;
+            continue;
+        }
+
+        std::fs::rename(&old_dir, &new_dir)?;
+        new_map.insert(new_slug.clone(), path_val.clone());
+        migrated += 1;
+
+        if project_path.is_dir() {
+            let saved_dir = std::env::current_dir()?;
+            std::env::set_current_dir(project_path)?;
+            let _ = crate::hooks::install_all(crate::hooks::Scope::Project, &new_dir).await;
+            std::env::set_current_dir(&saved_dir)?;
+            println!("    ✓ renamed + updated hooks/CLAUDE.md");
+        } else {
+            println!("    ✓ renamed (project dir gone, skipped hook update)");
+        }
+    }
+
+    if !dry_run && migrated > 0 {
+        let json = serde_json::to_string_pretty(&serde_json::Value::Object(new_map))?;
+        std::fs::write(&registry_path, json)?;
+    }
+
+    if migrated == 0 {
+        println!("All projects already use readable slugs.");
+    } else if dry_run {
+        println!("\n  {migrated} project(s) would be migrated. Run without --dry-run to apply.");
+    } else {
+        println!("\n✓ Migrated {migrated} project(s) to readable slugs.");
+    }
+    Ok(())
+}
+
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -208,4 +349,37 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
         // Skip symlinks, sockets (mcp.sock), etc.
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_basic() {
+        assert_eq!(sanitize_slug("Desktop-thoth"), "desktop-thoth");
+        assert_eq!(sanitize_slug("My Project"), "my-project");
+        assert_eq!(sanitize_slug("foo///bar"), "foo-bar");
+        assert_eq!(sanitize_slug("--leading--"), "leading");
+    }
+
+    #[test]
+    fn slug_uses_last_two_components() {
+        let p = PathBuf::from("/a/b/c/Desktop/thoth");
+        let components: Vec<&str> = p
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect();
+        let n = components.len();
+        let parts = if n >= 2 { &components[n - 2..] } else { &components[..] };
+        assert_eq!(sanitize_slug(&parts.join("-")), "desktop-thoth");
+    }
+
+    #[test]
+    fn legacy_slug_is_hex() {
+        let p = PathBuf::from("/tmp/test-project");
+        let slug = legacy_project_slug(&p);
+        assert_eq!(slug.len(), 12);
+        assert!(slug.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

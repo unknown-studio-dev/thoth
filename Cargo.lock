@@ -2413,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "thoth"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "tempfile",
  "thoth-core",
@@ -2429,7 +2429,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-cli"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-core"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-domain"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-graph"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "serde",
  "serde_json",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-mcp"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2524,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-memory"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "globset",
  "regex",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-parse"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-retrieve"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "thoth-store"
-version = "0.0.2-alpha"
+version = "0.0.3-alpha"
 dependencies = [
  "anyhow",
  "async-trait",

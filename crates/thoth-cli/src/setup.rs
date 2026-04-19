@@ -188,29 +188,13 @@ pub async fn run(root: &Path, status: bool, accept_defaults: bool) -> Result<()>
         return Ok(());
     }
 
-    // If bootstrapped and interactive, offer a short menu instead of
-    // walking the full wizard again.
+    // Already bootstrapped in interactive mode — just confirm and exit.
+    // Use `thoth setup --yes` to self-heal hooks/MCP idempotently.
     if state.is_bootstrapped() && !non_interactive {
         print_status(root, &state);
-        let theme = ColorfulTheme::default();
-        let choice = Select::with_theme(&theme)
-            .with_prompt("Thoth is already set up here — what would you like to do?")
-            .items([
-                "Reinstall hooks + MCP (self-heal, keep config.toml)",
-                "Reconfigure from scratch (rewrite config.toml)",
-                "Quit",
-            ])
-            .default(0)
-            .interact()?;
-        match choice {
-            0 => {
-                reinstall_integration(root).await?;
-                print_final_message(root, /* reconfigured */ true);
-                return Ok(());
-            }
-            1 => { /* fall through to full wizard */ }
-            _ => return Ok(()),
-        }
+        println!("\nAlready set up — nothing to do.");
+        println!("  Run `thoth setup --yes` to self-heal hooks + MCP.");
+        return Ok(());
     }
 
     let answers = if non_interactive {

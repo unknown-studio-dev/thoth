@@ -532,6 +532,9 @@ async fn main() -> anyhow::Result<()> {
             resolve::ProjectsCmd::Migrate { dry_run, rm_local } => {
                 resolve::cmd_projects_migrate(dry_run, rm_local).await?;
             }
+            resolve::ProjectsCmd::MigrateSlugs { dry_run } => {
+                resolve::cmd_projects_migrate_slugs(dry_run).await?;
+            }
         },
     }
 
