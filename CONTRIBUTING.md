@@ -26,7 +26,7 @@ Requirements:
 
 ## Repo layout
 
-See [`README.md`](./README.md). In short: one Cargo workspace with 11
+See [`README.md`](./README.md). In short: one Cargo workspace with 10
 crates. The Claude Code wiring (MCP config, hooks, skills) is bundled
 inside the CLI binary at compile time — source-of-truth files live in
 `crates/thoth-cli/assets/` and `thoth setup` writes them into
@@ -83,8 +83,8 @@ wrapper) sits under `packaging/`.
 
 - **More language grammars** in `thoth-parse` — anything tree-sitter
   supports. Adds semantic recall coverage.
-- **Embedder adapters** in `thoth-embed` — self-hosted / local models
-  are especially welcome.
+- **Embedder adapters** in `thoth-retrieve` — self-hosted / local models
+  are especially welcome (feature-gated modules).
 - **Gold sets** in `eval/` — recall is only as good as we can measure.
 - **Setup-flow polish and docs** — show off real `LESSONS.md` evolving
   over a real project; improve the `thoth setup` wizard prompts; better
@@ -94,11 +94,10 @@ wrapper) sits under `packaging/`.
 
 ## Design changes
 
-Anything that touches [`DESIGN.md`](docs/DESIGN.md) or changes the on-disk
-layout of `.thoth/` needs a design-note PR first. We'll discuss, then
-implement. This is to avoid store-format churn that breaks existing
-projects — one of the things the memory layer is specifically designed
-not to do.
+Anything that changes the on-disk layout of `.thoth/` needs a
+design-note PR first. We'll discuss, then implement. This is to avoid
+store-format churn that breaks existing projects — one of the things the
+memory layer is specifically designed not to do.
 
 ## Releasing (maintainers)
 

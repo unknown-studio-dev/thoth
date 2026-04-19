@@ -264,10 +264,77 @@ impl WatchConfig {
     }
 }
 
+/// ChromaDB integration config (`[chroma]` in `config.toml`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ChromaConfig {
+    /// Enable ChromaDB semantic search. Default `false`.
+    pub enabled: bool,
+    /// Custom ChromaDB data path. When `None`, falls back to
+    /// `StoreRoot::chroma_path()`.
+    pub data_path: Option<String>,
+}
+
+impl Default for ChromaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_path: None,
+        }
+    }
+}
+
+impl ChromaConfig {
+    /// Load `<root>/config.toml` if it exists, returning the `[chroma]`
+    /// table (or [`Self::default`] if the file / table are missing).
+    pub async fn load_or_default(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "chroma: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        match toml::from_str::<ConfigFile>(&text) {
+            Ok(cf) => cf.chroma.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "chroma: config.toml parse error, using defaults");
+                Self::default()
+            }
+        }
+    }
+
+    /// Sync twin of [`Self::load_or_default`].
+    pub fn load_or_default_sync(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "chroma: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        match toml::from_str::<ConfigFile>(&text) {
+            Ok(cf) => cf.chroma.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "chroma: config.toml parse error, using defaults");
+                Self::default()
+            }
+        }
+    }
+}
+
 /// TOML file schema — the outer document. We only care about `[index]`,
-/// `[output]`, `[retrieve]`, and `[watch]`; other tables (e.g. `[memory]`,
-/// read by `thoth-memory`) are left to their owners, so we tolerate them
-/// instead of `deny_unknown_fields` here.
+/// `[output]`, `[retrieve]`, `[watch]`, and `[chroma]`; other tables
+/// (e.g. `[memory]`, read by `thoth-memory`) are left to their owners,
+/// so we tolerate them instead of `deny_unknown_fields` here.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
@@ -278,6 +345,8 @@ struct ConfigFile {
     retrieve: Option<RetrieveConfig>,
     #[serde(default)]
     watch: Option<WatchConfig>,
+    #[serde(default)]
+    chroma: Option<ChromaConfig>,
 }
 
 impl IndexConfig {

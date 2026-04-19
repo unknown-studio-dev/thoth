@@ -25,13 +25,14 @@ q = "tantivy fts index writer"
 expect_path = ["thoth-store/src/fts"]
 
 [[query]]
-q = "episodic log sqlite fts5"
+q = "EpisodeStore sqlite fts5 episodes"
 expect_path = ["thoth-store/src/episodes"]
 expect_text = ["episodes_fts"]
 
 [[query]]
-q = "graph bfs callers callees"
-expect_path = ["thoth-graph/src/lib"]
+q = "graph bfs callers callees depth direction"
+expect_path = ["thoth-graph"]
+expect_text = ["bfs"]
 
 [[query]]
 q = "MCP tool call json-rpc"

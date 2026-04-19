@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Thoth Architecture Map</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e4e4e7;height:100vh;overflow:hidden}
+.container{display:flex;height:100vh}
+.sidebar{width:272px;min-width:272px;background:#1a1d27;border-right:1px solid #2d3142;padding:14px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.sidebar h1{font-size:15px;font-weight:700;color:#f4f4f5}
+.sidebar .sub{font-size:11px;color:#6b7280;margin-top:2px}
+.sidebar h2{font-size:11px;font-weight:600;color:#71717a;text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
+.preset-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.preset-btn{background:#252836;border:1px solid #2d3142;color:#a1a1aa;padding:7px 8px;border-radius:6px;cursor:pointer;font-size:11px;transition:all .15s;text-align:center;font-family:inherit}
+.preset-btn:hover{background:#2d3142;border-color:#3b82f6;color:#d4d4d8}
+.preset-btn.active{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd}
+.chk-group{display:flex;flex-direction:column;gap:4px}
+.chk-item{display:flex;align-items:center;gap:7px;cursor:pointer;padding:3px 6px;border-radius:4px;transition:background .1s}
+.chk-item:hover{background:#252836}
+.chk-item input{accent-color:#3b82f6;width:13px;height:13px}
+.chk-item label{font-size:12px;cursor:pointer;flex:1;color:#d4d4d8}
+.line-sample{width:22px;height:2px;display:inline-block;border-radius:1px}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.comments-list{display:flex;flex-direction:column;gap:6px;flex:1;overflow-y:auto}
+.comment-item{background:#252836;border:1px solid #2d3142;border-radius:6px;padding:9px 10px;font-size:12px}
+.comment-item .tgt{font-weight:600;color:#93c5fd;font-size:11px}
+.comment-item .file{color:#6b7280;font-size:10px;font-family:'SF Mono',Monaco,monospace;margin-bottom:4px}
+.comment-item .txt{color:#d4d4d8;line-height:1.4}
+.comment-item .del{float:right;background:0;border:0;color:#52525b;cursor:pointer;font-size:15px;padding:0;line-height:1}
+.comment-item .del:hover{color:#ef4444}
+.empty{color:#52525b;font-size:11px;font-style:italic;padding:6px 0}
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+.canvas-wrap{flex:1;position:relative;overflow:hidden}
+.canvas-wrap svg{width:100%;height:100%;cursor:grab}
+.canvas-wrap svg:active{cursor:grabbing}
+.zoom-ctrls{position:absolute;top:10px;right:10px;display:flex;gap:3px}
+.zoom-btn{background:#1a1d27;border:1px solid #2d3142;color:#a1a1aa;width:30px;height:30px;border-radius:6px;cursor:pointer;font-size:15px;display:flex;align-items:center;justify-content:center;font-family:inherit;transition:all .15s}
+.zoom-btn:hover{background:#252836;border-color:#3b82f6;color:#d4d4d8}
+.prompt-section{border-top:1px solid #2d3142;background:#1a1d27;padding:10px 14px;min-height:90px;max-height:150px;display:flex;flex-direction:column;gap:6px}
+.prompt-hdr{display:flex;justify-content:space-between;align-items:center}
+.prompt-hdr span{font-size:11px;font-weight:600;color:#71717a;text-transform:uppercase;letter-spacing:.5px}
+.copy-btn{background:#252836;border:1px solid #2d3142;color:#a1a1aa;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px;transition:all .15s;font-family:inherit}
+.copy-btn:hover{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd}
+.copy-btn.ok{background:#1a3a2a;border-color:#10b981;color:#6ee7b7}
+.prompt-txt{font-size:12px;line-height:1.5;color:#d4d4d8;overflow-y:auto;flex:1;font-family:'SF Mono',Monaco,monospace;white-space:pre-wrap}
+.node-group{cursor:pointer}
+.node-rect{transition:opacity .3s,filter .15s}
+.node-group:hover .node-rect{filter:brightness(1.3)}
+.node-label{font-family:system-ui,-apple-system,sans-serif;font-size:12px;font-weight:600;fill:#f4f4f5;pointer-events:none;text-anchor:middle}
+.node-sub{font-family:'SF Mono',Monaco,monospace;font-size:8.5px;fill:#9ca3af;pointer-events:none;text-anchor:middle}
+.conn-path{fill:none;stroke-width:1.4;transition:opacity .3s}
+.conn-lbl{font-family:'SF Mono',Monaco,monospace;font-size:8.5px;fill:#6b7280;pointer-events:none;text-anchor:middle}
+.layer-lbl{font-family:system-ui;font-size:9px;font-weight:700;letter-spacing:1.2px;text-anchor:start}
+.tooltip{position:absolute;background:#252836;border:1px solid #3b82f6;border-radius:7px;padding:9px 11px;font-size:11px;color:#d4d4d8;max-width:260px;pointer-events:none;z-index:100;box-shadow:0 4px 16px rgba(0,0,0,.5);display:none;line-height:1.4}
+.tooltip .tt-t{font-weight:600;color:#f4f4f5;margin-bottom:1px}
+.tooltip .tt-p{font-family:monospace;font-size:9px;color:#6b7280;margin-bottom:5px}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:200}
+.modal-bg.on{display:flex}
+.modal{background:#1a1d27;border:1px solid #2d3142;border-radius:10px;padding:18px;width:380px;max-width:90vw}
+.modal h3{font-size:14px;margin-bottom:2px}
+.modal .mp{font-family:monospace;font-size:10px;color:#6b7280;margin-bottom:10px}
+.modal textarea{width:100%;height:72px;background:#252836;border:1px solid #2d3142;border-radius:6px;color:#d4d4d8;padding:7px 9px;font-size:12px;font-family:system-ui;resize:vertical;outline:0}
+.modal textarea:focus{border-color:#3b82f6}
+.modal-acts{display:flex;justify-content:flex-end;gap:7px;margin-top:10px}
+.modal-acts button{padding:5px 14px;border-radius:6px;border:1px solid #2d3142;cursor:pointer;font-size:12px;font-family:inherit;transition:all .15s}
+.modal-acts .cancel{background:#252836;color:#a1a1aa}
+.modal-acts .save{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd}
+.modal-acts button:hover{filter:brightness(1.15)}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="sidebar">
+    <div><h1>Thoth Architecture</h1><div class="sub">Click nodes to add feedback</div></div>
+    <div><h2>View</h2><div class="preset-grid" id="presets"></div></div>
+    <div><h2>Layers</h2><div class="chk-group" id="layers"></div></div>
+    <div><h2>Connections</h2><div class="chk-group" id="connTypes"></div></div>
+    <div style="flex:1;display:flex;flex-direction:column;min-height:0">
+      <h2>Comments (<span id="cc">0</span>)</h2>
+      <div class="comments-list" id="cl"><div class="empty">Click a node to add a comment</div></div>
+    </div>
+  </div>
+  <div class="main">
+    <div class="canvas-wrap" id="cw">
+      <svg id="svg" viewBox="0 0 1100 520"></svg>
+      <div class="tooltip" id="tip"></div>
+      <div class="zoom-ctrls">
+        <button class="zoom-btn" onclick="zIn()">+</button>
+        <button class="zoom-btn" onclick="zOut()">&minus;</button>
+        <button class="zoom-btn" onclick="zReset()" style="font-size:11px">R</button>
+      </div>
+    </div>
+    <div class="prompt-section">
+      <div class="prompt-hdr"><span>Generated Prompt</span><button class="copy-btn" id="cpBtn" onclick="copyP()">Copy</button></div>
+      <div class="prompt-txt" id="pTxt"></div>
+    </div>
+  </div>
+</div>
+<div class="modal-bg" id="mbg">
+  <div class="modal">
+    <h3 id="mTitle"></h3>
+    <div class="mp" id="mPath"></div>
+    <textarea id="mTa" placeholder="Add your feedback about this component..."></textarea>
+    <div class="modal-acts">
+      <button class="cancel" onclick="closeM()">Cancel</button>
+      <button class="save" onclick="saveC()">Add Comment</button>
+    </div>
+  </div>
+</div>
+<script>
+const NODES=[
+  {id:'cli',label:'CLI',sub:'crates/thoth-cli/',x:70,y:40,w:155,h:50,layer:'interface',
+   detail:'Subcommands: setup, index, query, impact, watch, memory, review, compact, domain sync, eval'},
+  {id:'mcp',label:'MCP Server',sub:'crates/thoth-mcp/',x:390,y:40,w:165,h:50,layer:'interface',
+   detail:'41 tools, 3 prompts, 2 resources. JSON-RPC 2.0 over stdio + Unix socket listener'},
+  {id:'gate',label:'Gate',sub:'thoth-mcp/bin/gate.rs',x:710,y:40,w:160,h:50,layer:'interface',
+   detail:'PreToolUse hook binary. Checks intent \u2192 recency \u2192 relevance before allowing writes'},
+  {id:'facade',label:'CodeMemory',sub:'crates/thoth/',x:390,y:160,w:165,h:50,layer:'facade',
+   detail:'Unified API facade (~270 LoC). Owns all stores, dispatches to every subsystem'},
+  {id:'parse',label:'Parser',sub:'crates/thoth-parse/',x:30,y:290,w:140,h:50,layer:'logic',
+   detail:'Tree-sitter AST extraction: Rust, Python, JS/TS, Go. Symbols, calls, imports'},
+  {id:'retrieve',label:'Retriever',sub:'crates/thoth-retrieve/',x:230,y:290,w:145,h:50,layer:'logic',
+   detail:'Fan-out over 5+ stages \u2192 RRF fusion (K=10) \u2192 markdown re-rank. p50: 75ms'},
+  {id:'graph',label:'Graph BFS',sub:'crates/thoth-graph/',x:440,y:290,w:140,h:50,layer:'logic',
+   detail:'BFS traversal over call/import graph. Impact analysis depth 1\u20138. In: 13.5\u00b5s'},
+  {id:'memory',label:'Memory Mgr',sub:'crates/thoth-memory/',x:650,y:290,w:145,h:50,layer:'logic',
+   detail:'TTL (30d), capacity (50k), decay (\u03bb=0.02), lesson confidence, content policy, nudge'},
+  {id:'domain',label:'Domain Sync',sub:'crates/thoth-domain/',x:870,y:290,w:145,h:50,layer:'logic',
+   detail:'Remote rule ingestion: Notion, Asana, NotebookLM. PII redaction. Offline-safe recall'},
+  {id:'markdown',label:'Markdown',sub:'MEMORY.md + LESSONS.md',x:30,y:440,w:150,h:50,layer:'storage',
+   detail:'Human-readable source of truth. Facts, lessons, pending, quarantined, skills, history'},
+  {id:'kv',label:'KV (redb)',sub:'graph.redb',x:235,y:440,w:135,h:50,layer:'storage',
+   detail:'Nodes, edges, reverse-edge index, symbols. Pure-Rust embedded B-tree (redb)'},
+  {id:'fts',label:'FTS (tantivy)',sub:'fts.tantivy/',x:435,y:440,w:145,h:50,layer:'storage',
+   detail:'BM25 full-text search. 64 MiB heap. Fields: path, symbol, body, language, lines'},
+  {id:'episodes',label:'Episodes (SQLite)',sub:'episodes.db',x:645,y:440,w:160,h:50,layer:'storage',
+   detail:'Append-only event log. FTS5 contentless index. Salience + access-count decay scoring'},
+  {id:'chroma',label:'Chroma (Vectors)',sub:'chroma/ (optional)',x:870,y:440,w:155,h:50,layer:'storage',
+   detail:'Python sidecar with ONNX embedder. Mode::Full only. Lazily initialized to save RAM'},
+];
+
+const CONNS=[
+  {from:'cli',to:'facade',type:'tool-call',label:'commands'},
+  {from:'mcp',to:'facade',type:'tool-call',label:'41 tools'},
+  {from:'mcp',to:'gate',type:'event',label:'hook'},
+  {from:'gate',to:'episodes',type:'data-flow',label:'recency'},
+  {from:'facade',to:'parse',type:'tool-call',label:'index'},
+  {from:'facade',to:'retrieve',type:'data-flow',label:'query'},
+  {from:'facade',to:'graph',type:'data-flow',label:'impact'},
+  {from:'facade',to:'memory',type:'data-flow',label:'lifecycle'},
+  {from:'facade',to:'domain',type:'tool-call',label:'sync'},
+  {from:'retrieve',to:'kv',type:'data-flow',label:'symbols'},
+  {from:'retrieve',to:'fts',type:'data-flow',label:'BM25'},
+  {from:'retrieve',to:'markdown',type:'data-flow',label:'grep'},
+  {from:'retrieve',to:'episodes',type:'data-flow',label:'FTS5'},
+  {from:'retrieve',to:'chroma',type:'data-flow',label:'vectors'},
+  {from:'retrieve',to:'graph',type:'tool-call',label:'fan-out'},
+  {from:'parse',to:'kv',type:'data-flow',label:'symbols'},
+  {from:'parse',to:'fts',type:'data-flow',label:'chunks'},
+  {from:'parse',to:'chroma',type:'data-flow',label:'embed'},
+  {from:'graph',to:'kv',type:'data-flow',label:'edges'},
+  {from:'memory',to:'markdown',type:'data-flow',label:'R/W'},
+  {from:'memory',to:'episodes',type:'data-flow',label:'decay'},
+  {from:'domain',to:'markdown',type:'data-flow',label:'rules'},
+];
+
+const CS={
+  'data-flow':{color:'#3b82f6',dash:'',name:'Data Flow'},
+  'tool-call':{color:'#10b981',dash:'6,3',name:'Tool Call'},
+  'event':{color:'#ef4444',dash:'4,4',name:'Event'},
+};
+
+const LM={
+  interface:{name:'Interface',color:'#3b82f6',bg:'rgba(59,130,246,0.04)',fill:'#172554',stroke:'#3b82f6',y:25,h:80},
+  facade:{name:'Facade',color:'#8b5cf6',bg:'rgba(139,92,246,0.04)',fill:'#2e1065',stroke:'#8b5cf6',y:145,h:80},
+  logic:{name:'Logic',color:'#10b981',bg:'rgba(16,185,129,0.04)',fill:'#052e16',stroke:'#10b981',y:275,h:80},
+  storage:{name:'Storage',color:'#ec4899',bg:'rgba(236,72,153,0.04)',fill:'#3b0764',stroke:'#ec4899',y:425,h:80},
+};
+
+const PRESETS=[
+  {id:'full',name:'Full System',hl:null},
+  {id:'query',name:'Query Path',hl:['mcp','facade','retrieve','graph','kv','fts','markdown','episodes','chroma']},
+  {id:'index',name:'Index Path',hl:['cli','facade','parse','kv','fts','chroma']},
+  {id:'mem',name:'Memory',hl:['mcp','facade','memory','markdown','episodes']},
+  {id:'gate',name:'Gate Flow',hl:['mcp','gate','episodes']},
+];
+
+const NM={};NODES.forEach(n=>NM[n.id]=n);
+
+const S={
+  layers:{interface:true,facade:true,logic:true,storage:true},
+  ct:{'data-flow':true,'tool-call':true,event:true},
+  hl:null,ap:'full',
+  comments:[],
+  zoom:1,px:0,py:0,
+  mt:null,
+};
+
+function init(){
+  buildCtrls();
+  render();
+  setupPan();
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')closeM()});
+  document.getElementById('mbg').addEventListener('click',e=>{if(e.target===e.currentTarget)closeM()});
+  document.getElementById('mTa').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();saveC()}});
+}
+
+function buildCtrls(){
+  const pe=document.getElementById('presets');
+  PRESETS.forEach(p=>{
+    const b=document.createElement('button');
+    b.className='preset-btn'+(p.id===S.ap?' active':'');
+    b.textContent=p.name;b.dataset.id=p.id;
+    b.onclick=()=>applyPreset(p);
+    pe.appendChild(b);
+  });
+  const le=document.getElementById('layers');
+  Object.entries(LM).forEach(([k,m])=>{
+    const d=document.createElement('div');d.className='chk-item';
+    d.innerHTML=`<input type=checkbox id="l-${k}" checked><span class=dot style="background:${m.color}"></span><label for="l-${k}">${m.name}</label>`;
+    d.querySelector('input').onchange=e=>{S.layers[k]=e.target.checked;S.ap=null;S.hl=null;upPresets();render()};
+    le.appendChild(d);
+  });
+  const ce=document.getElementById('connTypes');
+  Object.entries(CS).forEach(([k,s])=>{
+    const d=document.createElement('div');d.className='chk-item';
+    const ds=s.dash?`background:repeating-linear-gradient(90deg,${s.color} 0,${s.color} 4px,transparent 4px,transparent 7px)`:`background:${s.color}`;
+    d.innerHTML=`<input type=checkbox id="c-${k}" checked><span class=line-sample style="${ds}"></span><label for="c-${k}">${s.name}</label>`;
+    d.querySelector('input').onchange=e=>{S.ct[k]=e.target.checked;S.ap=null;upPresets();render()};
+    ce.appendChild(d);
+  });
+}
+
+function applyPreset(p){
+  S.ap=p.id;S.hl=p.hl;
+  Object.keys(S.layers).forEach(k=>{S.layers[k]=true;document.getElementById('l-'+k).checked=true});
+  Object.keys(S.ct).forEach(k=>{S.ct[k]=true;document.getElementById('c-'+k).checked=true});
+  upPresets();render();
+}
+function upPresets(){document.querySelectorAll('.preset-btn').forEach(b=>b.classList.toggle('active',b.dataset.id===S.ap))}
+
+function sv(tag,a){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);if(a)Object.entries(a).forEach(([k,v])=>e.setAttribute(k,v));return e}
+
+function render(){
+  const s=document.getElementById('svg');s.innerHTML='';
+  const defs=sv('defs');
+  Object.entries(CS).forEach(([k,st])=>{
+    const m=sv('marker',{id:'a-'+k,markerWidth:8,markerHeight:6,refX:7,refY:3,orient:'auto',markerUnits:'strokeWidth'});
+    m.appendChild(sv('polygon',{points:'0 0, 8 3, 0 6',fill:st.color}));defs.appendChild(m);
+    const md=sv('marker',{id:'a-'+k+'-d',markerWidth:8,markerHeight:6,refX:7,refY:3,orient:'auto',markerUnits:'strokeWidth'});
+    md.appendChild(sv('polygon',{points:'0 0, 8 3, 0 6',fill:st.color,opacity:.15}));defs.appendChild(md);
+  });
+  s.appendChild(defs);
+  const g=sv('g',{id:'dg',transform:`translate(${S.px},${S.py}) scale(${S.zoom})`});s.appendChild(g);
+
+  Object.entries(LM).forEach(([k,m])=>{
+    if(!S.layers[k])return;
+    g.appendChild(sv('rect',{x:0,y:m.y,width:1100,height:m.h,fill:m.bg}));
+    const t=sv('text',{x:8,y:m.y+13,class:'layer-lbl',fill:m.color,opacity:.4});t.textContent=m.name.toUpperCase();g.appendChild(t);
+  });
+
+  CONNS.forEach(c=>{
+    if(!S.ct[c.type])return;
+    const fn=NM[c.from],tn=NM[c.to];
+    if(!S.layers[fn.layer]||!S.layers[tn.layer])return;
+    const dim=isDim(c.from)||isDim(c.to);
+    const st=CS[c.type];
+    const d=cPath(fn,tn);
+    g.appendChild(sv('path',{d,class:'conn-path',stroke:st.color,'stroke-dasharray':st.dash||'none','marker-end':`url(#a-${c.type}${dim?'-d':''})`,opacity:dim?.08:.55}));
+    if(!dim&&c.label){
+      const mp=bMid(fn,tn);
+      const lw=c.label.length*5.5+10;
+      g.appendChild(sv('rect',{x:mp.x-lw/2,y:mp.y-7,width:lw,height:14,fill:'#0f1117',rx:3,opacity:.85}));
+      const lt=sv('text',{x:mp.x,y:mp.y+3,class:'conn-lbl'});lt.textContent=c.label;g.appendChild(lt);
+    }
+  });
+
+  NODES.forEach(n=>{
+    if(!S.layers[n.layer])return;
+    const dim=isDim(n.id);const m=LM[n.layer];
+    const hc=S.comments.some(c=>c.target===n.id);
+    const gr=sv('g',{class:'node-group','data-id':n.id,opacity:dim?.1:1});
+    gr.appendChild(sv('rect',{x:n.x,y:n.y,width:n.w,height:n.h,fill:m.fill,stroke:hc?'#f59e0b':m.stroke,'stroke-width':hc?2.5:1.5,rx:8,ry:8,class:'node-rect'}));
+    const lb=sv('text',{x:n.x+n.w/2,y:n.y+20,class:'node-label'});lb.textContent=n.label;gr.appendChild(lb);
+    const sb=sv('text',{x:n.x+n.w/2,y:n.y+34,class:'node-sub'});sb.textContent=n.sub;gr.appendChild(sb);
+    gr.addEventListener('click',()=>openM(n));
+    gr.addEventListener('mouseenter',e=>showTip(e,n));
+    gr.addEventListener('mouseleave',hideTip);
+    g.appendChild(gr);
+  });
+  updateP();
+}
+
+function isDim(id){return S.hl?!S.hl.includes(id):false}
+
+function cPath(f,t){
+  if(Math.abs(f.y-t.y)<10){
+    const r=f.x<t.x;
+    const sx=r?f.x+f.w:f.x,sy=f.y+f.h/2;
+    const ex=r?t.x:t.x+t.w,ey=t.y+t.h/2;
+    const my=Math.min(sy,ey)-35;
+    return`M${sx},${sy} C${sx},${my} ${ex},${my} ${ex},${ey}`;
+  }
+  const sx=f.x+f.w/2,sy=f.y+f.h;
+  const ex=t.x+t.w/2,ey=t.y;
+  const cp=Math.max((ey-sy)*.4,20);
+  return`M${sx},${sy} C${sx},${sy+cp} ${ex},${ey-cp} ${ex},${ey}`;
+}
+
+function bMid(f,t){
+  if(Math.abs(f.y-t.y)<10){
+    const r=f.x<t.x;
+    const sx=r?f.x+f.w:f.x,sy=f.y+f.h/2;
+    const ex=r?t.x:t.x+t.w,ey=t.y+t.h/2;
+    const my=Math.min(sy,ey)-35;
+    return{x:(sx+ex)/2,y:(sy+3*my+3*my+ey)/8};
+  }
+  const sx=f.x+f.w/2,sy=f.y+f.h;
+  const ex=t.x+t.w/2,ey=t.y;
+  const cp=Math.max((ey-sy)*.4,20);
+  return{x:(sx+3*sx+3*ex+ex)/8,y:(sy+3*(sy+cp)+3*(ey-cp)+ey)/8};
+}
+
+function zIn(){S.zoom=Math.min(S.zoom*1.25,5);applyZ()}
+function zOut(){S.zoom=Math.max(S.zoom/1.25,.25);applyZ()}
+function zReset(){S.zoom=1;S.px=0;S.py=0;applyZ()}
+function applyZ(){const g=document.getElementById('dg');if(g)g.setAttribute('transform',`translate(${S.px},${S.py}) scale(${S.zoom})`)}
+
+function setupPan(){
+  const cw=document.getElementById('cw');
+  let drag=false,ox,oy,opx,opy;
+  cw.addEventListener('mousedown',e=>{if(e.target.closest('.node-group'))return;drag=true;ox=e.clientX;oy=e.clientY;opx=S.px;opy=S.py});
+  window.addEventListener('mousemove',e=>{if(!drag)return;S.px=opx+(e.clientX-ox);S.py=opy+(e.clientY-oy);applyZ()});
+  window.addEventListener('mouseup',()=>drag=false);
+  cw.addEventListener('wheel',e=>{e.preventDefault();const f=e.deltaY>0?.88:1.12;S.zoom=Math.min(Math.max(S.zoom*f,.25),5);applyZ()},{passive:false});
+}
+
+function showTip(e,n){
+  const t=document.getElementById('tip');
+  t.innerHTML=`<div class=tt-t>${n.label}</div><div class=tt-p>${n.sub}</div>${n.detail}`;
+  t.style.display='block';
+  const r=document.getElementById('cw').getBoundingClientRect();
+  let x=e.clientX-r.left+14,y=e.clientY-r.top+14;
+  if(x+260>r.width)x=e.clientX-r.left-270;
+  if(y+90>r.height)y=e.clientY-r.top-90;
+  t.style.left=x+'px';t.style.top=y+'px';
+}
+function hideTip(){document.getElementById('tip').style.display='none'}
+
+function openM(n){
+  S.mt=n;
+  document.getElementById('mTitle').textContent=n.label;
+  document.getElementById('mPath').textContent=n.sub;
+  document.getElementById('mTa').value='';
+  document.getElementById('mbg').classList.add('on');
+  setTimeout(()=>document.getElementById('mTa').focus(),50);
+}
+function closeM(){document.getElementById('mbg').classList.remove('on');S.mt=null}
+function saveC(){
+  const txt=document.getElementById('mTa').value.trim();
+  if(!txt||!S.mt)return;
+  S.comments.push({id:Date.now(),target:S.mt.id,targetLabel:S.mt.label,targetFile:S.mt.sub,text:txt});
+  closeM();renderC();render();
+}
+function delC(id){S.comments=S.comments.filter(c=>c.id!==id);renderC();render()}
+function renderC(){
+  const l=document.getElementById('cl');
+  document.getElementById('cc').textContent=S.comments.length;
+  if(!S.comments.length){l.innerHTML='<div class=empty>Click a node to add a comment</div>';return}
+  l.innerHTML=S.comments.map(c=>`<div class=comment-item><button class=del onclick="delC(${c.id})">&times;</button><div class=tgt>${c.targetLabel}</div><div class=file>${esc(c.targetFile)}</div><div class=txt>${esc(c.text)}</div></div>`).join('');
+}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function updateP(){
+  const el=document.getElementById('pTxt');
+  if(!S.comments.length){
+    const v=S.hl?PRESETS.find(p=>p.id===S.ap)?.name||'selected':'full system';
+    el.textContent=`Thoth architecture (10 Rust crates, 4 layers), viewing: ${v}. Click components to add feedback.`;
+    return;
+  }
+  const parts=['Thoth is a Rust workspace with 10 crates in 4 layers:','- Interface: CLI, MCP Server (41 tools), Gate (PreToolUse hook)','- Facade: CodeMemory (unified API)','- Logic: Parser (tree-sitter), Retriever (RRF fusion), Graph BFS, Memory Manager, Domain Sync','- Storage: Markdown, KV/redb, FTS/tantivy, Episodes/SQLite, Chroma/vectors (optional)',''];
+  if(S.hl){const pr=PRESETS.find(p=>p.id===S.ap);if(pr)parts.push(`Currently viewing: ${pr.name}.\n`)}
+  parts.push('Feedback on components:\n');
+  S.comments.forEach(c=>parts.push(`**${c.targetLabel}** (${c.targetFile}):\n${c.text}\n`));
+  el.textContent=parts.join('\n');
+}
+function copyP(){
+  navigator.clipboard.writeText(document.getElementById('pTxt').textContent).then(()=>{
+    const b=document.getElementById('cpBtn');b.textContent='Copied!';b.classList.add('ok');
+    setTimeout(()=>{b.textContent='Copy';b.classList.remove('ok')},1400);
+  });
+}
+
+init();
+</script>
+</body>
+</html>

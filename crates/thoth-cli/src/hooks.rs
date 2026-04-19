@@ -459,12 +459,18 @@ fn strip_mcp(v: &mut Value) {
 const CLAUDE_MD_START: &str = "<!-- thoth:managed:start -->";
 const CLAUDE_MD_END: &str = "<!-- thoth:managed:end -->";
 const CLAUDE_MD_PATH: &str = "CLAUDE.md";
+const AGENTS_MD_PATH: &str = "AGENTS.md";
 
-/// Render the managed block for a given init date (`YYYY-MM-DD`). The
-/// block is deterministic in the date so re-running `thoth setup` on the
-/// same day produces byte-identical output — makes [`claude_md_install`]
-/// a no-op write on same-day re-runs.
-fn render_claude_md_block(init_date: &str) -> String {
+/// Render the managed block for a given init date (`YYYY-MM-DD`) and
+/// data root. The root may be project-local (`.thoth`) or global
+/// (`~/.thoth/projects/<slug>`); all file-path references in the block
+/// use it so the agent can `Read` memory files at the right location.
+///
+/// The block is deterministic in (date, root) so re-running `thoth setup`
+/// on the same day with the same root produces byte-identical output —
+/// makes [`claude_md_install`] a no-op write on same-day re-runs.
+fn render_claude_md_block(init_date: &str, root: &Path) -> String {
+    let root_display = root.display();
     format!(
         "\
 {start}
@@ -474,23 +480,24 @@ This project uses **Thoth MCP** as its long-term memory. Initialized on {date}.
 
 ### Memory workflow
 
-- Persist facts via `thoth_remember_fact({{text, tags?}})` → `./.thoth/MEMORY.md`.
-- Persist lessons via `thoth_remember_lesson({{trigger, advice}})` → `./.thoth/LESSONS.md`.
+- Persist facts via `thoth_remember_fact({{text, tags?}})` → `{root}/MEMORY.md`.
+- Persist lessons via `thoth_remember_lesson({{trigger, advice}})` → `{root}/LESSONS.md`.
+- Persist user preferences via `thoth_remember_preference({{text, tags?}})` → `{root}/USER.md`.
 - Before every Write / Edit / Bash: call `thoth_recall({{query}})` at least once.
 - The `UserPromptSubmit` hook auto-recalls for context but passes `log_event: false`, \
 so that ceremonial recall does NOT satisfy the `thoth-gate` PreToolUse gate — only \
 agent-initiated recalls do.
-- Browse raw memory without tool calls: open `./.thoth/MEMORY.md` and `./.thoth/LESSONS.md`.
+- Browse raw memory without tool calls: open `{root}/MEMORY.md` and `{root}/LESSONS.md`.
 - Remove this block and all Thoth wiring: `thoth uninstall`.
 
 ### Code intelligence tools
 
 | Tool | Params | Purpose |
 |------|--------|---------|
-| `thoth_recall` | `query`, `top_k?` (default 8) | Hybrid search (symbol + BM25 + graph + markdown) |
-| `thoth_impact` | `fqn`, `direction?` (up/down/both), `depth?` (1-8) | Blast radius — who breaks if this symbol changes |
+| `thoth_recall` | `query`, `top_k?` (default 8), `scope?` (curated/archive/all) | Hybrid search (symbol + BM25 + graph + markdown + semantic) |
+| `thoth_impact` | `fqn`, `direction?` (up/down/both), `depth?` (default 3, 1-8) | Blast radius — who breaks if this symbol changes |
 | `thoth_symbol_context` | `fqn`, `limit?` (default 32) | 360° view: callers, callees, imports, siblings, doc |
-| `thoth_detect_changes` | `diff` (git diff output), `depth?` (1-6) | Find symbols touched by a diff + their blast radius |
+| `thoth_detect_changes` | `diff` (git diff output), `depth?` (default 2, 1-6) | Find symbols touched by a diff + their blast radius |
 | `thoth_index` | `path?` (default \".\") | Reindex source tree |
 
 ### Before editing code
@@ -525,6 +532,7 @@ Use `/skill-name` to invoke: `thoth-exploring` (understand code), `thoth-debuggi
         start = CLAUDE_MD_START,
         end = CLAUDE_MD_END,
         date = init_date,
+        root = root_display,
     )
 }
 
@@ -586,51 +594,56 @@ fn strip_claude_md(existing: &str) -> String {
 /// Write (or refresh) `./CLAUDE.md` with the Thoth managed block.
 /// No-op for `Scope::User` — CLAUDE.md is a per-project file, not a
 /// user-global one.
-pub async fn claude_md_install(scope: Scope, init_date: &str) -> anyhow::Result<()> {
+pub async fn claude_md_install(scope: Scope, init_date: &str, root: &Path) -> anyhow::Result<()> {
     if !matches!(scope, Scope::Project) {
         return Ok(());
     }
-    let path = PathBuf::from(CLAUDE_MD_PATH);
-    let existing = if path.exists() {
-        tokio::fs::read_to_string(&path).await.unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let block = render_claude_md_block(init_date);
-    let merged = merge_claude_md(&existing, &block);
-    if merged == existing {
-        return Ok(());
+    let block = render_claude_md_block(init_date, root);
+    for target in [CLAUDE_MD_PATH, AGENTS_MD_PATH] {
+        let path = PathBuf::from(target);
+        let existing = if path.exists() {
+            tokio::fs::read_to_string(&path).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let merged = merge_claude_md(&existing, &block);
+        if merged == existing {
+            continue;
+        }
+        tokio::fs::write(&path, &merged)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        println!("✓ {target} policy block written at {}", path.display());
     }
-    tokio::fs::write(&path, merged)
-        .await
-        .with_context(|| format!("write {}", path.display()))?;
-    println!("✓ CLAUDE.md policy block written at {}", path.display());
     Ok(())
 }
 
-/// Strip the Thoth managed block from `./CLAUDE.md`. Deletes the file
-/// entirely if nothing else was in it. No-op for `Scope::User`.
+/// Strip the Thoth managed block from `./CLAUDE.md` and `./AGENTS.md`.
+/// Deletes each file entirely if nothing else was in it. No-op for
+/// `Scope::User`.
 pub async fn claude_md_uninstall(scope: Scope) -> anyhow::Result<()> {
     if !matches!(scope, Scope::Project) {
         return Ok(());
     }
-    let path = PathBuf::from(CLAUDE_MD_PATH);
-    if !path.exists() {
-        return Ok(());
-    }
-    let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-    let stripped = strip_claude_md(&existing);
-    if stripped == existing {
-        return Ok(());
-    }
-    if stripped.trim().is_empty() {
-        let _ = tokio::fs::remove_file(&path).await;
-        println!("✓ CLAUDE.md removed (was only the Thoth block)");
-    } else {
-        tokio::fs::write(&path, stripped)
-            .await
-            .with_context(|| format!("write {}", path.display()))?;
-        println!("✓ Thoth block removed from {}", path.display());
+    for target in [CLAUDE_MD_PATH, AGENTS_MD_PATH] {
+        let path = PathBuf::from(target);
+        if !path.exists() {
+            continue;
+        }
+        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let stripped = strip_claude_md(&existing);
+        if stripped == existing {
+            continue;
+        }
+        if stripped.trim().is_empty() {
+            let _ = tokio::fs::remove_file(&path).await;
+            println!("✓ {target} removed (was only the Thoth block)");
+        } else {
+            tokio::fs::write(&path, stripped)
+                .await
+                .with_context(|| format!("write {}", path.display()))?;
+            println!("✓ Thoth block removed from {target}");
+        }
     }
     Ok(())
 }
@@ -1006,7 +1019,7 @@ pub async fn install_all(scope: Scope, root: &Path) -> anyhow::Result<()> {
     // one artifact Claude Code re-loads after `/clear` and `/compact`, so
     // it's what teaches the agent that Thoth owns long-term memory on a
     // fresh/collapsed context.
-    claude_md_install(scope, &crate::setup::today_ymd()).await?;
+    claude_md_install(scope, &crate::setup::today_ymd(), root).await?;
     println!();
     println!("✓ thoth fully wired into Claude Code ({scope:?} scope)");
     Ok(())
@@ -1140,11 +1153,13 @@ async fn run_session_start(root: &Path, buf: &mut String) -> anyhow::Result<()> 
         buf,
         "- Persist facts via `mcp__thoth__thoth_remember_fact`; lessons via \
          `mcp__thoth__thoth_remember_lesson`. These write to \
-         ./.thoth/MEMORY.md and ./.thoth/LESSONS.md — the single source of truth."
+         {}/MEMORY.md and {0}/LESSONS.md — the single source of truth.",
+        root.display()
     );
     let _ = writeln!(
         buf,
-        "- Do NOT write to auto-memory paths outside `.thoth/`."
+        "- Do NOT write to auto-memory paths outside `{}`.",
+        root.display()
     );
     let _ = writeln!(
         buf,
@@ -1645,7 +1660,7 @@ pub(crate) async fn run_outcome_harvest(root: &Path, payload: &Value) -> anyhow:
         })
         .collect();
 
-    let cfg = EnforcementConfig::default();
+    let cfg = EnforcementConfig::load_or_default(root).await;
     let harvester = OutcomeHarvester::new(root.to_path_buf(), cfg);
 
     // Deterministic-ish tool-call hash — timestamp + tool name. The
@@ -1707,7 +1722,7 @@ pub(crate) async fn run_workflow_close_check(root: &Path, payload: &Value) -> an
         return Ok(());
     }
 
-    let cfg = thoth_memory::EnforcementConfig::default();
+    let cfg = thoth_memory::EnforcementConfig::load_or_default(root).await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2362,16 +2377,28 @@ mod tests {
     // ---- CLAUDE.md managed block -----------------------------------------
 
     #[test]
-    fn claude_md_render_includes_init_date() {
-        let block = render_claude_md_block("2026-04-16");
+    fn claude_md_render_includes_init_date_and_root() {
+        let block = render_claude_md_block("2026-04-16", Path::new("/test/.thoth"));
         assert!(block.contains("2026-04-16"));
+        assert!(block.contains("/test/.thoth/MEMORY.md"));
+        assert!(block.contains("/test/.thoth/LESSONS.md"));
+        assert!(block.contains("/test/.thoth/USER.md"));
+        assert!(!block.contains("./.thoth/"));
         assert!(block.starts_with(CLAUDE_MD_START));
         assert!(block.ends_with(CLAUDE_MD_END));
     }
 
     #[test]
+    fn claude_md_render_uses_global_path() {
+        let global = Path::new("/Users/nat/.thoth/projects/abc123");
+        let block = render_claude_md_block("2026-04-16", global);
+        assert!(block.contains("/Users/nat/.thoth/projects/abc123/MEMORY.md"));
+        assert!(block.contains("/Users/nat/.thoth/projects/abc123/LESSONS.md"));
+    }
+
+    #[test]
     fn claude_md_merge_into_empty_produces_block_only() {
-        let block = render_claude_md_block("2026-04-16");
+        let block = render_claude_md_block("2026-04-16", Path::new("/test/.thoth"));
         let out = merge_claude_md("", &block);
         assert!(out.contains(CLAUDE_MD_START));
         assert!(out.contains(CLAUDE_MD_END));
@@ -2383,7 +2410,7 @@ mod tests {
         // Re-running `thoth setup` on the same UTC day must not rewrite the
         // file. We render the block twice with the same date and assert
         // `merge_claude_md` is stable.
-        let block = render_claude_md_block("2026-04-16");
+        let block = render_claude_md_block("2026-04-16", Path::new("/test/.thoth"));
         let once = merge_claude_md("", &block);
         let twice = merge_claude_md(&once, &block);
         assert_eq!(once, twice);
@@ -2391,8 +2418,8 @@ mod tests {
 
     #[test]
     fn claude_md_merge_replaces_existing_block_between_markers() {
-        let old = render_claude_md_block("2025-01-01");
-        let new = render_claude_md_block("2026-04-16");
+        let old = render_claude_md_block("2025-01-01", Path::new("/test/.thoth"));
+        let new = render_claude_md_block("2026-04-16", Path::new("/test/.thoth"));
         let existing = format!("{old}\n\nUser notes below.\n");
         let merged = merge_claude_md(&existing, &new);
         assert!(merged.contains("2026-04-16"));
@@ -2403,7 +2430,7 @@ mod tests {
 
     #[test]
     fn claude_md_merge_preserves_user_content_when_no_markers() {
-        let block = render_claude_md_block("2026-04-16");
+        let block = render_claude_md_block("2026-04-16", Path::new("/test/.thoth"));
         let existing = "# My project\n\nSome notes.\n";
         let merged = merge_claude_md(existing, &block);
         // Block goes first so Claude Code picks it up at the top of the file,
@@ -2415,7 +2442,7 @@ mod tests {
 
     #[test]
     fn claude_md_strip_removes_only_managed_block() {
-        let block = render_claude_md_block("2026-04-16");
+        let block = render_claude_md_block("2026-04-16", Path::new("/test/.thoth"));
         let existing = format!("# Top\n\n{block}\n\n## My own section\n");
         let stripped = strip_claude_md(&existing);
         assert!(!stripped.contains(CLAUDE_MD_START));
@@ -2432,7 +2459,7 @@ mod tests {
 
     #[test]
     fn claude_md_strip_on_pure_block_returns_empty() {
-        let block = render_claude_md_block("2026-04-16");
+        let block = render_claude_md_block("2026-04-16", Path::new("/test/.thoth"));
         // `claude_md_uninstall` treats an empty (or whitespace-only) result
         // as "delete the file" — we just confirm the string is empty here.
         let stripped = strip_claude_md(&block);

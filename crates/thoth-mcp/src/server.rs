@@ -18,7 +18,7 @@ use thoth_memory::{
     workflow::WorkflowStateManager,
 };
 use thoth_parse::LanguageRegistry;
-use thoth_retrieve::{Indexer, RetrieveConfig, Retriever};
+use thoth_retrieve::{ChromaConfig, Indexer, RetrieveConfig, Retriever};
 use thoth_store::{ChromaCol, ChromaStore, StoreRoot};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -89,52 +89,21 @@ impl Server {
     }
 
     async fn is_chroma_enabled(root: &Path) -> bool {
-        let config_path = root.join("config.toml");
-        let Ok(text) = tokio::fs::read_to_string(&config_path).await else {
-            return false;
-        };
-        #[derive(serde::Deserialize)]
-        struct Cfg {
-            chroma: Option<ChromaCfg>,
-        }
-        #[derive(serde::Deserialize)]
-        struct ChromaCfg {
-            enabled: Option<bool>,
-        }
-        toml::from_str::<Cfg>(&text)
-            .ok()
-            .and_then(|c| c.chroma)
-            .and_then(|c| c.enabled)
-            .unwrap_or(false)
+        ChromaConfig::load_or_default(root).await.enabled
     }
 
     async fn get_chroma(&self) -> Option<&ChromaStore> {
         if !self.inner.chroma_enabled {
             return None;
         }
+        let root = self.inner.root.clone();
         let store = self
             .inner
             .chroma
             .get_or_init(|| async {
-                let config_path = self.inner.root.join("config.toml");
-                let data_path = if let Ok(text) = tokio::fs::read_to_string(&config_path).await {
-                    #[derive(serde::Deserialize)]
-                    struct Cfg {
-                        chroma: Option<ChromaCfg>,
-                    }
-                    #[derive(serde::Deserialize)]
-                    struct ChromaCfg {
-                        data_path: Option<String>,
-                    }
-                    toml::from_str::<Cfg>(&text)
-                        .ok()
-                        .and_then(|c| c.chroma)
-                        .and_then(|c| c.data_path)
-                } else {
-                    None
-                };
-                let path = data_path.unwrap_or_else(|| {
-                    StoreRoot::chroma_path(&self.inner.root)
+                let cfg = ChromaConfig::load_or_default(&root).await;
+                let path = cfg.data_path.unwrap_or_else(|| {
+                    StoreRoot::chroma_path(&root)
                         .to_string_lossy()
                         .to_string()
                 });
@@ -1779,7 +1748,8 @@ impl Server {
     // ---- prompts ----------------------------------------------------------
 
     fn prompts_list(&self) -> Value {
-        json!({ "prompts": prompts_catalog() })
+        let disc = DisciplineConfig::load_or_default_sync(&self.inner.root);
+        json!({ "prompts": prompts_catalog(disc.grounding_check) })
     }
 
     async fn prompts_get(&self, params: Value) -> Result<Value, RpcError> {
@@ -3396,8 +3366,8 @@ fn tools_catalog() -> Vec<Tool> {
 /// Descriptors advertised by `prompts/list`. Each maps to a renderer in
 /// [`Server::prompts_get`]; rendering is pure string substitution so the
 /// server stays deterministic and dependency-free.
-fn prompts_catalog() -> Vec<Prompt> {
-    vec![
+fn prompts_catalog(grounding_enabled: bool) -> Vec<Prompt> {
+    let mut prompts = vec![
         Prompt {
             name: "thoth.reflect".to_string(),
             description:
@@ -3430,7 +3400,9 @@ fn prompts_catalog() -> Vec<Prompt> {
                 required: true,
             }],
         },
-        Prompt {
+    ];
+    if grounding_enabled {
+        prompts.push(Prompt {
             name: "thoth.grounding_check".to_string(),
             description: "Ask the agent to verify a factual claim against the indexed code before \
                  asserting it to the user."
@@ -3440,8 +3412,9 @@ fn prompts_catalog() -> Vec<Prompt> {
                 description: "The claim to verify.".to_string(),
                 required: true,
             }],
-        },
-    ]
+        });
+    }
+    prompts
 }
 
 fn arg_str<'a>(args: &'a serde_json::Map<String, Value>, key: &str) -> &'a str {

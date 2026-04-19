@@ -31,7 +31,7 @@ pub mod synth;
 #[cfg(feature = "anthropic")]
 pub use synth::*;
 
-pub use config::{IndexConfig, OutputConfig, RetrieveConfig, WatchConfig};
+pub use config::{ChromaConfig, IndexConfig, OutputConfig, RetrieveConfig, WatchConfig};
 pub use enrich::{enrich_chunks, extract_docstring};
 pub use indexer::{IndexProgress, IndexStats, Indexer, chunk_id, read_span};
 pub use retriever::Retriever;
@@ -103,38 +103,14 @@ pub async fn recall(store: StoreRoot, q: Query, mode: Mode) -> Result<Retrieval>
 /// Try to connect to ChromaDB using config. Returns None if ChromaDB is
 /// not configured or unreachable.
 async fn chroma_from_config(root: &std::path::Path) -> Option<Arc<ChromaCol>> {
-    let cfg_path = root.join("config.toml");
-    let data_path = if let Ok(text) = tokio::fs::read_to_string(&cfg_path).await {
-        #[derive(Deserialize)]
-        struct Cfg {
-            chroma: Option<ChromaCfg>,
-        }
-        #[derive(Deserialize)]
-        struct ChromaCfg {
-            enabled: Option<bool>,
-            data_path: Option<String>,
-        }
-        if let Ok(cfg) = toml::from_str::<Cfg>(&text) {
-            if let Some(c) = cfg.chroma {
-                if c.enabled == Some(false) {
-                    return None;
-                }
-                c.data_path
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let path =
-        data_path.unwrap_or_else(|| StoreRoot::chroma_path(root).to_string_lossy().to_string());
+    let cfg = ChromaConfig::load_or_default(root).await;
+    if !cfg.enabled {
+        return None;
+    }
+    let path = cfg
+        .data_path
+        .unwrap_or_else(|| StoreRoot::chroma_path(root).to_string_lossy().to_string());
     let store = ChromaStore::open(&path).await.ok()?;
     let (col, _info) = store.ensure_collection("thoth_code").await.ok()?;
     Some(Arc::new(col))
 }
-
-use serde::Deserialize;

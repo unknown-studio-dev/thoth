@@ -705,6 +705,17 @@ fn render_toml(a: &SetupAnswers) -> String {
          # pruning (keep every backup forever).\n\
          compact_backup_keep            = {compact_backup_keep}\n\
          \n\
+         [enforcement]\n\
+         # Auto-promote / auto-demote engine for lesson tiers.\n\
+         # Lessons climb Advise → Require → Block after repeated failures,\n\
+         # and descend after repeated successes.\n\
+         # promote_threshold = 2    # failures before auto-promote one tier\n\
+         # demote_threshold  = 2    # successes before auto-demote one tier\n\
+         # auto_promote      = true # master switch for promotion\n\
+         # auto_demote       = true # master switch for demotion\n\
+         # recall_within_turns        = 3  # turns the gate looks back for RequireRecall\n\
+         # workflow_violation_threshold = 3 # violations in 7 days before hard block\n\
+         \n\
          [chroma]\n\
          # ChromaDB semantic search via Python sidecar.\n\
          enabled = true\n\

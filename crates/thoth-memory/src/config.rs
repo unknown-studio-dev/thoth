@@ -127,11 +127,7 @@ pub(crate) struct ConfigFile {
     pub(crate) memory: MemoryConfig,
     #[serde(default)]
     pub(crate) discipline: DisciplineConfig,
-    // Parsed here so `[enforcement]` round-trips through the shared
-    // ConfigFile loader — consumers (harvester, promotion engine) will be
-    // wired in later tasks of the thoth-enforcement-layer plan.
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) enforcement: EnforcementConfig,
 }
 
@@ -209,6 +205,51 @@ impl Default for EnforcementConfig {
             workflow_violation_threshold: default_workflow_threshold(),
             auto_promote: default_true(),
             auto_demote: default_true(),
+        }
+    }
+}
+
+impl EnforcementConfig {
+    /// Load `<root>/config.toml` if it exists, returning the `[enforcement]`
+    /// table (or [`Self::default`] if the file / table are missing).
+    pub async fn load_or_default(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "enforcement: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        Self::parse_or_default(&text, &path)
+    }
+
+    /// Sync twin of [`Self::load_or_default`] for callers that can't
+    /// spin a tokio runtime (e.g. the gate hook binary).
+    pub fn load_or_default_sync(root: &Path) -> Self {
+        let path = root.join("config.toml");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "enforcement: could not read config.toml, using defaults");
+                return Self::default();
+            }
+        };
+        Self::parse_or_default(&text, &path)
+    }
+
+    fn parse_or_default(text: &str, path: &Path) -> Self {
+        match toml::from_str::<ConfigFile>(text) {
+            Ok(cf) => cf.enforcement,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "enforcement: config.toml parse error, using defaults");
+                Self::default()
+            }
         }
     }
 }
@@ -494,10 +535,6 @@ impl DisciplineConfig {
         }
     }
 
-    /// `true` if mode is `"strict"`.
-    pub fn is_strict(&self) -> bool {
-        self.mode.eq_ignore_ascii_case("strict")
-    }
 }
 
 #[cfg(test)]

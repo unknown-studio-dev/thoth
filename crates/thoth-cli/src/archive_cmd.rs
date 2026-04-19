@@ -1073,24 +1073,10 @@ async fn open_archive_chroma(root: &Path) -> Result<ChromaCol> {
     Ok(col)
 }
 
-#[derive(serde::Deserialize)]
-struct PartialConfig {
-    chroma: Option<ChromaCfg>,
-}
-#[derive(serde::Deserialize)]
-struct ChromaCfg {
-    data_path: Option<String>,
-}
-
 async fn load_chroma_data_path(root: &Path) -> String {
-    let config_path = root.join("config.toml");
-    if let Ok(text) = tokio::fs::read_to_string(&config_path).await
-        && let Ok(cfg) = toml::from_str::<PartialConfig>(&text)
-        && let Some(p) = cfg.chroma.and_then(|c| c.data_path)
-    {
-        return p;
-    }
-    StoreRoot::chroma_path(root).to_string_lossy().to_string()
+    let cfg = thoth_retrieve::ChromaConfig::load_or_default(root).await;
+    cfg.data_path
+        .unwrap_or_else(|| StoreRoot::chroma_path(root).to_string_lossy().to_string())
 }
 
 fn home_claude_sessions() -> Result<PathBuf> {

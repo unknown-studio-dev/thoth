@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use thoth_core::Synthesizer;
+use thoth_retrieve::ChromaConfig;
 use thoth_store::{ChromaStore, StoreRoot};
 
 mod archive_cmd;
@@ -559,33 +560,11 @@ pub(crate) fn build_synth(kind: Option<SynthKind>) -> anyhow::Result<Option<Arc<
 }
 
 pub(crate) async fn open_chroma(store: &StoreRoot) -> Option<Arc<thoth_store::ChromaCol>> {
-    let cfg_path = store.path.join("config.toml");
-    let data_path = if let Ok(text) = tokio::fs::read_to_string(&cfg_path).await {
-        #[derive(serde::Deserialize)]
-        struct Cfg {
-            chroma: Option<ChromaCfg>,
-        }
-        #[derive(serde::Deserialize)]
-        struct ChromaCfg {
-            enabled: Option<bool>,
-            data_path: Option<String>,
-        }
-        if let Ok(cfg) = toml::from_str::<Cfg>(&text) {
-            if let Some(c) = cfg.chroma {
-                if c.enabled == Some(false) {
-                    return None;
-                }
-                c.data_path
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let path = data_path.unwrap_or_else(|| {
+    let cfg = ChromaConfig::load_or_default(&store.path).await;
+    if !cfg.enabled {
+        return None;
+    }
+    let path = cfg.data_path.unwrap_or_else(|| {
         StoreRoot::chroma_path(&store.path)
             .to_string_lossy()
             .to_string()

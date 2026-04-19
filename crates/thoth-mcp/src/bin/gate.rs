@@ -385,7 +385,7 @@ fn run(input: &Value) -> (Value, Option<String>, Option<TelemetryRecord>) {
     // Extract edit context tokens from the tool input.
     let edit_tokens = extract_edit_tokens(&tool_name, &tool_input);
 
-    let decision = decide(&policy, &recalls, &edit_tokens, now_unix_ns());
+    let decision = decide(&policy, &recalls, &edit_tokens, now_unix_ns(), cfg.require_nudge);
 
     // Render verdict + stderr message.
     let stderr = format_stderr(
@@ -916,6 +916,7 @@ fn decide(
     recalls: &[RecallRow],
     edit_tokens: &HashSet<String>,
     now_ns: u64,
+    require_nudge: bool,
 ) -> Decision {
     // Empty edit context — nothing to match on, so fall back to recency
     // alone. This handles Write-with-empty-content and similar edge cases.
@@ -924,18 +925,21 @@ fn decide(
     let most_recent = recalls.first();
     let recency_secs = most_recent.map(|r| r.age_secs(now_ns));
 
-    // Recency shortcut.
-    if let Some(age) = recency_secs
-        && age <= policy.window_short_secs
-    {
-        return Decision {
-            verdict: Verdict::Pass,
-            reason: "recency",
-            recency_secs,
-            best_score: None,
-            considered: recalls.len(),
-            missed_tokens: Vec::new(),
-        };
+    // Recency shortcut — skip when `require_nudge` is true so every
+    // mutation must pass the full relevance check.
+    if !require_nudge {
+        if let Some(age) = recency_secs
+            && age <= policy.window_short_secs
+        {
+            return Decision {
+                verdict: Verdict::Pass,
+                reason: "recency",
+                recency_secs,
+                best_score: None,
+                considered: recalls.len(),
+                missed_tokens: Vec::new(),
+            };
+        }
     }
 
     // Cold start — never recalled in this session. Pass/nudge/block by mode.
@@ -1169,6 +1173,10 @@ struct GateConfig {
     nudge_before_write: bool,
     /// Whether to append each decision to `.thoth/gate.jsonl`.
     telemetry_enabled: bool,
+    /// When `true`, skip the recency shortcut — every mutation must pass
+    /// the full relevance check, not just have a recent recall in the
+    /// short window.
+    require_nudge: bool,
     /// Bash commands that start with any of these prefixes bypass the
     /// gate. Includes legacy defaults plus user-provided additions.
     bash_readonly_prefixes: Vec<String>,
@@ -1200,6 +1208,7 @@ impl Default for GateConfig {
             global_fallback: disc.global_fallback,
             nudge_before_write: disc.nudge_before_write,
             telemetry_enabled: disc.gate_telemetry_enabled,
+            require_nudge: disc.gate_require_nudge,
             bash_readonly_prefixes: DEFAULT_BASH_READONLY_PREFIXES
                 .iter()
                 .map(|s| (*s).to_string())
@@ -1309,6 +1318,7 @@ fn load_config(root: &Path) -> GateConfig {
         global_fallback: disc.global_fallback,
         nudge_before_write: disc.nudge_before_write,
         telemetry_enabled: disc.gate_telemetry_enabled,
+        require_nudge: disc.gate_require_nudge,
         bash_readonly_prefixes: DEFAULT_BASH_READONLY_PREFIXES
             .iter()
             .map(|s| (*s).to_string())
@@ -2069,7 +2079,7 @@ mod tests {
         let policy = mk_policy(PolicyMode::Strict, 60, 1800, 0.30);
         let recalls = vec![mk_recall(5, "xyz unrelated")];
         let edit: HashSet<String> = ["abc", "def"].iter().map(|s| s.to_string()).collect();
-        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        let d = decide(&policy, &recalls, &edit, now_unix_ns(), false);
         assert_eq!(d.verdict, Verdict::Pass);
         assert_eq!(d.reason, "recency");
     }
@@ -2082,7 +2092,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        let d = decide(&policy, &recalls, &edit, now_unix_ns(), false);
         // 3/3 overlap → 1.0, well above 0.30.
         assert_eq!(d.verdict, Verdict::Pass);
         assert_eq!(d.reason, "relevance");
@@ -2097,7 +2107,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        let d = decide(&policy, &recalls, &edit, now_unix_ns(), false);
         assert_eq!(d.verdict, Verdict::Block);
         assert_eq!(d.reason, "relevance_miss");
         assert!(!d.missed_tokens.is_empty());
@@ -2108,7 +2118,7 @@ mod tests {
         let policy = mk_policy(PolicyMode::Nudge, 10, 1800, 0.30);
         let recalls = vec![mk_recall(100, "unrelated stuff")];
         let edit: HashSet<String> = ["retriever"].iter().map(|s| s.to_string()).collect();
-        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        let d = decide(&policy, &recalls, &edit, now_unix_ns(), false);
         assert_eq!(d.verdict, Verdict::Nudge);
     }
 
@@ -2117,7 +2127,7 @@ mod tests {
         let policy = mk_policy(PolicyMode::Off, 10, 1800, 0.30);
         let recalls = vec![];
         let edit: HashSet<String> = ["x"].iter().map(|s| s.to_string()).collect();
-        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        let d = decide(&policy, &recalls, &edit, now_unix_ns(), false);
         assert_eq!(d.verdict, Verdict::Pass);
     }
 
@@ -2127,11 +2137,11 @@ mod tests {
         let nudge = mk_policy(PolicyMode::Nudge, 10, 1800, 0.30);
         let edit: HashSet<String> = ["x"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
-            decide(&strict, &[], &edit, now_unix_ns()).verdict,
+            decide(&strict, &[], &edit, now_unix_ns(), false).verdict,
             Verdict::Block
         );
         assert_eq!(
-            decide(&nudge, &[], &edit, now_unix_ns()).verdict,
+            decide(&nudge, &[], &edit, now_unix_ns(), false).verdict,
             Verdict::Nudge
         );
     }
@@ -2142,7 +2152,7 @@ mod tests {
         let policy = mk_policy(PolicyMode::Strict, 10, 1800, 0.0);
         let recalls = vec![mk_recall(100, "totally different topic")];
         let edit: HashSet<String> = ["anything"].iter().map(|s| s.to_string()).collect();
-        let d = decide(&policy, &recalls, &edit, now_unix_ns());
+        let d = decide(&policy, &recalls, &edit, now_unix_ns(), false);
         // Past short window + threshold 0 → time_lapsed miss → block under strict.
         assert_eq!(d.verdict, Verdict::Block);
         assert_eq!(d.reason, "time_lapsed");
