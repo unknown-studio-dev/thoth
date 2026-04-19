@@ -9,8 +9,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use blake3;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 /// Spawn `thoth-gate` with an isolated `$HOME` and `$THOTH_ROOT`, feed
 /// it the given hook envelope JSON on stdin, and return
@@ -62,13 +62,7 @@ telemetry_enabled = false
 
 fn tool_call_hash(input: &Value) -> String {
     let canonical = serde_json::to_vec(input).unwrap_or_default();
-    let digest = Sha256::digest(&canonical);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{b:02x}");
-    }
-    out
+    blake3::hash(&canonical).to_hex().to_string()
 }
 
 /// REQ-07 / REQ-08: the shipped `no-rm-rf` default rule must Block a

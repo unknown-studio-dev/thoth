@@ -74,5 +74,18 @@
         }
       ]
     }
+  ],
+  "PreCompact": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "thoth --root {THOTH_ROOT} hooks exec pre-compact",
+          "timeout": 10,
+          "output": "json"
+        }
+      ]
+    }
   ]
 }

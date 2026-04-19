@@ -1044,6 +1044,9 @@ pub enum HookEvent {
     PostToolUse,
     /// `Stop` / `SessionEnd` — forget pass (+ nudge if Mode::Full).
     Stop,
+    /// `PreCompact` — fires right before context compression. Last chance
+    /// to save conversation state before the window shrinks.
+    PreCompact,
 }
 
 /// `thoth hooks exec <event>`. Called by Claude Code itself. Reads the
@@ -1060,6 +1063,7 @@ pub async fn exec(event: HookEvent, root: &Path) -> anyhow::Result<()> {
         HookEvent::UserPromptSubmit => run_user_prompt(root, &payload, &mut buf).await,
         HookEvent::PostToolUse => run_post_tool(root, &payload, &mut buf).await,
         HookEvent::Stop => run_stop(root, &payload).await,
+        HookEvent::PreCompact => run_pre_compact(root, &payload).await,
     };
     if let Err(e) = result {
         eprintln!("thoth: hook error: {e}");
@@ -1157,6 +1161,24 @@ async fn run_session_start(root: &Path, buf: &mut String) -> anyhow::Result<()> 
         let _ = writeln!(buf);
     }
 
+    // L0 archive status — lightweight (~100 tokens) orientation so the
+    // agent knows how much verbatim context is available via
+    // `thoth_recall scope:"archive"` or `thoth_archive_search`.
+    if let Ok(tracker) =
+        thoth_store::ArchiveTracker::open(thoth_store::StoreRoot::archive_path(root)).await
+        && let Ok((sessions, turns, curated)) = tracker.status()
+        && sessions > 0
+    {
+        let _ = writeln!(buf, "### Conversation archive");
+        let _ = writeln!(
+            buf,
+            "{sessions} sessions, {turns} turns ({curated} curated). \
+             Use `thoth_recall` with `scope: \"archive\"` or `scope: \"all\"` \
+             to search past conversations. Use `thoth_archive_topics` to browse topics."
+        );
+        let _ = writeln!(buf);
+    }
+
     // Curator pass. Equivalent to invoking `thoth curate --quiet`
     // directly, but inlined so we don't re-exec the binary from its
     // own hook (costly on cold start). Any findings are printed to
@@ -1232,6 +1254,22 @@ async fn run_user_prompt(root: &Path, payload: &Value, buf: &mut String) -> anyh
         .to_string();
     if prompt.is_empty() {
         return Ok(());
+    }
+
+    // Save user turn verbatim via the daemon (fire-and-forget).
+    if let Some(session_id) = payload.get("session_id").and_then(Value::as_str)
+        && let Some(mut d) = crate::daemon::DaemonClient::try_connect(root).await
+    {
+        let _ = d
+            .call(
+                "thoth_turn_save",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "role": "user",
+                    "content": prompt,
+                }),
+            )
+            .await;
     }
 
     // Reflection-debt heartbeat. If the agent has been editing
@@ -1736,7 +1774,7 @@ async fn run_stop(root: &Path, payload: &Value) -> anyhow::Result<()> {
         if std::env::var("ANTHROPIC_API_KEY").is_ok() {
             use std::sync::Arc;
             use thoth_core::Synthesizer;
-            match thoth_synth::anthropic::AnthropicSynthesizer::from_env() {
+            match thoth_retrieve::anthropic::AnthropicSynthesizer::from_env() {
                 Ok(synth) => {
                     let synth: Arc<dyn Synthesizer> = Arc::new(synth);
                     match memory.nudge(synth.as_ref(), 0).await {
@@ -1753,6 +1791,33 @@ async fn run_stop(root: &Path, payload: &Value) -> anyhow::Result<()> {
                 Err(e) => eprintln!("thoth: nudge skipped: {e}"),
             }
         }
+    }
+    Ok(())
+}
+
+/// PreCompact: fires right before context compression. Saves a marker
+/// so the agent knows context was compressed, and triggers a forget
+/// pass to clean up before the window shrinks.
+async fn run_pre_compact(root: &Path, _payload: &Value) -> anyhow::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    eprintln!("thoth: pre-compact — saving state before context compression");
+
+    if let Some(mut d) = crate::daemon::DaemonClient::try_connect(root).await {
+        // Run forget pass to clean up before compression
+        let _ = d.call("thoth_memory_forget", serde_json::json!({})).await;
+
+        // Save a marker episode so we know compaction happened
+        let _ = d
+            .call(
+                "thoth_episode_append",
+                serde_json::json!({
+                    "kind": "nudge_invoked",
+                    "text": "context_compaction",
+                }),
+            )
+            .await;
     }
     Ok(())
 }
@@ -1812,6 +1877,107 @@ fn first_line(s: &str, max: usize) -> String {
         let head: String = line.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
     }
+}
+
+// ------------------------------------------------- CLI enum definitions
+
+#[derive(clap::Subcommand, Debug)]
+pub enum HooksCmd {
+    /// Install Thoth's Claude Code hook block into `settings.json`.
+    Install {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: Scope,
+    },
+    /// Remove thoth-managed hooks from `settings.json`. Leaves user-owned
+    /// hooks untouched.
+    Uninstall {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: Scope,
+    },
+    /// Runtime dispatcher — called by Claude Code itself with a JSON
+    /// payload on stdin. Not intended for interactive use.
+    Exec {
+        #[arg(value_enum)]
+        event: HookEvent,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum McpCmd {
+    /// Register `thoth-mcp` under `mcpServers.thoth` in `settings.json`.
+    /// Idempotent.
+    Install {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: Scope,
+    },
+    /// Remove the `mcpServers.thoth` entry. Other MCP servers are preserved.
+    Uninstall {
+        #[arg(long, value_enum, default_value = "project")]
+        scope: Scope,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SkillsCmd {
+    /// List installed skills.
+    List,
+    /// Install skills into `.claude/skills/`.
+    ///
+    /// With no `PATH`: installs the bundled skills (`memory-discipline`,
+    /// `thoth-reflect`, `thoth-guide`, `thoth-exploring`, `thoth-debugging`,
+    /// `thoth-impact-analysis`, `thoth-refactoring`, `thoth-cli`) — this is
+    /// the primitive `thoth setup` drives.
+    ///
+    /// With a `PATH` pointing at a `<slug>.draft/` directory (produced by
+    /// the agent's `thoth_skill_propose` MCP tool): promotes the draft
+    /// into a live skill Claude Code will load on the next session, then
+    /// removes the draft.
+    Install {
+        /// Path to a `<slug>.draft/` skill directory to promote. If
+        /// omitted, the bundled skills are installed instead.
+        path: Option<std::path::PathBuf>,
+        #[arg(long, value_enum, default_value = "project")]
+        scope: Scope,
+    },
+}
+
+/// `thoth skills list` handler — prefers daemon, falls back to direct store.
+pub async fn cmd_skills_list(root: &std::path::Path, json: bool) -> anyhow::Result<()> {
+    if let Some(mut d) = crate::daemon::DaemonClient::try_connect(root).await {
+        let result = d.call("thoth_skills_list", serde_json::json!({})).await?;
+        if crate::daemon::tool_is_error(&result) {
+            anyhow::bail!("{}", crate::daemon::tool_text(&result));
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::daemon::tool_data(&result))?
+            );
+        } else {
+            // `text` already handles the empty-list message for us.
+            print!("{}", crate::daemon::tool_text(&result));
+        }
+        return Ok(());
+    }
+
+    use thoth_store::StoreRoot;
+    let store = StoreRoot::open(root).await?;
+    let skills = store.markdown.list_skills().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&skills)?);
+        return Ok(());
+    }
+    if skills.is_empty() {
+        println!(
+            "(no skills installed — drop a folder into {}/skills/)",
+            store.path.display()
+        );
+        return Ok(());
+    }
+    for s in skills {
+        println!("{:<28}  {}", s.slug, s.description);
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------- tests

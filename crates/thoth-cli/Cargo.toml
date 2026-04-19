@@ -13,23 +13,12 @@ name = "thoth"
 path = "src/main.rs"
 
 [features]
-# Mode::Zero is always available. Any adapter below opts in to Mode::Full
-# for the corresponding provider. `full` turns everything on.
 default   = []
-voyage    = ["thoth-embed/voyage"]
-openai    = ["thoth-embed/openai"]
-cohere    = ["thoth-embed/cohere"]
-anthropic = ["thoth-synth/anthropic", "dep:reqwest"]
-# Domain-memory adapters. The `file` ingestor is always on — it ships
-# in the base crate and powers the `thoth domain sync --source file`
-# path that air-gapped users and tests rely on.
+anthropic = ["thoth-retrieve/anthropic", "dep:reqwest"]
 notion     = ["thoth-domain/notion"]
 asana      = ["thoth-domain/asana"]
 notebooklm = ["thoth-domain/notebooklm"]
-# LanceDB-backed vector store (local-only). Flips every `VectorStore`
-# reference in thoth-retrieve / thoth to the LanceDB implementation.
-lance     = ["thoth-retrieve/lance", "thoth-store/lance"]
-full      = ["voyage", "openai", "cohere", "anthropic", "notion", "asana", "notebooklm"]
+full      = ["anthropic", "notion", "asana", "notebooklm"]
 
 [dependencies]
 thoth-core     = { workspace = true }
@@ -37,11 +26,10 @@ thoth-parse    = { workspace = true }
 thoth-store    = { workspace = true }
 thoth-retrieve = { workspace = true }
 thoth-memory   = { workspace = true }
-thoth-embed    = { workspace = true }
-thoth-synth    = { workspace = true }
 thoth-domain   = { workspace = true }
 thoth-mcp      = { workspace = true }
 
+blake3               = { workspace = true }
 tokio                = { workspace = true, features = ["signal", "process", "io-std", "net"] }
 anyhow               = { workspace = true }
 tracing              = { workspace = true }

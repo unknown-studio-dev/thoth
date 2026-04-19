@@ -25,6 +25,12 @@ pub mod enrich;
 pub mod indexer;
 pub mod retriever;
 
+#[cfg(feature = "anthropic")]
+pub mod synth;
+
+#[cfg(feature = "anthropic")]
+pub use synth::*;
+
 pub use config::{IndexConfig, OutputConfig, RetrieveConfig, WatchConfig};
 pub use enrich::{enrich_chunks, extract_docstring};
 pub use indexer::{IndexProgress, IndexStats, Indexer, chunk_id, read_span};
@@ -34,8 +40,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use thoth_core::{Embedder, Mode, Query, Result, Retrieval, Synthesizer};
-use thoth_store::{StoreRoot, VectorStore};
+use thoth_core::{Mode, Query, Result, Retrieval, Synthesizer};
+use thoth_store::{ChromaCol, ChromaStore, StoreRoot};
 
 /// Process-lifetime cache for [`RetrieveConfig`], keyed by store root path.
 ///
@@ -70,31 +76,65 @@ async fn cached_retrieve_config(root: &std::path::Path) -> RetrieveConfig {
 /// Convenience wrapper: opens the right extra backends for the requested
 /// [`Mode`] and runs a single recall.
 ///
-/// In Mode::Zero the synthesizer and vector stages are skipped. In Mode::Full
-/// the vector store is opened at `<root>/vectors.db` (per DESIGN §7) and
-/// the caller-supplied embedder / synthesizer are plugged into the
-/// retriever.
+/// In Mode::Zero the synthesizer and vector stages are skipped but ChromaDB
+/// semantic search is used if configured. In Mode::Full the ChromaDB stage
+/// always runs and the caller-supplied synthesizer is plugged in.
 pub async fn recall(store: StoreRoot, q: Query, mode: Mode) -> Result<Retrieval> {
     let retrieve_cfg = cached_retrieve_config(&store.path).await;
+    let chroma = chroma_from_config(&store.path).await;
     match mode {
         Mode::Zero => {
             Retriever::new(store)
+                .with_chroma(chroma)
                 .with_markdown_boost(retrieve_cfg.rerank_markdown_boost)
                 .recall(&q)
                 .await
         }
-        Mode::Full {
-            embedder,
-            synthesizer,
-        } => {
-            let vectors_path = StoreRoot::vectors_path(&store.path);
-            let vectors = VectorStore::open(&vectors_path).await?;
-            let embedder: Option<Arc<dyn Embedder>> = embedder.map(Arc::from);
+        Mode::Full { synthesizer } => {
             let synth: Option<Arc<dyn Synthesizer>> = synthesizer.map(Arc::from);
-            Retriever::with_full(store, Some(vectors), embedder, synth)
+            Retriever::with_full(store, chroma, synth)
                 .with_markdown_boost(retrieve_cfg.rerank_markdown_boost)
                 .recall_full(&q)
                 .await
         }
     }
 }
+
+/// Try to connect to ChromaDB using config. Returns None if ChromaDB is
+/// not configured or unreachable.
+async fn chroma_from_config(root: &std::path::Path) -> Option<Arc<ChromaCol>> {
+    let cfg_path = root.join("config.toml");
+    let data_path = if let Ok(text) = tokio::fs::read_to_string(&cfg_path).await {
+        #[derive(Deserialize)]
+        struct Cfg {
+            chroma: Option<ChromaCfg>,
+        }
+        #[derive(Deserialize)]
+        struct ChromaCfg {
+            enabled: Option<bool>,
+            data_path: Option<String>,
+        }
+        if let Ok(cfg) = toml::from_str::<Cfg>(&text) {
+            if let Some(c) = cfg.chroma {
+                if c.enabled == Some(false) {
+                    return None;
+                }
+                c.data_path
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let path =
+        data_path.unwrap_or_else(|| StoreRoot::chroma_path(root).to_string_lossy().to_string());
+    let store = ChromaStore::open(&path).await.ok()?;
+    let (col, _info) = store.ensure_collection("thoth_code").await.ok()?;
+    Some(Arc::new(col))
+}
+
+use serde::Deserialize;

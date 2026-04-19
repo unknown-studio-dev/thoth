@@ -9,6 +9,21 @@
 use std::io;
 use std::path::Path;
 
+#[derive(clap::Subcommand, Debug)]
+pub enum WorkflowCmd {
+    /// List every workflow session currently in `Active` state.
+    List,
+    /// Mark the session's workflow as abandoned and clear its accumulated
+    /// rows in `workflow-violations.jsonl` so the gate's violation
+    /// counter falls back below threshold.
+    Reset {
+        /// Claude Code session id (matches the filename under
+        /// `<root>/workflow/<session_id>.json`).
+        #[arg(required = true)]
+        session_id: String,
+    },
+}
+
 use thoth_memory::workflow::{WorkflowState, WorkflowStateManager};
 
 /// Current wall-clock in unix epoch seconds. Broken out so tests can

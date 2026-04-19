@@ -81,6 +81,80 @@ pub enum LayerArg {
     Effective,
 }
 
+// ------------------------------------------------------------------- CLI enum
+
+#[derive(clap::Subcommand, Debug)]
+pub enum RuleCmd {
+    /// Show rules from a selected layer (default: `effective`).
+    List {
+        #[arg(long, value_enum, default_value_t = LayerArg::Effective)]
+        layer: LayerArg,
+    },
+    /// Set `disabled = true` for a rule in the user (or project) layer.
+    Disable {
+        #[arg(required = true)]
+        id: String,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Clear `disabled = true` for a rule.
+    Enable {
+        #[arg(required = true)]
+        id: String,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Override a rule's enforcement tier in the user (or project) layer.
+    Override {
+        #[arg(required = true)]
+        id: String,
+        #[arg(long, value_enum)]
+        tier: EnforcementArg,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Add a new user (or project) rule — either from a lesson id or inline.
+    Add {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, conflicts_with = "inline")]
+        from_lesson: Option<String>,
+        #[arg(long)]
+        inline: bool,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        path_glob: Option<String>,
+        #[arg(long)]
+        cmd_regex: Option<String>,
+        #[arg(long)]
+        content_regex: Option<String>,
+        #[arg(long)]
+        natural: Option<String>,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long, value_enum)]
+        enforcement: Option<EnforcementArg>,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Print every layer's contribution plus the final effective set.
+    Diff,
+    /// Simulate a tool call or detect overlapping rules.
+    Check {
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        cmd: Option<String>,
+        #[arg(long)]
+        content: Option<String>,
+    },
+    /// Bake `.thoth/ignore` + lesson-derived rules into `rules.project.toml`.
+    Compile,
+}
+
 // ------------------------------------------------------------------- helpers
 
 fn user_path(root: &Path) -> PathBuf {

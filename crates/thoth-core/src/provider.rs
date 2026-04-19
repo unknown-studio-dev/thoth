@@ -1,8 +1,4 @@
-//! Pluggable provider traits: embedding and LLM synthesis.
-//!
-//! Thoth never depends on a specific provider SDK. Callers plug in an
-//! implementation of [`Embedder`] and/or [`Synthesizer`] when they want
-//! Mode::Full behaviour.
+//! Pluggable provider traits for LLM synthesis.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -11,20 +7,6 @@ use crate::Result;
 use crate::event::{Event, Outcome};
 use crate::memory::{Fact, Lesson, Skill};
 use crate::query::Chunk;
-
-/// Semantic embedding provider.
-#[async_trait]
-pub trait Embedder: Send + Sync {
-    /// Embed a batch of texts. The returned vector has length `texts.len()`,
-    /// each inner vec has length [`Embedder::dim`].
-    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
-
-    /// The output dimensionality of this embedder.
-    fn dim(&self) -> usize;
-
-    /// Stable identifier of the underlying model (e.g. `"voyage-code-3"`).
-    fn model_id(&self) -> &str;
-}
 
 /// LLM synthesis provider — used for answer synthesis, query rewriting,
 /// and self-critique.

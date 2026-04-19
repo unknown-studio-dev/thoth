@@ -7,9 +7,9 @@
 //! 3. **Graph fan-out** from whichever symbols the first two steps hit.
 //! 4. **Markdown grep** over `MEMORY.md` (fact bullets surface as chunks).
 //!
-//! In **Mode::Full** an additional [`VectorStore`] stage runs — the query text
-//! is embedded with the configured [`Embedder`] and the top-k nearest
-//! neighbours by cosine similarity are folded into the fusion alongside the
+//! In **Mode::Full** an additional ChromaDB vector stage runs — the query
+//! text is sent to ChromaDB for server-side embedding and ANN search, and
+//! the top-k nearest neighbours are folded into the fusion alongside the
 //! other sources. If a [`Synthesizer`] is configured, the fused chunks are
 //! then handed to it to produce a natural-language answer.
 //!
@@ -23,13 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thoth_core::{
-    Chunk, Embedder, Event, Prompt, Query, QueryScope, Result, Retrieval, RetrievalSource,
-    Synthesizer,
+    Chunk, Event, Prompt, Query, QueryScope, Result, Retrieval, RetrievalSource, Synthesizer,
 };
+use thoth_domain::snapshot::SnapshotStore;
 use thoth_graph::Graph;
-use thoth_store::{
-    EpisodeHit, FtsHit, KvStore, MarkdownStore, StoreRoot, SymbolRow, VectorHit, VectorStore,
-};
+use thoth_store::{ChromaCol, EpisodeHit, FtsHit, KvStore, MarkdownStore, StoreRoot, SymbolRow};
 use uuid::Uuid;
 
 use crate::indexer::{chunk_id, read_span};
@@ -50,9 +48,11 @@ const RRF_K: f32 = 10.0;
 pub struct Retriever {
     store: StoreRoot,
     graph: Graph,
-    vectors: Option<VectorStore>,
-    embedder: Option<Arc<dyn Embedder>>,
+    chroma: Option<Arc<ChromaCol>>,
     synthesizer: Option<Arc<dyn Synthesizer>>,
+    /// Domain snapshot store for business-rule / invariant recall.
+    /// Optional — the retriever works without it (degrades silently).
+    domain: Option<Arc<SnapshotStore>>,
     /// Multiplier applied to the fused score of every
     /// `RetrievalSource::Markdown` hit after RRF, before top-K selection.
     /// `1.0` is the identity (no boost). Set via
@@ -62,36 +62,55 @@ pub struct Retriever {
 }
 
 impl Retriever {
-    /// Create a Mode::Zero retriever — no vector stage, no synthesis.
+    /// Create a Mode::Zero retriever — no synthesis. ChromaDB is used for
+    /// semantic search if configured.
     pub fn new(store: StoreRoot) -> Self {
         let graph = Graph::new(store.kv.clone());
         Self {
             store,
             graph,
-            vectors: None,
-            embedder: None,
+            chroma: None,
             synthesizer: None,
+            domain: None,
             markdown_boost: 1.0,
         }
     }
 
-    /// Create a Mode::Full retriever with any of the optional providers
-    /// attached. Passing `None` for all three is equivalent to [`Retriever::new`].
+    /// Create a Mode::Full retriever with any of the optional providers.
     pub fn with_full(
         store: StoreRoot,
-        vectors: Option<VectorStore>,
-        embedder: Option<Arc<dyn Embedder>>,
+        chroma: Option<Arc<ChromaCol>>,
         synthesizer: Option<Arc<dyn Synthesizer>>,
     ) -> Self {
         let graph = Graph::new(store.kv.clone());
         Self {
             store,
             graph,
-            vectors,
-            embedder,
+            chroma,
             synthesizer,
+            domain: None,
             markdown_boost: 1.0,
         }
+    }
+
+    /// Attach a ChromaDB store + collection ID for semantic vector search.
+    pub fn with_chroma(mut self, chroma: Option<Arc<ChromaCol>>) -> Self {
+        self.chroma = chroma;
+        self
+    }
+
+    /// Attach a domain snapshot store for business-rule / invariant recall.
+    ///
+    /// When set, the retriever scans the on-disk domain snapshots for tokens
+    /// that match the query and folds them into RRF fusion. Domain hits are
+    /// supplementary context — they compete on equal terms with other sources
+    /// but typically surface fewer candidates than symbol or BM25 stages.
+    ///
+    /// Passing `None` is a no-op: the domain stage is silently skipped and
+    /// all other backends continue to work as before.
+    pub fn with_domain(mut self, domain: Option<Arc<SnapshotStore>>) -> Self {
+        self.domain = domain;
+        self
     }
 
     /// Set the post-RRF multiplier applied to Markdown-sourced hits.
@@ -163,18 +182,21 @@ impl Retriever {
             .take(8)
             .collect();
 
-        // Stages 3 (graph), 4 (markdown), 4b (lessons), 5 (episodic) are all
-        // independent once `seeds` are known — run them concurrently.
-        let (graph_hits, md_hits, lesson_hits, ep_hits) = tokio::join!(
+        // Stages 3 (graph), 4 (markdown), 4b (lessons), 5 (episodic),
+        // 4c (domain) are all independent once `seeds` are known — run them
+        // concurrently.
+        let (graph_hits, md_hits, lesson_hits, ep_hits, domain_hits) = tokio::join!(
             self.graph_stage(&seeds),
-            self.markdown_stage(&search_text),
+            self.markdown_stage(&search_text, &scope.tags),
             self.lessons_stage(&search_text),
             self.episodic_stage(&search_text, k * 2),
+            self.domain_stage(&search_text),
         );
         let graph_hits = filter_scope(graph_hits?, scope);
         let md_hits = md_hits?;
         let lesson_hits = lesson_hits?;
         let ep_hits = ep_hits?;
+        let domain_hits = domain_hits?;
 
         for (rank, cand) in graph_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
@@ -191,6 +213,14 @@ impl Retriever {
         //     path (`LESSONS.md` vs `MEMORY.md`), which is enough for callers
         //     to tell them apart in renders.
         for (rank, cand) in lesson_hits.iter().enumerate() {
+            fuse(&mut fused, cand, rank);
+        }
+
+        // 4c. domain snapshot search — business rules, invariants, workflows.
+        //     Participates in RRF on equal footing; typically returns fewer
+        //     candidates than code stages so it acts as supplementary context.
+        //     Global (no scope filter) like MEMORY.md.
+        for (rank, cand) in domain_hits.iter().enumerate() {
             fuse(&mut fused, cand, rank);
         }
 
@@ -318,14 +348,20 @@ impl Retriever {
         Ok(out)
     }
 
-    async fn markdown_stage(&self, text: &str) -> Result<Vec<Candidate>> {
+    async fn markdown_stage(&self, text: &str, tags: &[String]) -> Result<Vec<Candidate>> {
         let md: &MarkdownStore = &self.store.markdown;
-        // Cheap heuristic: split the query into meaningful tokens and union
-        // the matches. Short tokens would match everything, so we filter.
         let toks = tokens(text);
         let facts = md.grep_facts_multi(&toks).await?;
         let mut out = Vec::new();
         for f in facts {
+            if !tags.is_empty()
+                && !f
+                    .tags
+                    .iter()
+                    .any(|t| tags.iter().any(|q| t.eq_ignore_ascii_case(q)))
+            {
+                continue;
+            }
             let preview = first_nonempty_line(&f.text);
             let id = format!("memory.md:{}", blake3::hash(f.text.as_bytes()).to_hex());
             out.push(Candidate {
@@ -410,24 +446,102 @@ impl Retriever {
         Ok(out)
     }
 
-    /// Returns `Ok(None)` when the vector stage is disabled (no embedder or
-    /// no vector store configured). Returns `Ok(Some(vec))` — possibly empty
-    /// — when the stage ran.
+    /// Search domain snapshots (business rules / invariants / workflows) for
+    /// tokens that overlap with the query. Returns an empty vec when no domain
+    /// store is configured — the caller never needs to special-case the
+    /// absence of this backend.
+    ///
+    /// Each matching snapshot becomes one [`Candidate`] whose preview is the
+    /// rule title. Ids are namespaced under `domain:` so they can't collide
+    /// with file-backed chunk ids or markdown memory ids.
+    async fn domain_stage(&self, text: &str) -> Result<Vec<Candidate>> {
+        let Some(store) = self.domain.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let toks = tokens(text);
+        if toks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Walk the domain directory and check each snapshot file for token
+        // matches. We read each file as raw text and do a simple case-insensitive
+        // substring scan — same approach as the markdown stage.
+        let domain_root = &store.root;
+        if !domain_root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut hits: Vec<Candidate> = Vec::new();
+        if let Ok(entries) = Self::collect_domain_snapshots(domain_root).await {
+            for path in entries {
+                let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+                    continue;
+                };
+                let raw_lc = raw.to_ascii_lowercase();
+                let matched = toks.iter().any(|t| raw_lc.contains(t.as_str()));
+                if !matched {
+                    continue;
+                }
+                // Extract title from the markdown body (line starting with "# ").
+                let title = raw
+                    .lines()
+                    .find(|l| l.starts_with("# "))
+                    .map(|l| l.trim_start_matches("# ").trim().to_string())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("domain rule")
+                            .to_string()
+                    });
+                let id = format!(
+                    "domain:{}",
+                    blake3::hash(path.to_string_lossy().as_bytes()).to_hex()
+                );
+                hits.push(Candidate {
+                    id,
+                    path: path.clone(),
+                    start_line: 0,
+                    end_line: 0,
+                    symbol: None,
+                    source: RetrievalSource::Markdown,
+                    preview: Some(format!("domain rule — {title}")),
+                });
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Recursively collect all `.md` snapshot files under the domain root.
+    async fn collect_domain_snapshots(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let mut queue = vec![root.to_path_buf()];
+        while let Some(dir) = queue.pop() {
+            let mut rd = match tokio::fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let p = entry.path();
+                if p.is_dir() {
+                    queue.push(p);
+                } else if p.extension().is_some_and(|e| e == "md") {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Semantic vector search via ChromaDB. Returns `Ok(None)` when
+    /// ChromaDB is not configured.
     async fn vector_stage(&self, text: &str, k: usize) -> Result<Option<Vec<Candidate>>> {
-        let (Some(embedder), Some(vectors)) = (self.embedder.as_ref(), self.vectors.as_ref())
-        else {
+        let Some(col) = self.chroma.as_ref() else {
             return Ok(None);
         };
-        let embeddings = embedder.embed_batch(&[text]).await?;
-        let Some(q_vec) = embeddings.into_iter().next() else {
-            return Ok(Some(Vec::new()));
-        };
-        let hits: Vec<VectorHit> = vectors.search(embedder.model_id(), &q_vec, k).await?;
+        let hits = col.query_text(text, k, None).await?;
         let mut out = Vec::with_capacity(hits.len());
         for h in hits {
-            // Every vector we wrote uses a chunk_id shaped like
-            // `"<path>:<start>-<end>"`. If a row fails to parse we skip it —
-            // the vector DB might hold rows written by an older schema.
             if let Some((path, start, end)) = parse_chunk_id(&h.id) {
                 out.push(Candidate {
                     id: h.id,
@@ -436,7 +550,7 @@ impl Retriever {
                     end_line: end,
                     symbol: None,
                     source: RetrievalSource::Vector,
-                    preview: None,
+                    preview: h.document,
                 });
             }
         }

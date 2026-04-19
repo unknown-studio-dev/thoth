@@ -1461,6 +1461,20 @@ fn first_existing_root(allow_home_fallback: bool) -> Option<PathBuf> {
         return Some(local);
     }
     if allow_home_fallback && let Some(home) = std::env::var_os("HOME") {
+        // Global per-project root: ~/.thoth/projects/{slug}/
+        if let Ok(cwd) = std::env::current_dir() {
+            let canonical = cwd.canonicalize().unwrap_or(cwd);
+            let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+            let slug = &hash.to_hex()[..12];
+            let p = PathBuf::from(&home)
+                .join(".thoth")
+                .join("projects")
+                .join(slug);
+            if p.is_dir() {
+                return Some(p);
+            }
+        }
+        // Legacy: flat ~/.thoth/
         let p = PathBuf::from(home).join(".thoth");
         if p.is_dir() {
             return Some(p);
@@ -1530,16 +1544,8 @@ fn ymd_from_days(days: i64) -> (i64, u32, u32) {
 /// `serde_json::to_vec` (which sorts neither keys nor anything else, but is
 /// stable for the same in-memory `Value` shape we just parsed).
 fn tool_call_hash(input: &Value) -> String {
-    use sha2::{Digest, Sha256};
     let canonical = serde_json::to_vec(input).unwrap_or_default();
-    let digest = Sha256::digest(&canonical);
-    // Hex-encode without pulling another dep.
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{b:02x}");
-    }
-    out
+    blake3::hash(&canonical).to_hex().to_string()
 }
 
 /// Try to load every lesson currently on disk via [`MarkdownStore`]. Returns

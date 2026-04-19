@@ -27,21 +27,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let root = std::env::var("THOTH_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(".thoth"));
+    let root = resolve_root();
 
     tracing::info!(root = %root.display(), "thoth-mcp starting");
 
     let server = Server::open(&root).await?;
 
-    // If `[watch] enabled = true`, spawn a background file watcher that
-    // reindexes source changes in-process. The watched directory is the
-    // project root (parent of `.thoth/`).
-    let project_root = root
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // The project root is either cwd (global mode) or the parent of .thoth/ (local mode).
+    let project_root = std::env::current_dir().unwrap_or_else(|_| {
+        root.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    });
     if server.spawn_watcher(project_root).await {
         tracing::info!("background file watcher enabled");
     }
@@ -64,4 +61,30 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("thoth-mcp exiting");
     Ok(())
+}
+
+/// Resolve root: `$THOTH_ROOT` > `./.thoth/` > `~/.thoth/projects/{slug}/`.
+fn resolve_root() -> PathBuf {
+    if let Ok(env) = std::env::var("THOTH_ROOT") {
+        let p = PathBuf::from(env);
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    let local = PathBuf::from(".thoth");
+    if local.is_dir() {
+        return local;
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let canonical = cwd.canonicalize().unwrap_or(cwd);
+        let hash = blake3::hash(canonical.to_string_lossy().as_bytes());
+        let slug = &hash.to_hex()[..12];
+        return PathBuf::from(home)
+            .join(".thoth")
+            .join("projects")
+            .join(slug);
+    }
+    local
 }

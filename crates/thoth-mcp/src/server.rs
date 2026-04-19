@@ -19,7 +19,7 @@ use thoth_memory::{
 };
 use thoth_parse::LanguageRegistry;
 use thoth_retrieve::{Indexer, RetrieveConfig, Retriever};
-use thoth_store::StoreRoot;
+use thoth_store::{ChromaCol, ChromaStore, StoreRoot};
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
@@ -54,17 +54,26 @@ pub(crate) struct Inner {
     indexer: Indexer,
     retriever: Retriever,
     graph: thoth_graph::Graph,
+    chroma: tokio::sync::OnceCell<Option<ChromaStore>>,
+    chroma_enabled: bool,
 }
 
 impl Server {
     /// Open a server rooted at `path` (the `.thoth/` directory).
+    ///
+    /// ChromaDB (and its ONNX embedder) is **not** loaded here — it is
+    /// lazily initialized on first use to avoid the ~2 GB RSS hit when
+    /// no vector operation is needed.
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = path.as_ref().to_path_buf();
         let store = StoreRoot::open(&root).await?;
-        let indexer = Indexer::new(store.clone(), LanguageRegistry::new());
         let retrieve_cfg = RetrieveConfig::load_or_default(&root).await;
+        let chroma_enabled = Self::is_chroma_enabled(&root).await;
+
+        let indexer = Indexer::new(store.clone(), LanguageRegistry::new());
         let retriever =
             Retriever::new(store.clone()).with_markdown_boost(retrieve_cfg.rerank_markdown_boost);
+
         let graph = thoth_graph::Graph::new(store.kv.clone());
         Ok(Self {
             inner: Arc::new(Inner {
@@ -73,8 +82,75 @@ impl Server {
                 indexer,
                 retriever,
                 graph,
+                chroma: tokio::sync::OnceCell::new(),
+                chroma_enabled,
             }),
         })
+    }
+
+    async fn is_chroma_enabled(root: &Path) -> bool {
+        let config_path = root.join("config.toml");
+        let Ok(text) = tokio::fs::read_to_string(&config_path).await else {
+            return false;
+        };
+        #[derive(serde::Deserialize)]
+        struct Cfg {
+            chroma: Option<ChromaCfg>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ChromaCfg {
+            enabled: Option<bool>,
+        }
+        toml::from_str::<Cfg>(&text)
+            .ok()
+            .and_then(|c| c.chroma)
+            .and_then(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    async fn get_chroma(&self) -> Option<&ChromaStore> {
+        if !self.inner.chroma_enabled {
+            return None;
+        }
+        let store = self
+            .inner
+            .chroma
+            .get_or_init(|| async {
+                let config_path = self.inner.root.join("config.toml");
+                let data_path = if let Ok(text) = tokio::fs::read_to_string(&config_path).await {
+                    #[derive(serde::Deserialize)]
+                    struct Cfg {
+                        chroma: Option<ChromaCfg>,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct ChromaCfg {
+                        data_path: Option<String>,
+                    }
+                    toml::from_str::<Cfg>(&text)
+                        .ok()
+                        .and_then(|c| c.chroma)
+                        .and_then(|c| c.data_path)
+                } else {
+                    None
+                };
+                let path = data_path.unwrap_or_else(|| {
+                    StoreRoot::chroma_path(&self.inner.root)
+                        .to_string_lossy()
+                        .to_string()
+                });
+                match ChromaStore::open(&path).await {
+                    Ok(s) => {
+                        tracing::info!(path = %path, "ChromaDB sidecar started (lazy init)");
+                        Some(s)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ChromaDB sidecar init failed");
+                        None
+                    }
+                }
+            })
+            .await;
+        store.as_ref()
     }
 
     /// Spawn a background file watcher if `[watch] enabled = true` in
@@ -210,6 +286,8 @@ impl Server {
             "thoth_memory_remove" => self.tool_memory_remove(arguments).await,
             "thoth_skills_list" => self.tool_skills_list().await,
             "thoth_memory_show" => self.tool_memory_show().await,
+            "thoth_wakeup" => self.tool_wakeup(arguments).await,
+            "thoth_memory_detail" => self.tool_memory_detail(arguments).await,
             "thoth_memory_forget" => self.tool_memory_forget().await,
             "thoth_episode_append" => self.tool_episode_append(arguments).await,
             "thoth_lesson_outcome" => self.tool_lesson_outcome(arguments).await,
@@ -230,6 +308,16 @@ impl Server {
             "thoth_workflow_advance" => self.tool_workflow_advance(arguments).await,
             "thoth_workflow_complete" => self.tool_workflow_complete(arguments).await,
             "thoth_workflow_list" => self.tool_workflow_list().await,
+            "thoth_kg_add" => self.tool_kg_add(arguments).await,
+            "thoth_kg_query" => self.tool_kg_query(arguments).await,
+            "thoth_kg_invalidate" => self.tool_kg_invalidate(arguments).await,
+            "thoth_kg_timeline" => self.tool_kg_timeline(arguments).await,
+            "thoth_kg_stats" => self.tool_kg_stats().await,
+            "thoth_turn_save" => self.tool_turn_save(arguments).await,
+            "thoth_turns_search" => self.tool_turns_search(arguments).await,
+            "thoth_archive_status" => self.tool_archive_status().await,
+            "thoth_archive_topics" => self.tool_archive_topics(arguments).await,
+            "thoth_archive_search" => self.tool_archive_search(arguments).await,
             other => {
                 return Err(RpcError::new(
                     error_codes::METHOD_NOT_FOUND,
@@ -249,13 +337,16 @@ impl Server {
             Resource {
                 uri: MEMORY_URI.to_string(),
                 name: "MEMORY.md".to_string(),
-                description: "Declarative facts about the codebase.".to_string(),
+                description:
+                    "Declarative facts (full text). For a compact index, use thoth_wakeup."
+                        .to_string(),
                 mime_type: "text/markdown".to_string(),
             },
             Resource {
                 uri: LESSONS_URI.to_string(),
                 name: "LESSONS.md".to_string(),
-                description: "Lessons learned from past mistakes.".to_string(),
+                description: "Lessons learned (full text). For a compact index, use thoth_wakeup."
+                    .to_string(),
                 mime_type: "text/markdown".to_string(),
             },
         ];
@@ -304,32 +395,104 @@ impl Server {
             query: String,
             #[serde(default)]
             top_k: Option<usize>,
+            /// Recall scope: `"curated"` (default) = code + memory,
+            /// `"archive"` = archive only, `"all"` = code + memory + archive.
+            #[serde(default)]
+            scope: Option<String>,
+            /// Filter facts to those with any of these tags.
+            #[serde(default)]
+            tags: Option<Vec<String>>,
             /// Whether to persist this recall as a `QueryIssued` event.
-            ///
-            /// Default `true` — agent-initiated recalls (MCP tool calls from
-            /// Claude) must log, because that's the signal `thoth-gate` keys
-            /// off to prove the agent consulted memory before mutating.
-            ///
-            /// The `UserPromptSubmit` hook passes `false`: its recall is
-            /// context injection, not deliberate memory consultation.
-            /// Letting the hook's ceremonial recall satisfy the gate would
-            /// make the discipline vacuous — every prompt would pre-approve
-            /// every subsequent Write/Edit/Bash regardless of whether the
-            /// agent actually looked at the chunks.
             #[serde(default)]
             log_event: Option<bool>,
         }
         let Args {
             query,
             top_k,
+            scope,
+            tags,
             log_event,
         } = serde_json::from_value(args)?;
-        let q = Query {
+        let scope_str = scope.as_deref().unwrap_or("curated");
+        let mut q = Query {
             text: query.clone(),
             top_k: top_k.unwrap_or(8).max(1),
             ..Query::text("")
         };
-        let out = self.inner.retriever.recall(&q).await?;
+        if let Some(t) = tags {
+            q.scope.tags = t;
+        }
+        let include_curated = scope_str == "curated" || scope_str == "all";
+        let include_archive = scope_str == "archive" || scope_str == "all";
+
+        let mut out = if include_curated {
+            self.inner.retriever.recall(&q).await?
+        } else {
+            thoth_core::Retrieval {
+                chunks: Vec::new(),
+                synthesized: None,
+                correlation_id: Uuid::new_v4(),
+            }
+        };
+
+        // Semantic memory search via ChromaDB — best-effort, failures are
+        // silent so recall degrades gracefully when ChromaDB is down.
+        if include_curated
+            && let Ok(col) = self.open_memory_chroma().await
+            && let Ok(hits) = col.query_text(&query, 5, None).await
+        {
+            for h in hits {
+                if let Some(doc) = &h.document {
+                    let kind = h
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("kind"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("memory");
+                    out.chunks.push(thoth_core::Chunk {
+                        id: h.id,
+                        path: PathBuf::from(format!(".thoth/{kind}")),
+                        line: 0,
+                        span: (0, 0),
+                        symbol: None,
+                        preview: doc.chars().take(200).collect(),
+                        body: doc.clone(),
+                        source: thoth_core::RetrievalSource::Markdown,
+                        score: 1.0 / (1.0 + h.distance),
+                        context: None,
+                    });
+                }
+            }
+        }
+
+        // Archive search — exchange-pair conversation chunks from ChromaDB.
+        if include_archive
+            && let Ok(col) = self.open_archive_chroma().await
+            && let Ok(hits) = col.query_text(&query, 5, None).await
+        {
+            for h in hits {
+                if let Some(doc) = &h.document {
+                    let topic = h
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("topic"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("conversation");
+                    out.chunks.push(thoth_core::Chunk {
+                        id: h.id,
+                        path: PathBuf::from(".thoth/archive"),
+                        line: 0,
+                        span: (0, 0),
+                        symbol: Some(format!("[{topic}]")),
+                        preview: doc.chars().take(200).collect(),
+                        body: doc.clone(),
+                        source: thoth_core::RetrievalSource::Markdown,
+                        score: 1.0 / (1.0 + h.distance),
+                        context: None,
+                    });
+                }
+            }
+        }
 
         // Log a `QueryIssued` event so the strict-mode gate can prove the
         // agent actually consulted memory before mutating files. Failure
@@ -432,6 +595,8 @@ impl Server {
             .await
         {
             Ok(()) => {
+                self.upsert_memory_chroma("fact", &fact.text, &fact.tags)
+                    .await;
                 let path = self.inner.root.join("MEMORY.md");
                 let text = format!("committed to MEMORY.md: {}", first_line(&fact.text));
                 let data = json!({
@@ -560,6 +725,8 @@ impl Server {
             .await
         {
             Ok(()) => {
+                let combined = format!("WHEN: {}\nDO: {}", lesson.trigger, lesson.advice);
+                self.upsert_memory_chroma("lesson", &combined, &[]).await;
                 let path = self.inner.root.join("LESSONS.md");
                 let text = format!("committed to LESSONS.md: {}", lesson.trigger);
                 let data = json!({
@@ -1258,6 +1425,169 @@ impl Server {
         Ok(ToolOutput::new(data, text))
     }
 
+    /// Compact one-line-per-entry index of MEMORY.md + LESSONS.md.
+    ///
+    /// Returns a scannable summary (~1 line per entry) so the LLM can
+    /// quickly see what's stored and then call `thoth_memory_detail` for
+    /// the full content of specific entries. This is the "L1 wake-up"
+    /// layer inspired by MemPalace's layered memory stack.
+    async fn tool_wakeup(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            scope: Option<String>,
+        }
+        let scope = serde_json::from_value::<Args>(args)
+            .ok()
+            .and_then(|a| a.scope)
+            .unwrap_or_else(|| "all".to_string());
+
+        let md = &self.inner.store.markdown;
+        let mut text = String::new();
+        let mut fact_count = 0usize;
+        let mut lesson_count = 0usize;
+
+        if scope == "all" || scope == "facts" {
+            let facts = md.read_facts().await?;
+            fact_count = facts.len();
+            text.push_str(&format!("=== MEMORY ({fact_count} facts) ===\n"));
+            for (i, f) in facts.iter().enumerate() {
+                let heading = first_nonempty_line(&f.text);
+                let tags = if f.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | tags: {}", f.tags.join(", "))
+                };
+                text.push_str(&format!("F{:02} | {heading}{tags}\n", i + 1));
+            }
+            text.push('\n');
+        }
+
+        if scope == "all" || scope == "lessons" {
+            let lessons = md.read_lessons().await?;
+            lesson_count = lessons.len();
+            text.push_str(&format!("=== LESSONS ({lesson_count} lessons) ===\n"));
+            for (i, l) in lessons.iter().enumerate() {
+                let tier = format!("{:?}", l.enforcement);
+                text.push_str(&format!(
+                    "L{:02} | {} | {tier} | {}✓ {}✗\n",
+                    i + 1,
+                    l.trigger.trim(),
+                    l.success_count,
+                    l.failure_count,
+                ));
+            }
+        }
+
+        let data = json!({
+            "facts": fact_count,
+            "lessons": lesson_count,
+        });
+        Ok(ToolOutput::new(data, text))
+    }
+
+    /// Return the full content of a specific fact or lesson by index
+    /// (e.g. "F03", "L01") or heading substring match.
+    async fn tool_memory_detail(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            id: String,
+        }
+        let Args { id } = serde_json::from_value(args)?;
+        let id = id.trim();
+
+        let md = &self.inner.store.markdown;
+
+        if let Some(Ok(idx)) = id
+            .strip_prefix('F')
+            .or_else(|| id.strip_prefix('f'))
+            .map(|rest| rest.parse::<usize>())
+        {
+            let facts = md.read_facts().await?;
+            if idx == 0 || idx > facts.len() {
+                return Ok(ToolOutput::error(format!(
+                    "F{idx} out of range (1..{})",
+                    facts.len()
+                )));
+            }
+            let f = &facts[idx - 1];
+            let tags = if f.tags.is_empty() {
+                String::new()
+            } else {
+                format!("\ntags: {}", f.tags.join(", "))
+            };
+            let text = format!("### F{idx:02}\n{}{tags}", f.text);
+            return Ok(ToolOutput::new(json!({"kind": "fact", "index": idx}), text));
+        }
+
+        if let Some(Ok(idx)) = id
+            .strip_prefix('L')
+            .or_else(|| id.strip_prefix('l'))
+            .map(|rest| rest.parse::<usize>())
+        {
+            let lessons = md.read_lessons().await?;
+            if idx == 0 || idx > lessons.len() {
+                return Ok(ToolOutput::error(format!(
+                    "L{idx} out of range (1..{})",
+                    lessons.len()
+                )));
+            }
+            let l = &lessons[idx - 1];
+            let text = format!(
+                "### L{idx:02} — {}\n{}\nenforcement: {:?} | {}✓ {}✗",
+                l.trigger.trim(),
+                l.advice,
+                l.enforcement,
+                l.success_count,
+                l.failure_count,
+            );
+            return Ok(ToolOutput::new(
+                json!({"kind": "lesson", "index": idx}),
+                text,
+            ));
+        }
+
+        // Fallback: substring match across both facts and lessons
+        let needle = id.to_lowercase();
+        let facts = md.read_facts().await?;
+        for (i, f) in facts.iter().enumerate() {
+            if f.text.to_lowercase().contains(&needle)
+                || f.tags.iter().any(|t| t.to_lowercase().contains(&needle))
+            {
+                let tags = if f.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("\ntags: {}", f.tags.join(", "))
+                };
+                let idx = i + 1;
+                let text = format!("### F{idx:02}\n{}{tags}", f.text);
+                return Ok(ToolOutput::new(json!({"kind": "fact", "index": idx}), text));
+            }
+        }
+        let lessons = md.read_lessons().await?;
+        for (i, l) in lessons.iter().enumerate() {
+            if l.trigger.to_lowercase().contains(&needle)
+                || l.advice.to_lowercase().contains(&needle)
+            {
+                let idx = i + 1;
+                let text = format!(
+                    "### L{idx:02} — {}\n{}\nenforcement: {:?} | {}✓ {}✗",
+                    l.trigger.trim(),
+                    l.advice,
+                    l.enforcement,
+                    l.success_count,
+                    l.failure_count,
+                );
+                return Ok(ToolOutput::new(
+                    json!({"kind": "lesson", "index": idx}),
+                    text,
+                ));
+            }
+        }
+
+        Ok(ToolOutput::error(format!("no match for \"{id}\"")))
+    }
+
     /// Append a raw episodic event. Used by Claude Code hooks to record
     /// what it observed during a session (file edits, tool outcomes, etc.)
     /// so future reflective passes have ground-truth timeline data.
@@ -1884,6 +2214,379 @@ impl Server {
 
         Ok(ToolOutput::new(data, text))
     }
+
+    // ---- knowledge graph tools ---------------------------------------------
+    // Temporal logic (valid_from/valid_to storage, as_of filtering, current-vs-expired
+    // distinction) lives entirely in thoth-store/src/episodes.rs; these handlers are thin
+    // dispatchers. valid_from/valid_to are ISO-date strings stored as nullable TEXT in
+    // SQLite; a triple is "current" when valid_to IS NULL and "expired" once valid_to is set.
+
+    async fn tool_kg_add(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            subject: String,
+            predicate: String,
+            object: String,
+            #[serde(default)]
+            valid_from: Option<String>,
+            #[serde(default)]
+            valid_to: Option<String>,
+            #[serde(default = "default_confidence")]
+            confidence: f64,
+            #[serde(default)]
+            source: Option<String>,
+        }
+        fn default_confidence() -> f64 {
+            1.0
+        }
+        let Args {
+            subject,
+            predicate,
+            object,
+            valid_from,
+            valid_to,
+            confidence,
+            source,
+        } = serde_json::from_value(args)?;
+        let id = self
+            .inner
+            .store
+            .episodes
+            .kg_add(
+                subject.clone(),
+                predicate.clone(),
+                object.clone(),
+                valid_from,
+                valid_to,
+                confidence,
+                source,
+            )
+            .await?;
+        let text = format!("added triple #{id}: {subject} —[{predicate}]→ {object}");
+        Ok(ToolOutput::new(json!({"id": id}), text))
+    }
+
+    async fn tool_kg_query(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            entity: String,
+            #[serde(default)]
+            direction: Option<String>,
+            #[serde(default)]
+            as_of: Option<String>,
+        }
+        let Args {
+            entity,
+            direction,
+            as_of,
+        } = serde_json::from_value(args)?;
+        let dir = direction.unwrap_or_else(|| "both".to_string());
+        let triples = self
+            .inner
+            .store
+            .episodes
+            .kg_query(entity.clone(), dir, as_of)
+            .await?;
+        if triples.is_empty() {
+            return Ok(ToolOutput::new(
+                json!({"count": 0}),
+                format!("no triples for \"{entity}\""),
+            ));
+        }
+        let mut text = format!("=== {} triple(s) for \"{}\" ===\n", triples.len(), entity);
+        for t in &triples {
+            let validity = match (&t.valid_from, &t.valid_to) {
+                (Some(f), Some(to)) => format!(" [{f} → {to}]"),
+                (Some(f), None) => format!(" [{f} → now]"),
+                (None, Some(to)) => format!(" [? → {to}]"),
+                (None, None) => String::new(),
+            };
+            text.push_str(&format!(
+                "{} —[{}]→ {}{}\n",
+                t.subject, t.predicate, t.object, validity,
+            ));
+        }
+        Ok(ToolOutput::new(json!({"count": triples.len()}), text))
+    }
+
+    async fn tool_kg_invalidate(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            subject: String,
+            predicate: String,
+            object: String,
+            #[serde(default)]
+            ended: Option<String>,
+        }
+        let Args {
+            subject,
+            predicate,
+            object,
+            ended,
+        } = serde_json::from_value(args)?;
+        let n = self
+            .inner
+            .store
+            .episodes
+            .kg_invalidate(subject.clone(), predicate.clone(), object.clone(), ended)
+            .await?;
+        let text = format!("invalidated {n} triple(s): {subject} —[{predicate}]→ {object}");
+        Ok(ToolOutput::new(json!({"invalidated": n}), text))
+    }
+
+    async fn tool_kg_timeline(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            entity: Option<String>,
+            #[serde(default)]
+            limit: Option<usize>,
+        }
+        let Args { entity, limit } = serde_json::from_value(args)?;
+        let triples = self
+            .inner
+            .store
+            .episodes
+            .kg_timeline(entity.clone(), limit.unwrap_or(50))
+            .await?;
+        if triples.is_empty() {
+            return Ok(ToolOutput::new(
+                json!({"count": 0}),
+                "no triples in knowledge graph",
+            ));
+        }
+        let mut text = String::new();
+        for t in &triples {
+            let validity = match (&t.valid_from, &t.valid_to) {
+                (Some(f), Some(to)) => format!(" [{f} → {to}]"),
+                (Some(f), None) => format!(" [{f} → now]"),
+                _ => String::new(),
+            };
+            text.push_str(&format!(
+                "{} —[{}]→ {}{}\n",
+                t.subject, t.predicate, t.object, validity,
+            ));
+        }
+        Ok(ToolOutput::new(json!({"count": triples.len()}), text))
+    }
+
+    async fn tool_kg_stats(&self) -> anyhow::Result<ToolOutput> {
+        let (total, current, expired) = self.inner.store.episodes.kg_stats().await?;
+        let text = format!("KG: {total} triples ({current} current, {expired} expired)");
+        Ok(ToolOutput::new(
+            json!({"total": total, "current": current, "expired": expired}),
+            text,
+        ))
+    }
+
+    // ---- conversation turn tools ------------------------------------------
+
+    async fn tool_turn_save(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            session_id: String,
+            role: String,
+            content: String,
+        }
+        let Args {
+            session_id,
+            role,
+            content,
+        } = serde_json::from_value(args)?;
+
+        let id = self
+            .inner
+            .store
+            .episodes
+            .append_turn(session_id.clone(), role.clone(), content)
+            .await?;
+        let text = format!("saved turn #{id} ({role}) for session {session_id}");
+        Ok(ToolOutput::new(json!({"id": id, "role": role}), text))
+    }
+
+    async fn tool_turns_search(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Args {
+            query: String,
+            #[serde(default)]
+            top_k: Option<usize>,
+        }
+        let Args { query, top_k } = serde_json::from_value(args)?;
+        let k = top_k.unwrap_or(10);
+
+        let hits = self.inner.store.episodes.search_turns(&query, k).await?;
+        if hits.is_empty() {
+            return Ok(ToolOutput::new(json!({"count": 0}), "no matching turns"));
+        }
+
+        let mut text = String::new();
+        for t in &hits {
+            let ts =
+                t.at.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+            text.push_str(&format!(
+                "[{}] {} (turn {}, session {})\n{}\n---\n",
+                ts,
+                t.role,
+                t.turn_number,
+                &t.session_id[..t.session_id.len().min(8)],
+                &t.content[..t.content.len().min(500)],
+            ));
+        }
+        Ok(ToolOutput::new(json!({"count": hits.len()}), text))
+    }
+
+    // ---- archive tools ---------------------------------------------------
+
+    async fn tool_archive_status(&self) -> anyhow::Result<ToolOutput> {
+        let db_path = StoreRoot::archive_path(&self.inner.root);
+        let tracker = thoth_store::ArchiveTracker::open(&db_path).await?;
+        let (sessions, turns, curated) = tracker.status()?;
+        let data = json!({
+            "sessions": sessions,
+            "turns": turns,
+            "curated": curated,
+        });
+        let text = format!("Archive: {sessions} sessions, {turns} turns ({curated} curated)");
+        Ok(ToolOutput::new(data, text))
+    }
+
+    async fn tool_archive_topics(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        let project = args.get("project").and_then(|v| v.as_str());
+        let db_path = StoreRoot::archive_path(&self.inner.root);
+        let tracker = thoth_store::ArchiveTracker::open(&db_path).await?;
+        let topics = tracker.topics(project)?;
+        let arr: Vec<Value> = topics
+            .iter()
+            .map(|t| {
+                json!({
+                    "topic": t.topic,
+                    "sessions": t.session_count,
+                    "turns": t.total_turns,
+                })
+            })
+            .collect();
+        let text = if topics.is_empty() {
+            "No topics found.".to_string()
+        } else {
+            topics
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{}: {} sessions, {} turns",
+                        t.topic, t.session_count, t.total_turns
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Ok(ToolOutput::new(json!(arr), text))
+    }
+
+    async fn tool_archive_search(&self, args: Value) -> anyhow::Result<ToolOutput> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let project = args.get("project").and_then(|v| v.as_str());
+        let topic = args.get("topic").and_then(|v| v.as_str());
+
+        let col = self.open_archive_chroma().await?;
+
+        let mut filter = None;
+        if project.is_some() || topic.is_some() {
+            let mut conditions = Vec::new();
+            if let Some(p) = project {
+                conditions.push(json!({"project": {"$eq": p}}));
+            }
+            if let Some(t) = topic {
+                conditions.push(json!({"topic": {"$eq": t}}));
+            }
+            filter = Some(if conditions.len() == 1 {
+                conditions.into_iter().next().unwrap()
+            } else {
+                json!({"$and": conditions})
+            });
+        }
+
+        let hits = col.query_text(query, top_k, filter).await?;
+        let arr: Vec<Value> = hits
+            .iter()
+            .map(|h| {
+                json!({
+                    "id": h.id,
+                    "distance": h.distance,
+                    "text": h.document,
+                    "metadata": h.metadata,
+                })
+            })
+            .collect();
+        let text = if hits.is_empty() {
+            "No archive results.".to_string()
+        } else {
+            hits.iter()
+                .map(|h| {
+                    let topic = h
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("topic"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let preview = h
+                        .document
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    format!("[{topic}] (d={:.3}) {preview}", h.distance)
+                })
+                .collect::<Vec<_>>()
+                .join("\n---\n")
+        };
+        Ok(ToolOutput::new(json!(arr), text))
+    }
+
+    async fn upsert_memory_chroma(&self, kind: &str, text: &str, tags: &[String]) {
+        let col = match self.open_memory_chroma().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "ChromaDB memory upsert skipped (server unavailable)");
+                return;
+            }
+        };
+        let id = format!("{kind}:{}", blake3::hash(text.as_bytes()).to_hex());
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("kind".to_string(), json!(kind));
+        if !tags.is_empty() {
+            meta.insert("tags".to_string(), json!(tags.join(",")));
+        }
+        if let Err(e) = col
+            .upsert(vec![id], Some(vec![text.to_string()]), Some(vec![meta]))
+            .await
+        {
+            tracing::debug!(error = %e, "ChromaDB memory upsert failed");
+        }
+    }
+
+    async fn open_memory_chroma(&self) -> anyhow::Result<ChromaCol> {
+        let cs = self
+            .get_chroma()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("ChromaDB not configured"))?;
+        let (col, _info) = cs.ensure_collection("thoth_memory").await?;
+        Ok(col)
+    }
+
+    async fn open_archive_chroma(&self) -> anyhow::Result<ChromaCol> {
+        let cs = self
+            .get_chroma()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("ChromaDB not configured"))?;
+        let (col, _info) = cs.ensure_collection("thoth_archive").await?;
+        Ok(col)
+    }
 }
 
 /// One parsed hunk: a file path + every post-image line range the diff
@@ -1984,14 +2687,28 @@ fn tools_catalog() -> Vec<Tool> {
     vec![
         Tool {
             name: "thoth_recall".to_string(),
-            description: "Hybrid recall (symbol + BM25 + graph + markdown) over the code memory. \
-                          Returns ranked chunks with path, line span, and preview."
+            description: "Hybrid recall (symbol + BM25 + graph + markdown + semantic) over the \
+                          code memory. Returns ranked chunks with path, line span, and preview. \
+                          Use `scope` to include archived conversations."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language or keyword query." },
                     "top_k": { "type": "integer", "minimum": 1, "maximum": 64, "default": 8 },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["curated", "archive", "all"],
+                        "default": "curated",
+                        "description": "What to search: 'curated' (default) = code + facts/lessons, \
+                                        'archive' = verbatim conversations only, \
+                                        'all' = code + facts/lessons + archive."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Filter facts to those with any of these tags (wing/scope filter)."
+                    },
                     "log_event": {
                         "type": "boolean",
                         "default": true,
@@ -2145,8 +2862,48 @@ fn tools_catalog() -> Vec<Tool> {
         },
         Tool {
             name: "thoth_memory_show".to_string(),
-            description: "Return the current MEMORY.md and LESSONS.md as plain text.".to_string(),
+            description: "Return the current MEMORY.md and LESSONS.md as plain text. \
+                          For large memory sets, prefer thoth_wakeup (compact index) + \
+                          thoth_memory_detail (drill into specific entries)."
+                .to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        Tool {
+            name: "thoth_wakeup".to_string(),
+            description: "Compact one-line-per-entry index of all facts and lessons. \
+                          Use at session start to see what's stored without loading \
+                          full content. Then call thoth_memory_detail for specific \
+                          entries. Much cheaper than thoth_memory_show for large \
+                          memory sets."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "facts", "lessons"],
+                        "default": "all",
+                        "description": "Which memory surface to index."
+                    }
+                }
+            }),
+        },
+        Tool {
+            name: "thoth_memory_detail".to_string(),
+            description: "Return the full content of a specific fact or lesson. \
+                          Pass an index from thoth_wakeup (e.g. 'F03', 'L01') or \
+                          a heading substring to match."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Entry index (e.g. 'F03', 'L01') or heading substring."
+                    }
+                },
+                "required": ["id"]
+            }),
         },
         Tool {
             name: "thoth_memory_forget".to_string(),
@@ -2440,6 +3197,145 @@ fn tools_catalog() -> Vec<Tool> {
                 .to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
         },
+        // ---- knowledge graph tools ----
+        Tool {
+            name: "thoth_kg_add".to_string(),
+            description: "Add a temporal triple to the knowledge graph. \
+                          Entities are auto-created. Use valid_from/valid_to \
+                          for facts with time bounds."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "subject":    { "type": "string", "description": "Subject entity." },
+                    "predicate":  { "type": "string", "description": "Relationship (e.g. 'uses', 'owns', 'works_at')." },
+                    "object":     { "type": "string", "description": "Object entity." },
+                    "valid_from": { "type": "string", "description": "ISO date when this became true." },
+                    "valid_to":   { "type": "string", "description": "ISO date when this stopped being true." },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1, "default": 1.0 },
+                    "source":     { "type": "string", "description": "Where this fact came from (e.g. fact ID, conversation)." }
+                },
+                "required": ["subject", "predicate", "object"]
+            }),
+        },
+        Tool {
+            name: "thoth_kg_query".to_string(),
+            description: "Query knowledge graph triples for an entity. \
+                          Returns all relationships with optional temporal filter."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity":    { "type": "string", "description": "Entity name to query." },
+                    "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "default": "both" },
+                    "as_of":     { "type": "string", "description": "ISO date to filter: only triples valid at this date." }
+                },
+                "required": ["entity"]
+            }),
+        },
+        Tool {
+            name: "thoth_kg_invalidate".to_string(),
+            description: "Mark a knowledge graph triple as ended (set valid_to). \
+                          The triple is not deleted — it becomes historical."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "subject":   { "type": "string" },
+                    "predicate": { "type": "string" },
+                    "object":    { "type": "string" },
+                    "ended":     { "type": "string", "description": "ISO date. Defaults to now." }
+                },
+                "required": ["subject", "predicate", "object"]
+            }),
+        },
+        Tool {
+            name: "thoth_kg_timeline".to_string(),
+            description: "Chronological timeline of knowledge graph triples. \
+                          Optionally filter by entity."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "entity": { "type": "string", "description": "Filter to this entity." },
+                    "limit":  { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                }
+            }),
+        },
+        Tool {
+            name: "thoth_kg_stats".to_string(),
+            description: "Knowledge graph summary: total, current, and expired triples."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        // ---- conversation turn tools ----
+        Tool {
+            name: "thoth_turn_save".to_string(),
+            description: "Save a verbatim conversation turn (user or assistant) to the \
+                          episodic log. Called automatically by hooks or manually by the \
+                          agent to preserve important exchanges."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "Session identifier." },
+                    "role":       { "type": "string", "enum": ["user", "assistant"] },
+                    "content":    { "type": "string", "description": "Verbatim turn content." }
+                },
+                "required": ["session_id", "role", "content"]
+            }),
+        },
+        Tool {
+            name: "thoth_turns_search".to_string(),
+            description: "Full-text search over saved conversation turns. Returns matching \
+                          turns with session context."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query (FTS5 MATCH)." },
+                    "top_k": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+                },
+                "required": ["query"]
+            }),
+        },
+        // ---- archive tools ----
+        Tool {
+            name: "thoth_archive_status".to_string(),
+            description: "Archive summary: total sessions, turns, and curated count. \
+                          ~100 tokens. Good for L0 orientation."
+                .to_string(),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        Tool {
+            name: "thoth_archive_topics".to_string(),
+            description: "List topics in the conversation archive with session and turn counts. \
+                          Optionally filter by project."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Filter by project name." }
+                }
+            }),
+        },
+        Tool {
+            name: "thoth_archive_search".to_string(),
+            description: "Semantic search across archived verbatim conversations stored in \
+                          ChromaDB. Returns the most relevant conversation turns. Use this to \
+                          find past discussions, decisions, and context."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural language search query." },
+                    "top_k": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+                    "project": { "type": "string", "description": "Filter by project name." },
+                    "topic": { "type": "string", "description": "Filter by topic." }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -2596,6 +3492,16 @@ async fn render_retrieval(r: &thoth_core::Retrieval, root: &Path) -> String {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
+}
+
+fn first_nonempty_line(s: &str) -> String {
+    s.lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect()
 }
 
 /// Parse the MCP-level `kind` string ("fact" / "lesson" / "preference") into

@@ -74,6 +74,59 @@ pub struct CompactReport {
     pub lessons_backup: String,
 }
 
+/// `thoth compact` CLI handler — delegates to `run_compact` with config fallback.
+pub async fn cmd_compact(
+    root: &Path,
+    backend: &str,
+    model: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if !root.exists() {
+        println!("(no .thoth/ at {} — nothing to compact)", root.display());
+        return Ok(());
+    }
+    let disc = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let backend = if backend.is_empty() {
+        disc.background_review_backend.as_str()
+    } else {
+        backend
+    };
+    let model = if model.is_empty() {
+        disc.background_review_model.as_str()
+    } else {
+        model
+    };
+    match run_compact(root, backend, model, dry_run).await {
+        Ok(report) => {
+            let label = if dry_run {
+                "thoth compact (dry-run)"
+            } else {
+                "thoth compact"
+            };
+            eprintln!(
+                "{label}: {} → {} facts, {} → {} lessons",
+                report.facts_before,
+                report.facts_after,
+                report.lessons_before,
+                report.lessons_after,
+            );
+            if !dry_run {
+                if !report.memory_backup.is_empty() {
+                    eprintln!("  MEMORY.md backup:  {}", report.memory_backup);
+                }
+                if !report.lessons_backup.is_empty() {
+                    eprintln!("  LESSONS.md backup: {}", report.lessons_backup);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("thoth compact failed: {e}");
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Run the compaction end-to-end.
 ///
 /// `backend` and `model` follow the same fallback semantics as

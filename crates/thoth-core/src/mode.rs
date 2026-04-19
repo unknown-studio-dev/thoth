@@ -1,24 +1,17 @@
 //! Operating mode for Thoth.
-//!
-//! Thoth runs in one of two modes (see `DESIGN.md` §6).
 
-use crate::provider::{Embedder, Synthesizer};
+use crate::provider::Synthesizer;
 
 /// Operating mode.
 ///
-/// `Mode::Zero` is fully offline and requires no API key.
-/// `Mode::Full` accepts an optional `Embedder` (for semantic search)
-/// and an optional `Synthesizer` (for LLM-curated memory and answer synthesis).
-/// Either, both, or neither may be supplied in `Mode::Full`.
+/// `Mode::Zero` is fully offline: symbol lookup + graph + BM25 + ChromaDB.
+/// `Mode::Full` adds an LLM synthesizer for curated memory and answer synthesis.
 pub enum Mode {
-    /// Offline-only. Symbol lookup + graph traversal + BM25 + markdown grep.
+    /// Offline-only. Symbol lookup + graph traversal + BM25 + ChromaDB.
     Zero,
 
-    /// Plug-in mode. Supply an embedder and/or a synthesizer.
+    /// Plug-in mode. Supply a synthesizer for LLM-driven flows.
     Full {
-        /// Semantic embedding provider. If `None`, falls back to Mode::Zero
-        /// retrieval but still runs synthesizer-driven flows.
-        embedder: Option<Box<dyn Embedder>>,
         /// LLM synthesis provider. If `None`, retrieval returns raw chunks.
         synthesizer: Option<Box<dyn Synthesizer>>,
     },

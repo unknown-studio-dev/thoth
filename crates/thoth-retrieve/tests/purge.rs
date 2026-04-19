@@ -117,9 +117,8 @@ async fn reindex_drops_stale_symbols_and_nodes() {
 }
 
 #[tokio::test]
-async fn purge_path_clears_kv_graph_and_vectors() {
+async fn purge_path_clears_kv_and_graph() {
     use thoth_graph::Graph;
-    use thoth_store::VectorStore;
 
     let src_dir = tempdir().unwrap();
     let file = src_dir.path().join("auth.rs");
@@ -128,26 +127,7 @@ async fn purge_path_clears_kv_graph_and_vectors() {
     let thoth_dir = tempdir().unwrap();
     let store = StoreRoot::open(thoth_dir.path()).await.unwrap();
 
-    // Open a vector store alongside so we can pin the Mode::Full cleanup
-    // path too. We write a fake vector with the same id shape the indexer
-    // uses (`<path>:<start>-<end>`), bypassing any embedder.
-    let vec_path = StoreRoot::vectors_sqlite_path(thoth_dir.path());
-    let vectors = VectorStore::open(&vec_path).await.unwrap();
-    let sentinel_path = file.to_string_lossy().into_owned();
-    let sentinel_id = format!("{sentinel_path}:1-5");
-    let other_id = "some/other.rs:10-20".to_string();
-    vectors
-        .upsert(&sentinel_id, "test-model", &[1.0, 0.0, 0.0])
-        .await
-        .unwrap();
-    vectors
-        .upsert(&other_id, "test-model", &[0.0, 1.0, 0.0])
-        .await
-        .unwrap();
-
-    // Index, then assert KV + graph hold entries for this file.
-    let idx = Indexer::new(store.clone(), LanguageRegistry::new())
-        .with_embedding(std::sync::Arc::new(DummyEmbedder), vectors.clone());
+    let idx = Indexer::new(store.clone(), LanguageRegistry::new());
     idx.index_file(&file).await.unwrap();
     idx.commit().await.unwrap();
 
@@ -182,25 +162,6 @@ async fn purge_path_clears_kv_graph_and_vectors() {
             "graph node {fqn} survived purge",
         );
     }
-
-    // Vectors: the unrelated row survives; every row whose id was scoped to
-    // the purged file is gone.
-    let hits = vectors
-        .search("test-model", &[0.0, 1.0, 0.0], 10)
-        .await
-        .unwrap();
-    let leaked: Vec<_> = hits
-        .iter()
-        .filter(|h| h.id.starts_with(&format!("{sentinel_path}:")))
-        .collect();
-    assert!(
-        leaked.is_empty(),
-        "vector rows for purged path survived: {leaked:#?}",
-    );
-    assert!(
-        hits.iter().any(|h| h.id == other_id),
-        "unrelated vector row was wiped",
-    );
 }
 
 /// Content-hash gating — re-indexing an unchanged file must not re-parse,
@@ -285,23 +246,4 @@ async fn reindex_skips_when_content_hash_unchanged() {
         !after_v2.iter().any(|f| f == "auth::__hash_sentinel"),
         "sentinel survived a real content change — hash gate over-matched: {after_v2:?}",
     );
-}
-
-// ---------------------------------------------------------------------------
-// Dummy embedder — returns a canned 3-dim vector for every input. Lets us
-// exercise the Mode::Full write path without needing a real provider.
-#[derive(Default)]
-struct DummyEmbedder;
-
-#[async_trait::async_trait]
-impl thoth_core::Embedder for DummyEmbedder {
-    async fn embed_batch(&self, texts: &[&str]) -> thoth_core::Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|_| vec![0.5, 0.5, 0.5]).collect())
-    }
-    fn dim(&self) -> usize {
-        3
-    }
-    fn model_id(&self) -> &str {
-        "test-model"
-    }
 }

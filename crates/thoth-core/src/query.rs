@@ -32,6 +32,10 @@ pub struct QueryScope {
     /// Restrict to these symbol names.
     #[serde(default)]
     pub symbols: Vec<String>,
+    /// Filter facts/lessons to those matching any of these tags.
+    /// Empty means "all tags" (no filter).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl Query {

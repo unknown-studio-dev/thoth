@@ -705,6 +705,13 @@ fn render_toml(a: &SetupAnswers) -> String {
          # pruning (keep every backup forever).\n\
          compact_backup_keep            = {compact_backup_keep}\n\
          \n\
+         [chroma]\n\
+         # ChromaDB semantic search via Python sidecar.\n\
+         enabled = true\n\
+         # data_path omitted → per-project default: <project_root>/chroma/\n\
+         # Uncomment to override:\n\
+         # data_path = \"/custom/path/to/chromadb\"\n\
+         \n\
          [watch]\n\
          # Auto-watch the source tree for changes and reindex in the MCP\n\
          # daemon background. Removes the need for `thoth watch`.\n\
@@ -891,8 +898,16 @@ fn render_thothignore(project_root: &Path) -> String {
 // -------------------------------------------------- integration wiring
 
 /// Full install — hooks + skills + MCP — into `./.claude/settings.json`.
+/// When the root lives under `~/.thoth/projects/`, also register it in
+/// the global project registry.
 async fn install_integration(root: &Path) -> Result<()> {
     hooks::install_all(hooks::Scope::Project, root).await?;
+    if crate::resolve::is_global_root(root)
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let slug = crate::resolve::project_slug(&cwd);
+        let _ = crate::resolve::register_project(&slug, &cwd);
+    }
     Ok(())
 }
 
@@ -1025,6 +1040,175 @@ fn print_final_message(root: &Path, reconfigured: bool) {
     println!("  2. thoth index .              # build the code index");
     println!();
     println!("Re-run `thoth setup` any time to reconfigure or repair the install.");
+}
+
+// --------------------------------------------------------- thoth init command
+
+/// Scaffold written on `thoth init`. Every setting is commented out so the
+/// file only documents defaults — uncomment to override. Kept inline (not
+/// a separate `include_str!` fixture) so the CLI binary has no external
+/// runtime dependency on the repo layout.
+pub const DEFAULT_CONFIG_TOML: &str = r#"# Thoth config. All fields are optional; defaults shown.
+# Uncomment the ones you want to change.
+
+[index]
+# Gitignore-syntax patterns. Applied on top of `.gitignore`, `.ignore`, and
+# any `.thothignore` found in the project. Supports re-including with `!`.
+#
+# ignore = [
+#     "target/",
+#     "node_modules/",
+#     "dist/",
+#     "build/",
+#     "*.generated.rs",
+#     "docs/internal/",
+#     "!docs/internal/README.md",
+# ]
+
+# Max file size (bytes) considered for indexing. Files larger than this
+# are skipped with a debug log. Default: 2 MiB.
+# max_file_size = 2097152
+
+# Descend into hidden dirs (e.g. `.github`). Default: false.
+# include_hidden = false
+
+# Follow symlinks. Default: false — prevents indexing sibling projects.
+# follow_symlinks = false
+
+[memory]
+# How many days an episode survives before TTL eviction. Default: 30.
+# episodic_ttl_days = 30
+
+# Hard cap on episode count before capacity-based eviction. Default: 50_000.
+# max_episodes = 50000
+
+# Lessons with a success ratio below this floor (and at least
+# `lesson_min_attempts` attempts) are dropped by the forget pass.
+# lesson_floor = 0.2
+# lesson_min_attempts = 3
+
+# Exponential decay rate per day for the retention score, and the floor
+# below which an episode is dropped. Set `decay_floor = 0.0` to disable
+# decay-based eviction entirely (Mode::Zero deterministic).
+# decay_lambda = 0.02
+# decay_floor  = 0.05
+
+# Whether to run the LLM nudge at session end (Mode::Full only).
+# enable_nudge = true
+
+[discipline]
+# Gate master switch — set `false` to disable discipline entirely.
+# nudge_before_write = true
+
+# Gate verdict on a miss:
+#   "off"    — disable the gate (pass silently).
+#   "nudge"  — pass + stderr warning. [default]
+#   "strict" — block.
+# mode = "nudge"
+
+# Recency shortcut — recall within this window passes without a relevance
+# check. Keep short; long windows enable ritual recall.
+# gate_window_short_secs = 60
+
+# Relevance pool — how far back the gate looks for a topical recall.
+# gate_window_long_secs = 1800
+
+# Relevance threshold [0.0, 1.0] — containment score of edit tokens vs
+# the best-matching recent recall. Guidance:
+#   0.0  — disable relevance (time-only legacy behavior).
+#   0.15 — permissive; catches only clear mismatch.
+#   0.30 — balanced. [default]
+#   0.50 — strict; forces strong token overlap.
+#   0.70+ — very strict; expect friction.
+# gate_relevance_threshold = 0.30
+
+# Append decisions to `.thoth/gate.jsonl` for calibration.
+# gate_telemetry_enabled = false
+
+# Reflection-debt thresholds. Debt = mutations (successful Write/Edit/
+# NotebookEdit passes, read from gate.jsonl) minus remembers (append
+# ops in memory-history.jsonl), windowed to the current session.
+#
+# Above the nudge threshold, the Stop + UserPromptSubmit hooks inject
+# a reminder into agent context. Above the block threshold, the gate
+# hard-blocks new mutations until the agent calls thoth_remember_fact
+# or thoth_remember_lesson. Set `THOTH_DEFER_REFLECT=1` in the env to
+# bypass for one session.
+#
+# Set either to `0` to disable that tier.
+# reflect_debt_nudge = 10
+# reflect_debt_block = 20
+
+# Additional Bash prefixes that bypass the gate (additive with built-ins
+# like `cargo test`, `git status`, `grep`).
+# gate_bash_readonly_prefixes = ["pnpm lint", "just check"]
+
+# Actor-specific policy overrides. `THOTH_ACTOR` env var selects the
+# policy; first matching glob wins. Omit `[[discipline.policies]]`
+# entirely to apply the default policy to every actor.
+#
+# [[discipline.policies]]
+# actor = "hoangsa/*"
+# mode = "nudge"
+# window_short_secs = 300
+# relevance_threshold = 0.20
+#
+# [[discipline.policies]]
+# actor = "ci-*"
+# mode = "off"
+
+[output]
+# Recall/impact text-rendering budgets. Structured JSON (`--json` /
+# MCP `data`) is never truncated — only the human-readable text
+# surface honours these caps.
+
+# Maximum body lines rendered per recall chunk. Excess lines become
+# a `[… truncated, M more lines. Read <path>:L<a>-L<b> for full
+# body]` marker. Default: 200. Set to 0 to disable.
+# max_body_lines = 200
+
+# Soft cap on total rendered bytes per recall. A chunk in progress
+# finishes, but no new chunk starts once the budget is crossed.
+# Remaining chunks are elided with a footer. Default: 32768.
+# Set to 0 to disable.
+# max_total_bytes = 32768
+
+# Node count above which `thoth_impact` groups results by file
+# rather than listing every node. Default: 50. Set to 0 to disable
+# grouping (always flat list).
+# impact_group_threshold = 50
+"#;
+
+/// `thoth init` — create `.thoth/` + seed markdown and a documented config.
+pub async fn cmd_init(root: &std::path::Path) -> anyhow::Result<()> {
+    use thoth_store::StoreRoot;
+    let existed = root.exists();
+    let store = StoreRoot::open(root).await?;
+    // Seed empty source-of-truth files so `memory show` isn't confused.
+    let mut seeded = Vec::new();
+    for name in ["MEMORY.md", "LESSONS.md"] {
+        let p = store.path.join(name);
+        if !p.exists() {
+            tokio::fs::write(&p, format!("# {name}\n")).await?;
+            seeded.push(name);
+        }
+    }
+    // Scaffold a documented config.toml on first run. Every knob is
+    // commented-out so the file documents defaults without overriding
+    // them — users uncomment only what they want to change. Never
+    // overwrite an existing config.
+    let cfg_path = store.path.join("config.toml");
+    if !cfg_path.exists() {
+        tokio::fs::write(&cfg_path, DEFAULT_CONFIG_TOML).await?;
+        seeded.push("config.toml");
+    }
+    let verb = if existed { "refreshed" } else { "created" };
+    println!("✓ {verb} {}", store.path.display());
+    if !seeded.is_empty() {
+        println!("  seeded: {}", seeded.join(", "));
+    }
+    println!("  next:   thoth index .");
+    Ok(())
 }
 
 // ------------------------------------------------------------------ tests

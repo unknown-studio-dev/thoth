@@ -6,12 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Embedded storage backends: redb (KV + graph), tantivy (BM25), LanceDB (vectors), SQLite+FTS5 (episodes), markdown files."
+description = "Storage backends: redb (KV + graph), tantivy (BM25), ChromaDB (vectors), SQLite+FTS5 (episodes), markdown files."
 
 [dependencies]
 thoth-core   = { workspace = true }
 async-trait  = { workspace = true }
-tokio        = { workspace = true }
+tokio        = { workspace = true, features = ["process"] }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 tracing      = { workspace = true }
@@ -27,32 +27,8 @@ tantivy      = { workspace = true }
 # Episodic log (SQLite + FTS5 contentless index)
 rusqlite     = { workspace = true }
 
-# LanceDB vector store (feature-gated). The arrow-* crates must track the
-# version that `lancedb` pins internally — bumping `lancedb` typically
-# requires bumping arrow in lockstep or the RecordBatch types we pass in
-# won't match the ones `lancedb` expects.
-#
-# `default-features = false` drops the cloud object-store features
-# (`aws`, `azure`, `gcs`, `dynamodb`, `remote`, `oss`, `huggingface`).
-# Thoth only reads/writes under a local `.thoth/` directory, so every
-# one of those would just balloon the dep graph (aws-sdk-* alone pulls
-# in ~20 crates and a separate MSRV) without buying us anything.
-lancedb      = { version = "0.10", optional = true, default-features = false }
-arrow-array  = { version = "52",   optional = true }
-arrow-schema = { version = "52",   optional = true }
-futures      = { workspace = true, optional = true }
-
-[features]
-default = []
-# Reserved feature flag for the SQLite flat-cosine vector store's "rich
-# search" mode (currently always-on; left here for future gating).
-vector = []
-# Enables the LanceDB-backed vector store as a drop-in replacement for the
-# default SQLite flat-cosine index (see DESIGN.md §3 and §12). Off by
-# default because the full LanceDB dep graph (Arrow, DataFusion, async
-# runtimes) is very heavy — only turn it on for codebases where the
-# SQLite flat-cosine index (>500k vectors) starts to hurt.
-lance = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
+# ChromaDB vector search via Python sidecar (no ONNX in Rust)
+anyhow       = { workspace = true }
 
 [dev-dependencies]
 tokio     = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
@@ -63,4 +39,8 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
 name = "graph_bfs"
+harness = false
+
+[[bench]]
+name = "kv_ops"
 harness = false

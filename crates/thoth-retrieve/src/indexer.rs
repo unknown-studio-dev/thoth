@@ -19,13 +19,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
-use thoth_core::{Embedder, Result};
+use thoth_core::Result;
 use thoth_graph::{Edge, EdgeKind, Graph, Node};
 use thoth_parse::{
     LanguageRegistry, SourceChunk, SymbolKind,
     walk::{WalkOptions, walk_sources},
 };
-use thoth_store::{ChunkDoc, StoreRoot, SymbolRow, VectorStore};
+use thoth_store::{ChromaCol, ChunkDoc, StoreRoot, SymbolRow};
 use tracing::debug;
 
 /// How many chunks to embed in one `embed_batch` call. Each provider adapter
@@ -47,8 +47,7 @@ pub struct IndexStats {
     pub calls: usize,
     /// Import edges inserted.
     pub imports: usize,
-    /// Chunks embedded into the vector store. `0` unless an [`Embedder`]
-    /// + [`VectorStore`] are configured.
+    /// Chunks embedded into ChromaDB. `0` unless ChromaDB is configured.
     pub embedded: usize,
 }
 
@@ -87,11 +86,8 @@ pub struct Indexer {
     store: StoreRoot,
     graph: Graph,
     registry: LanguageRegistry,
-    /// Optional embedder — if set (together with `vectors`) the indexer
-    /// populates the vector store as it walks the tree.
-    embedder: Option<Arc<dyn Embedder>>,
-    /// Optional vector store — set together with `embedder` for Mode::Full.
-    vectors: Option<VectorStore>,
+    /// Optional ChromaDB collection for semantic search.
+    chroma: Option<Arc<ChromaCol>>,
     /// Optional per-file progress callback.
     on_progress: Option<ProgressFn>,
     /// Max concurrent per-file pipelines during [`Indexer::index_path`].
@@ -110,8 +106,7 @@ impl Indexer {
             store,
             graph,
             registry,
-            embedder: None,
-            vectors: None,
+            chroma: None,
             on_progress: None,
             concurrency: default_concurrency(),
             walk_opts: WalkOptions::default(),
@@ -162,14 +157,11 @@ impl Indexer {
         self
     }
 
-    /// Attach an [`Embedder`] + [`VectorStore`] so the indexer also
-    /// populates the semantic search backend. Returns `self` for chaining.
-    pub fn with_embedding(mut self, embedder: Arc<dyn Embedder>, vectors: VectorStore) -> Self {
-        self.embedder = Some(embedder);
-        self.vectors = Some(vectors);
+    /// Attach a ChromaDB collection for semantic indexing.
+    pub fn with_chroma(mut self, col: Arc<ChromaCol>) -> Self {
+        self.chroma = Some(col);
         self
     }
-
     /// Register a progress callback fired once per file during
     /// [`Indexer::index_path`] (plus one `stage = "walk"` at the start and
     /// one `stage = "commit"` at the end).
@@ -220,7 +212,7 @@ impl Indexer {
         // flattened after all tasks complete.
         let stats = Arc::new(Mutex::new(IndexStats::default()));
         let done = Arc::new(AtomicUsize::new(0));
-        let want_embed = self.embedder.is_some() && self.vectors.is_some();
+        let want_embed = self.chroma.is_some();
 
         let tasks: Vec<_> = stream::iter(files)
             .map(|path| {
@@ -350,9 +342,10 @@ impl Indexer {
             let _ = self.store.kv.delete_edges_touching(&symbol_fqns).await?;
         }
 
-        // 4. Vectors — Mode::Full only. Safe to skip otherwise.
-        if let Some(vectors) = &self.vectors {
-            let _ = vectors.delete_by_path(&path_str).await?;
+        // 4. ChromaDB vectors — delete chunks for this path.
+        if let Some(col) = &self.chroma {
+            let filter = serde_json::json!({"path": {"$eq": path_str}});
+            let _ = col.delete_by_filter(filter).await;
         }
 
         // 5. Drop the content-hash sentinel so the next writer sees a miss
@@ -534,27 +527,40 @@ impl Indexer {
         Ok((s, chunks))
     }
 
-    /// Embed every chunk body and upsert into the vector store. Returns
-    /// `Some(n)` with the number of rows written, or `None` if the vector
-    /// stage isn't configured.
+    /// Upsert chunks into ChromaDB (server-side embedding).
     async fn embed_chunks(&self, chunks: &[SourceChunk]) -> Result<Option<usize>> {
-        let (Some(embedder), Some(vectors)) = (self.embedder.as_ref(), self.vectors.as_ref())
-        else {
+        let Some(col) = self.chroma.as_ref() else {
             return Ok(None);
         };
         if chunks.is_empty() {
             return Ok(Some(0));
         }
-        // embed_batch takes &[&str]; build a parallel Vec<&str>.
-        let texts: Vec<&str> = chunks.iter().map(|c| c.body.as_str()).collect();
-        let vecs = embedder.embed_batch(&texts).await?;
-        let items: Vec<(String, Vec<f32>)> = chunks
+
+        let ids: Vec<String> = chunks
             .iter()
-            .zip(vecs.into_iter())
-            .map(|(c, v)| (chunk_id(&c.path, c.start_line, c.end_line), v))
+            .map(|c| chunk_id(&c.path, c.start_line, c.end_line))
             .collect();
-        vectors.upsert_batch(&items, embedder.model_id()).await?;
-        Ok(Some(items.len()))
+        let documents: Vec<String> = chunks.iter().map(|c| c.body.clone()).collect();
+        let metadatas: Vec<std::collections::HashMap<String, serde_json::Value>> = chunks
+            .iter()
+            .map(|c| {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "path".to_string(),
+                    serde_json::json!(c.path.to_string_lossy()),
+                );
+                m.insert("start_line".to_string(), serde_json::json!(c.start_line));
+                m.insert("end_line".to_string(), serde_json::json!(c.end_line));
+                if let Some(sym) = &c.symbol {
+                    m.insert("symbol".to_string(), serde_json::json!(sym));
+                }
+                m
+            })
+            .collect();
+
+        let count = ids.len();
+        col.upsert(ids, Some(documents), Some(metadatas)).await?;
+        Ok(Some(count))
     }
 }
 

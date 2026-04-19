@@ -19,6 +19,36 @@ use thoth_memory::r#override::{OverrideManager, OverrideRequest, OverrideStatus}
 /// does not override it. Matches the design-spec default of 1.
 const DEFAULT_TTL_TURNS: u32 = 1;
 
+#[derive(clap::Subcommand, Debug)]
+pub enum OverrideCmd {
+    /// List pending override requests (agent-filed, awaiting user decision).
+    List,
+    /// Approve a pending request by id, minting a single-use override token.
+    Approve {
+        /// Request id (UUID) as shown by `thoth override list`.
+        #[arg(required = true)]
+        id: String,
+        /// Remaining turns the approval is valid for. Default 1.
+        #[arg(long, default_value_t = DEFAULT_APPROVE_TTL)]
+        ttl_turns: u32,
+    },
+    /// Reject a pending request. Agent will see the rejection next turn.
+    Reject {
+        /// Request id (UUID) as shown by `thoth override list`.
+        #[arg(required = true)]
+        id: String,
+        /// Optional human-readable reason recorded on the rejection.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Per-rule counts across pending / approved / consumed / rejected.
+    Stats {
+        /// Window in weeks (filters on `requested_at`). `0` = all-time.
+        #[arg(long, default_value_t = 1)]
+        weeks: u32,
+    },
+}
+
 /// List pending override requests.
 pub async fn cmd_list(root: &Path, json: bool) -> Result<()> {
     let mgr = OverrideManager::new(root);

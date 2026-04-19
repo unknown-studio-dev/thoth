@@ -36,15 +36,15 @@ use std::sync::Arc;
 // ------------------------------------------------------- re-exports (public)
 
 pub use thoth_core::{
-    Chunk, Citation, Embedder, Error, Event, EventId, Fact, Lesson, MemoryKind, MemoryMeta, Mode,
-    Outcome, Prompt, Query, QueryScope, Result, Retrieval, RetrievalSource, Skill, Synthesis,
-    Synthesizer,
+    Chunk, Citation, Error, Event, EventId, Fact, Lesson, MemoryKind, MemoryMeta, Mode, Outcome,
+    Prompt, Query, QueryScope, Result, Retrieval, RetrievalSource, Skill, Synthesis, Synthesizer,
 };
 
+pub use thoth_graph;
 pub use thoth_memory::{MemoryConfig, MemoryManager, NudgeReport, WorkingMemory, WorkingNote};
 pub use thoth_parse::LanguageRegistry;
 pub use thoth_retrieve::{IndexProgress, IndexStats, Indexer, RetrieveConfig, Retriever};
-pub use thoth_store::{StoreRoot, VectorStore};
+pub use thoth_store::{ChromaStore, StoreRoot};
 
 // --------------------------------------------------------------- CodeMemory
 
@@ -161,22 +161,14 @@ impl CodeMemory {
     /// Recall context for a query, under the given [`Mode`].
     ///
     /// In `Mode::Zero` this runs the symbol / BM25 / graph / markdown
-    /// fusion. In `Mode::Full` it additionally opens the SQLite vector
-    /// store at `<root>/vectors.db` (per DESIGN §7), plugs in the
-    /// caller-supplied embedder + synthesizer, and runs the full hybrid
-    /// pipeline.
+    /// fusion. In `Mode::Full` it additionally plugs in the caller-supplied
+    /// synthesizer and runs the full hybrid pipeline.
     pub async fn recall(&self, q: Query, mode: Mode) -> Result<Retrieval> {
         match mode {
             Mode::Zero => self.retriever().recall(&q).await,
-            Mode::Full {
-                embedder,
-                synthesizer,
-            } => {
-                let vectors_path = StoreRoot::vectors_path(&self.root);
-                let vectors = VectorStore::open(&vectors_path).await?;
-                let embedder: Option<Arc<dyn Embedder>> = embedder.map(Arc::from);
+            Mode::Full { synthesizer } => {
                 let synth: Option<Arc<dyn Synthesizer>> = synthesizer.map(Arc::from);
-                Retriever::with_full(self.store.clone(), Some(vectors), embedder, synth)
+                Retriever::with_full(self.store.clone(), None, synth)
                     .with_markdown_boost(self.retrieve.rerank_markdown_boost)
                     .recall_full(&q)
                     .await

@@ -190,6 +190,44 @@ async fn call_api(prompt: &str, api_key: &str, model: &str) -> anyhow::Result<St
         .ok_or_else(|| anyhow::anyhow!("unexpected API response shape"))
 }
 
+// ---------------------------------------------------------- cmd_review handler
+
+/// `thoth review` CLI handler — delegates to `run_review` with config fallback.
+pub async fn cmd_review(root: &Path, backend: &str, model: &str) -> anyhow::Result<()> {
+    if !root.exists() {
+        println!("(no .thoth/ at {} — nothing to review)", root.display());
+        return Ok(());
+    }
+    // Flag overrides, else fall back to config values so the hook-spawned
+    // and user-invoked paths agree on model/backend.
+    let disc = thoth_memory::DisciplineConfig::load_or_default(root).await;
+    let backend = if backend.is_empty() {
+        disc.background_review_backend.as_str()
+    } else {
+        backend
+    };
+    let model = if model.is_empty() {
+        disc.background_review_model.as_str()
+    } else {
+        model
+    };
+    match run_review(root, backend, model).await {
+        Ok(report) => {
+            let total = report.facts_added + report.lessons_added + report.skills_proposed;
+            if total > 0 {
+                eprintln!(
+                    "thoth: background review added {} facts, {} lessons, {} skill proposals",
+                    report.facts_added, report.lessons_added, report.skills_proposed,
+                );
+            } else {
+                eprintln!("thoth: background review — nothing worth saving");
+            }
+        }
+        Err(e) => eprintln!("thoth: background review failed: {e}"),
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ helpers
 
 async fn git_diff_stat() -> anyhow::Result<String> {
