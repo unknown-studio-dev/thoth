@@ -44,24 +44,34 @@ pub async fn run_index(root: &Path, src: &Path, json: bool) -> Result<()> {
     idx = idx.with_progress(make_progress_bar());
 
     let stats = idx.index_path(src).await?;
+    let reparsed = stats.files.saturating_sub(stats.files_skipped);
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "path": src.display().to_string(),
                 "files": stats.files,
+                "files_reparsed": reparsed,
+                "files_skipped": stats.files_skipped,
                 "chunks": stats.chunks,
                 "symbols": stats.symbols,
                 "calls": stats.calls,
                 "imports": stats.imports,
                 "embedded": stats.embedded,
+                "note": "counters are deltas for this run; files_skipped were cache-hits (content hash unchanged)",
             }))?
         );
     } else {
         println!("✓ indexed {}", src.display());
         println!(
-            "  {} files · {} chunks · {} symbols · {} calls · {} imports",
-            stats.files, stats.chunks, stats.symbols, stats.calls, stats.imports,
+            "  {} files ({} reparsed, {} up-to-date) · {} chunks · {} symbols · {} calls · {} imports",
+            stats.files,
+            reparsed,
+            stats.files_skipped,
+            stats.chunks,
+            stats.symbols,
+            stats.calls,
+            stats.imports,
         );
         if stats.embedded > 0 {
             println!("  {} chunks embedded", stats.embedded);

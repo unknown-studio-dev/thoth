@@ -355,6 +355,80 @@ async fn purge_path_drops_nodes_and_touching_edges() {
     assert!(inc.is_empty(), "all edges from a.rs were purged");
 }
 
+/// When the indexer couldn't resolve a callee's bare name through the
+/// file-local alias map (`cmd::hook::cmd_enforce(…)` invoked from a
+/// different file that only says `use cmd::hook;`), the edge's `dst`
+/// stays as the simple leaf `cmd_enforce`. `impact(hook::cmd_enforce,
+/// Up)` must still surface those callers — otherwise agents get a false
+/// "0 callers, safe to delete" reading on a real cross-file symbol.
+#[tokio::test]
+async fn impact_up_picks_up_unresolved_bare_name_edges() {
+    let dir = tempdir().unwrap();
+    let g = new_graph(dir.path()).await;
+
+    g.upsert_nodes_batch(vec![
+        node("hook::cmd_enforce", "hook.rs", 10),
+        node("main::main", "main.rs", 1),
+    ])
+    .await
+    .unwrap();
+    // Edge `to` is the bare `cmd_enforce`, not the canonical
+    // `hook::cmd_enforce` — exactly what the indexer would write when
+    // the calling file didn't have a `use` that maps `cmd_enforce`.
+    g.upsert_edges_batch(vec![edge("main::main", "cmd_enforce", EdgeKind::Calls)])
+        .await
+        .unwrap();
+
+    let hits = g.impact("hook::cmd_enforce", BlastDir::Up, 3).await.unwrap();
+    let got: Vec<_> = hits.iter().map(|(n, d)| (n.fqn.as_str(), *d)).collect();
+    assert_eq!(
+        got,
+        vec![("main::main", 1)],
+        "leaf-fallback BFS must surface callers keyed on the bare name"
+    );
+
+    // Symmetric: `in_neighbors(Calls)` serves the same role for
+    // `symbol_context`, and must not miss the bare-name edge either.
+    let callers = g
+        .in_neighbors("hook::cmd_enforce", EdgeKind::Calls)
+        .await
+        .unwrap();
+    let fqns: Vec<_> = callers.iter().map(|n| n.fqn.as_str()).collect();
+    assert_eq!(fqns, vec!["main::main"]);
+}
+
+/// `resolve_fqn` folds `cli::cmd::rule::foo` into the graph key
+/// `rule::foo` when exactly one node shares that suffix — the FQN
+/// friction the bug report called out.
+#[tokio::test]
+async fn resolve_fqn_suffix_matches_when_unique() {
+    let dir = tempdir().unwrap();
+    let g = new_graph(dir.path()).await;
+    g.upsert_node(node("rule::cmd_rule_add", "rule.rs", 100))
+        .await
+        .unwrap();
+
+    let resolved = g
+        .resolve_fqn("cli::cmd::rule::cmd_rule_add")
+        .await
+        .unwrap()
+        .expect("unique suffix should resolve");
+    assert_eq!(resolved.fqn, "rule::cmd_rule_add");
+
+    // Ambiguous → None (caller renders the list via find_suffix_candidates).
+    g.upsert_node(node("other::cmd_rule_add", "other.rs", 1))
+        .await
+        .unwrap();
+    let resolved = g.resolve_fqn("cmd_rule_add").await.unwrap();
+    assert!(
+        resolved.is_none(),
+        "ambiguous suffix must not silently pick one"
+    );
+
+    let cands = g.find_suffix_candidates("cmd_rule_add").await.unwrap();
+    assert_eq!(cands.len(), 2);
+}
+
 #[tokio::test]
 async fn imports_of_file_dedupes_and_includes_file_stem() {
     let dir = tempdir().unwrap();

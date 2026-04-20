@@ -29,7 +29,12 @@ pub enum ProjectsCmd {
 ///
 /// 1. Explicit `--root` flag (highest priority)
 /// 2. `$THOTH_ROOT` env var
-/// 3. Project-local `./.thoth/` (backwards compat)
+/// 3. Project-local `./.thoth/` (backwards compat) — BUT only when it
+///    actually has a populated graph. An empty `.thoth/` created by a
+///    `thoth index .` run that lost the `--root` flag used to silently
+///    pre-empt the real global root; we now detect that case and fall
+///    through to the global path, printing a one-line warning so the
+///    user knows why.
 /// 4. Global `~/.thoth/projects/{slug}/`
 pub fn resolve_root(explicit: Option<&Path>) -> PathBuf {
     if let Some(root) = explicit {
@@ -42,26 +47,58 @@ pub fn resolve_root(explicit: Option<&Path>) -> PathBuf {
         }
     }
     let local = PathBuf::from(".thoth");
-    if local.is_dir() {
+    let local_populated = local.is_dir() && is_populated_root(&local);
+
+    if local_populated {
         return local;
     }
+
     if let Some(home) = home_dir()
         && let Ok(cwd) = std::env::current_dir()
     {
         let projects = home.join(".thoth").join("projects");
         let slug = project_slug(&cwd);
         let new_path = projects.join(&slug);
-        if new_path.is_dir() {
-            return new_path;
+        let global_path = if new_path.is_dir() {
+            new_path
+        } else {
+            let legacy = legacy_project_slug(&cwd);
+            let legacy_path = projects.join(&legacy);
+            if legacy_path.is_dir() {
+                legacy_path
+            } else {
+                new_path
+            }
+        };
+
+        // Warn when we're falling through a stale local `.thoth/` to
+        // reach a populated global root. Silent if the local doesn't
+        // exist at all (common, expected) or the global path is equally
+        // empty (we can't tell which is "right", so don't guess).
+        if local.is_dir() && is_populated_root(&global_path) {
+            eprintln!(
+                "thoth: ignoring stale local .thoth/ (no graph.redb); using {} instead. \
+                 Remove ./.thoth or run `thoth index --root ./.thoth .` to repopulate it.",
+                global_path.display()
+            );
         }
-        let legacy = legacy_project_slug(&cwd);
-        let legacy_path = projects.join(&legacy);
-        if legacy_path.is_dir() {
-            return legacy_path;
-        }
-        return new_path;
+        return global_path;
     }
+
     local
+}
+
+/// True when the root directory looks like it has usable indexed data —
+/// i.e. a `graph.redb` that is larger than a fresh empty redb file.
+/// Empty redb databases are ~4 KiB (header + one free-page map entry);
+/// anything under 1 KiB is definitely empty, and the 4-KiB threshold is
+/// a generous cutoff for "has any rows".
+fn is_populated_root(root: &Path) -> bool {
+    let graph = root.join("graph.redb");
+    match std::fs::metadata(&graph) {
+        Ok(m) => m.is_file() && m.len() > 4096,
+        Err(_) => false,
+    }
 }
 
 /// Human-readable slug from a project path: last two path components,

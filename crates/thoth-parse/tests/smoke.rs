@@ -249,6 +249,67 @@ async fn walk_survives_bad_extra_pattern() {
     );
 }
 
+/// Type references — fields, param types, return types — must be
+/// captured so `impact(TypeX, up)` reports every function that threads
+/// `TypeX` through, not just direct callers.
+#[tokio::test]
+async fn rust_captures_type_references() {
+    const SAMPLE: &str = r#"
+pub struct Rule {
+    pub id: String,
+}
+
+pub struct RulesConfig {
+    pub rules: Vec<Rule>,
+}
+
+pub fn cmd_rule_add(rule: Rule) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn evaluate(cfg: &RulesConfig, r: &Rule) -> bool {
+    true
+}
+"#;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rule.rs");
+    tokio::fs::write(&path, SAMPLE).await.unwrap();
+
+    let reg = LanguageRegistry::new();
+    let (_chunks, table) = thoth_parse::parse_file(&reg, &path).await.unwrap();
+
+    // Every owner → referenced type pair we expect to see.
+    let expected: &[(&str, &str)] = &[
+        ("rule::RulesConfig", "Rule"),
+        ("rule::cmd_rule_add", "Rule"),
+        ("rule::cmd_rule_add", "Result"),
+        ("rule::evaluate", "RulesConfig"),
+        ("rule::evaluate", "Rule"),
+    ];
+    for (owner, ty) in expected {
+        assert!(
+            table
+                .references
+                .iter()
+                .any(|(o, t)| o == owner && t == ty),
+            "missing reference {owner} → {ty} in {:?}",
+            table.references,
+        );
+    }
+
+    // `Rule` must not reference itself (`struct Rule { id: String }` —
+    // the declared `Rule` identifier and the self-referential field
+    // type would collapse to a self-loop).
+    assert!(
+        !table
+            .references
+            .iter()
+            .any(|(o, t)| o == "rule::Rule" && t == "Rule"),
+        "self-reference leaked for struct name: {:?}",
+        table.references,
+    );
+}
+
 #[tokio::test]
 async fn watcher_emits_events_on_change() {
     let dir = tempdir().unwrap();

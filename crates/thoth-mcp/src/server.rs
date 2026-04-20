@@ -497,10 +497,13 @@ impl Server {
         let Args { path } = serde_json::from_value(args).unwrap_or_default();
         let src = PathBuf::from(path.unwrap_or_else(|| ".".to_string()));
         let stats = self.inner.indexer.index_path(&src).await?;
+        let reparsed = stats.files.saturating_sub(stats.files_skipped);
         let text = format!(
-            "indexed {}: files={} chunks={} symbols={} calls={} imports={}",
+            "indexed {}: files={} ({} reparsed, {} up-to-date) chunks={} symbols={} calls={} imports={} — counts are delta for this run",
             src.display(),
             stats.files,
+            reparsed,
+            stats.files_skipped,
             stats.chunks,
             stats.symbols,
             stats.calls,
@@ -509,11 +512,14 @@ impl Server {
         let data = json!({
             "path": src.display().to_string(),
             "files": stats.files,
+            "files_reparsed": reparsed,
+            "files_skipped": stats.files_skipped,
             "chunks": stats.chunks,
             "symbols": stats.symbols,
             "calls": stats.calls,
             "imports": stats.imports,
             "embedded": stats.embedded,
+            "note": "counters are deltas for this run; files_skipped were cache-hits (content hash unchanged)",
         });
         Ok(ToolOutput::new(data, text))
     }
@@ -1841,14 +1847,47 @@ impl Server {
         };
 
         // Confirm the symbol exists so the caller gets a clear error
-        // instead of an empty result on typos.
-        if self.inner.graph.get(&fqn).await?.is_none() {
-            let text = format!(
-                "symbol not found: {fqn}\n(try `thoth_recall` first to look up the \
-                 correct FQN — graph keys are module::name)"
-            );
-            return Ok(ToolOutput::error(text));
-        }
+        // instead of an empty result on typos. When the exact FQN misses,
+        // fall back to a `::`-boundary suffix scan so an agent that
+        // passed `cli::cmd::rule::foo` still gets routed to the graph
+        // key `rule::foo`. Ambiguous matches surface the candidate list
+        // instead of guessing.
+        let resolved_fqn = match self.inner.graph.get(&fqn).await? {
+            Some(_) => fqn.clone(),
+            None => {
+                let candidates = self.inner.graph.find_suffix_candidates(&fqn).await?;
+                match candidates.len() {
+                    1 => candidates.into_iter().next().unwrap().fqn,
+                    0 => {
+                        let text = format!(
+                            "symbol not found: {fqn}\n(try `thoth_recall` first to look up the \
+                             correct FQN — graph keys are module::name)"
+                        );
+                        return Ok(ToolOutput::error(text));
+                    }
+                    _ => {
+                        let mut text = format!(
+                            "symbol {fqn:?} is ambiguous — {} candidates share that suffix:\n",
+                            candidates.len(),
+                        );
+                        for c in candidates.iter().take(10) {
+                            text.push_str(&format!(
+                                "  {}  {}:{}\n",
+                                c.fqn,
+                                c.path.display(),
+                                c.line
+                            ));
+                        }
+                        if candidates.len() > 10 {
+                            text.push_str(&format!("  … +{} more\n", candidates.len() - 10));
+                        }
+                        text.push_str("(rerun with the exact FQN from the list above)");
+                        return Ok(ToolOutput::error(text));
+                    }
+                }
+            }
+        };
+        let fqn = resolved_fqn;
 
         let hits = self.inner.graph.impact(&fqn, dir, depth).await?;
 
@@ -1970,11 +2009,46 @@ impl Server {
         let limit = limit.unwrap_or(32).clamp(1, 128);
 
         let g = &self.inner.graph;
-        let Some(self_node) = g.get(&fqn).await? else {
-            return Ok(ToolOutput::error(format!(
-                "symbol not found: {fqn}\n(graph keys are `module::name`; use `thoth_recall` \
-                 to look up the right FQN first)"
-            )));
+        // Same resolve-by-suffix fallback as `tool_impact`: accept a
+        // fully-qualified "cli::cmd::rule::foo" when the graph key is
+        // just "rule::foo". Ambiguity → list candidates and bail.
+        let (self_node, fqn) = match g.get(&fqn).await? {
+            Some(n) => (n, fqn),
+            None => {
+                let candidates = g.find_suffix_candidates(&fqn).await?;
+                match candidates.len() {
+                    1 => {
+                        let n = candidates.into_iter().next().unwrap();
+                        let canonical = n.fqn.clone();
+                        (n, canonical)
+                    }
+                    0 => {
+                        return Ok(ToolOutput::error(format!(
+                            "symbol not found: {fqn}\n(graph keys are `module::name`; use `thoth_recall` \
+                             to look up the right FQN first)"
+                        )));
+                    }
+                    _ => {
+                        let mut text = format!(
+                            "symbol {fqn:?} is ambiguous — {} candidates share that suffix:\n",
+                            candidates.len(),
+                        );
+                        for c in candidates.iter().take(10) {
+                            text.push_str(&format!(
+                                "  {}  {}:{}\n",
+                                c.fqn,
+                                c.path.display(),
+                                c.line
+                            ));
+                        }
+                        if candidates.len() > 10 {
+                            text.push_str(&format!("  … +{} more\n", candidates.len() - 10));
+                        }
+                        text.push_str("(rerun with the exact FQN from the list above)");
+                        return Ok(ToolOutput::error(text));
+                    }
+                }
+            }
         };
 
         let mut callers = g.in_neighbors(&fqn, thoth_graph::EdgeKind::Calls).await?;
@@ -2105,15 +2179,23 @@ impl Server {
             // fetch the matching graph Nodes for rendering via a second
             // round trip — nodes and rows key on the same FQN but live in
             // different tables.
+            // Diffs can arrive with any of three path flavours depending on
+            // how `git diff` was invoked: `cli/src/cmd/rule.rs` (cwd-rel),
+            // `./cli/src/cmd/rule.rs` (dot-prefixed), or absolute. The
+            // symbols table could have been populated with a different
+            // flavour when the repo was indexed (`thoth index .` vs
+            // `thoth index /abs/path`). Go through the lenient lookup so a
+            // PR pre-check actually finds the symbols instead of silently
+            // returning "no overlap".
             let path_buf = std::path::PathBuf::from(path);
-            let sym_rows = match store.kv.symbols_for_path(&path_buf).await {
+            let sym_rows = match store.kv.symbols_for_path_like(&path_buf).await {
                 Ok(r) => r,
                 Err(_) => continue,
             };
             if sym_rows.is_empty() {
                 continue;
             }
-            let nodes = g.symbols_in_file(&path_buf).await?;
+            let nodes = g.symbols_in_file_like(&path_buf).await?;
             let by_fqn: std::collections::HashMap<&str, &thoth_graph::Node> =
                 nodes.iter().map(|n| (n.fqn.as_str(), n)).collect();
 

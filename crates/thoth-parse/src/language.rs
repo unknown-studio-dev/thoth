@@ -274,6 +274,42 @@ impl Language {
         }
     }
 
+    /// Extract the name of a type this node references, if the node is
+    /// a type-reference leaf (Rust `type_identifier` / `scoped_type_identifier`,
+    /// TS/JS `type_identifier`, Python `type` / `identifier` inside an
+    /// annotation). Returns a bare / qualified name exactly as it
+    /// appears in source — the indexer resolves it through the file's
+    /// alias map before writing a `References` edge.
+    ///
+    /// Scope is deliberately narrow: only the leaves whose sole job is
+    /// to name a type, not every `identifier` in the tree. Call sites
+    /// (already captured as `Calls`), variable bindings, and literal
+    /// strings are untouched. Yields `None` for unsupported kinds,
+    /// which is the common case — callers guard with `is_some()`.
+    pub(crate) fn extract_type_ref(
+        self,
+        node: tree_sitter::Node<'_>,
+        source: &[u8],
+    ) -> Option<String> {
+        let kind = node.kind();
+        let matches = match self.inner {
+            #[cfg(feature = "lang-rust")]
+            LanguageKind::Rust => kind == "type_identifier" || kind == "scoped_type_identifier",
+            #[cfg(feature = "lang-typescript")]
+            LanguageKind::TypeScript => kind == "type_identifier",
+            _ => false,
+        };
+        if !matches {
+            return None;
+        }
+        let text = node.utf8_text(source).ok()?;
+        let bare = strip_generics(text.trim()).to_string();
+        if bare.is_empty() {
+            return None;
+        }
+        Some(bare)
+    }
+
     /// Extract the unresolved names of any parent types this definition
     /// extends / implements. Returns bare or qualified names exactly as
     /// they appear in source; the indexer resolves them through the

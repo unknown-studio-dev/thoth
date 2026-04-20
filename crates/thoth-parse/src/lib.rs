@@ -106,6 +106,17 @@ pub struct SymbolTable {
     /// through `aliases` before writing [`EdgeKind::Extends`].
     #[serde(default)]
     pub extends: Vec<(String, String)>,
+    /// `(referrer_fqn, referenced_type_name)` type-usage edges.
+    ///
+    /// Every place a symbol *mentions* another type — a struct field
+    /// whose type is `T`, a function parameter / return type `T`, a
+    /// generic argument `T`, a trait bound `T`, etc. The referenced
+    /// name is unresolved at parse time (same treatment as `extends`);
+    /// the indexer rewrites it through `aliases` / local symbols before
+    /// emitting [`EdgeKind::References`]. Deduped per-definition so a
+    /// type mentioned 20 times inside one function only appears once.
+    #[serde(default)]
+    pub references: Vec<(String, String)>,
 }
 
 /// Parse a single file and produce chunks + a symbol table.
@@ -188,6 +199,32 @@ fn module_path_from(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// True when `node` is the `name` field of its parent AST node —
+/// i.e. it IS the declared identifier of the enclosing definition
+/// rather than a type *use*. Used to filter `struct Foo { … }` from
+/// recording a spurious `Foo → Foo` self-reference.
+fn is_definition_name_node(node: tree_sitter::Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if let Some(name) = parent.child_by_field_name("name")
+        && name.id() == node.id()
+    {
+        return true;
+    }
+    // Rust `impl Trait for Type` uses the `type` field for the subject
+    // (see `extract_name`). Treat the type name used there as the
+    // definition's own name so we don't emit `English → English` for
+    // `impl Greet for English`.
+    if let Some(ty) = parent.child_by_field_name("type")
+        && ty.id() == node.id()
+        && parent.kind() == "impl_item"
+    {
+        return true;
+    }
+    false
+}
+
 /// AST walker.
 ///
 /// Single depth-first pass that:
@@ -221,6 +258,18 @@ fn walk_ast(
     {
         table.calls.push((caller.clone(), callee));
         // Still descend — calls can nest inside call arguments.
+    }
+
+    // ---- type references ---------------------------------------------------
+    // Attribute any type-identifier to the deepest enclosing symbol on
+    // the stack. Skip when the node is the *name* of its parent
+    // definition (otherwise `struct Rule { … }` would emit `Rule → Rule`).
+    if let Some(type_name) = lang.extract_type_ref(node, source)
+        && !type_name.is_empty()
+        && let Some((owner, _)) = stack.last()
+        && !is_definition_name_node(node)
+    {
+        table.references.push((owner.clone(), type_name));
     }
 
     // ---- definitions -------------------------------------------------------

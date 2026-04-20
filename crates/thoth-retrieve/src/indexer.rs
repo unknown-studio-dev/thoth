@@ -35,19 +35,32 @@ use tracing::debug;
 const EMBED_BATCH_SIZE: usize = 256;
 
 /// Stats returned from one full [`Indexer::index_path`] run.
+///
+/// Every counter is a **delta** for this run — not an index-wide total.
+/// `files` is the count of files the walker emitted; `files_skipped` is
+/// the subset of those whose content hash matched the last-indexed
+/// blake3 sentinel so the file was short-circuited with zero work.
+/// `chunks`, `symbols`, `calls`, `imports`, and `embedded` therefore
+/// reflect only the newly-parsed or reparsed files, which is why a
+/// steady-state reindex can report e.g. `files=23 files_skipped=23
+/// chunks=0 symbols=0` — expected, not a bug.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IndexStats {
-    /// Files touched.
+    /// Files the walker yielded (parsed + cache-hit).
     pub files: usize,
-    /// Chunks written to the BM25 index.
+    /// Subset of `files` where content hash matched the prior index
+    /// sentinel so no FTS/KV/graph writes happened.
+    pub files_skipped: usize,
+    /// Chunks written to the BM25 index during this run.
     pub chunks: usize,
-    /// Symbols written to the KV + graph.
+    /// Symbols written to the KV + graph during this run.
     pub symbols: usize,
-    /// Call edges inserted.
+    /// Call edges inserted during this run.
     pub calls: usize,
-    /// Import edges inserted.
+    /// Import edges inserted during this run.
     pub imports: usize,
-    /// Chunks embedded into ChromaDB. `0` unless ChromaDB is configured.
+    /// Chunks embedded into ChromaDB during this run. `0` unless
+    /// ChromaDB is configured.
     pub embedded: usize,
 }
 
@@ -226,6 +239,7 @@ impl Indexer {
                             {
                                 let mut st = stats.lock();
                                 st.files += 1;
+                                st.files_skipped += s.files_skipped;
                                 st.chunks += s.chunks;
                                 st.symbols += s.symbols;
                                 st.calls += s.calls;
@@ -389,7 +403,11 @@ impl Indexer {
             && prev.as_slice() == new_hash_bytes
         {
             debug!(?path, "skip: content hash unchanged");
-            return Ok((IndexStats::default(), Vec::new()));
+            let skipped = IndexStats {
+                files_skipped: 1,
+                ..IndexStats::default()
+            };
+            return Ok((skipped, Vec::new()));
         }
 
         self.purge_path(path).await?;
@@ -510,10 +528,36 @@ impl Indexer {
             }
         }
 
+        // References edges — a type mentioned inside another symbol's
+        // body / signature. Dedup on `(from, to)` so repeated mentions
+        // inside the same owner collapse to one edge, matching the
+        // semantics of the key-based dedup redb does anyway but saving
+        // the round-trip.
+        let mut ref_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for (referrer, ty) in &table.references {
+            let resolved = resolution
+                .get(ty)
+                .cloned()
+                .unwrap_or_else(|| ty.clone());
+            if resolved.is_empty() || resolved == *referrer {
+                continue;
+            }
+            if !ref_seen.insert((referrer.clone(), resolved.clone())) {
+                continue;
+            }
+            all_edges.push(Edge {
+                from: referrer.clone(),
+                to: resolved,
+                kind: EdgeKind::References,
+            });
+        }
+
         self.graph.upsert_edges_batch(all_edges).await?;
 
         let s = IndexStats {
             files: 0, // caller increments
+            files_skipped: 0,
             chunks: chunks.len(),
             symbols: table.symbols.len(),
             calls: table.calls.len(),
@@ -586,7 +630,7 @@ fn symbol_kind_tag(k: SymbolKind) -> &'static str {
 /// baked into the hash meta key invalidates every previously-stored
 /// hash sentinel in one go, so the next indexer run re-parses every
 /// file even when its bytes haven't changed.
-const PARSER_SCHEMA_VERSION: u32 = 2;
+const PARSER_SCHEMA_VERSION: u32 = 3;
 
 /// Meta key under which we store the blake3 hash of the last-indexed bytes
 /// of `path`. Kept private to the indexer — callers shouldn't need to read

@@ -18,7 +18,7 @@
 //! milestones). redb is synchronous, so every public method wraps the actual
 //! I/O in [`tokio::task::spawn_blocking`].
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -527,6 +527,48 @@ impl KvStore {
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
 
+    /// Like [`Self::symbols_for_path`] but tolerates the three flavors of
+    /// path a caller might hand us:
+    ///
+    /// - an absolute path (`/home/u/proj/cli/src/cmd/rule.rs`),
+    /// - a cwd-relative path (`cli/src/cmd/rule.rs`) — what `git diff`
+    ///   emits,
+    /// - a `./`-prefixed path (`./cli/src/cmd/rule.rs`) — what some index
+    ///   runs store when the indexer was invoked with `.`.
+    ///
+    /// Match rule: strip leading `./` + redundant `.` components from both
+    /// sides, then exact or either-suffix of the resulting component
+    /// sequence. Ordered: the caller gets every match, deduped on the
+    /// stored row's path so we never return a single symbol twice.
+    ///
+    /// Used by `detect_changes` — diff hunks arrive with whatever path
+    /// git printed, but the symbols table could have been populated with
+    /// any of the three forms depending on how the indexer was invoked.
+    /// A strict-equality query is right ~none of the time in practice;
+    /// this helper shifts the burden off the caller.
+    pub async fn symbols_for_path_like(&self, path: impl AsRef<Path>) -> Result<Vec<SymbolRow>> {
+        let db = self.db.clone();
+        let needle = normalize_path(path.as_ref());
+        tokio::task::spawn_blocking(move || -> Result<Vec<SymbolRow>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(SYMBOLS).map_err(store)?;
+            let mut out = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (_k, v) = entry.map_err(store)?;
+                let row: SymbolRow = match serde_json::from_slice(v.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if path_matches_flexible(&row.path, &needle) {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
     /// Delete every graph node whose JSON payload `path` field matches
     /// `path`. Returns the list of node ids removed (so the caller can clean
     /// up the edges that touch them).
@@ -773,6 +815,78 @@ impl KvStore {
         .await
         .map_err(|e| Error::Store(format!("join: {e}")))?
     }
+
+    /// Find every node whose FQN ends with `needle` on a `::` component
+    /// boundary.
+    ///
+    /// The graph keys nodes by `module::name` — a bare filestem plus the
+    /// symbol's simple name — while callers often pass in fully qualified
+    /// paths they inferred from the source tree (`cli::cmd::rule::foo`)
+    /// or the simple name alone (`foo`). Rather than fail on the exact
+    /// miss, `impact` / `symbol_context` fall back to this scan and
+    /// promote a unique hit to the canonical form. O(|NODES|) table scan
+    /// — fine while `nodes` stays in the low millions.
+    pub async fn find_nodes_by_suffix(&self, needle: &str) -> Result<Vec<NodeRow>> {
+        let db = self.db.clone();
+        let needle = needle.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Vec<NodeRow>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(NODES).map_err(store)?;
+            let mut out = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (k, v) = entry.map_err(store)?;
+                let key = k.value();
+                // Either direction of `::`-boundary suffix overlap matches,
+                // covering both calling conventions:
+                //   needle "cmd_enforce"           → key "hook::cmd_enforce"
+                //   needle "cli::cmd::rule::foo"   → key "rule::foo"
+                let needle_is_suffix_of_key = key
+                    .strip_suffix(needle.as_str())
+                    .is_some_and(|prefix| prefix.ends_with("::"));
+                let key_is_suffix_of_needle = needle
+                    .strip_suffix(key)
+                    .is_some_and(|prefix| prefix.ends_with("::"));
+                if (key == needle || needle_is_suffix_of_key || key_is_suffix_of_needle)
+                    && let Ok(row) = serde_json::from_slice::<NodeRow>(v.value())
+                {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
+
+    /// Like [`Self::nodes_for_path`] but tolerant of absolute /
+    /// cwd-relative / `./`-prefixed variants — symmetric with
+    /// [`Self::symbols_for_path_like`].
+    pub async fn nodes_for_path_like(&self, path: impl AsRef<Path>) -> Result<Vec<NodeRow>> {
+        let db = self.db.clone();
+        let needle = normalize_path(path.as_ref());
+        tokio::task::spawn_blocking(move || -> Result<Vec<NodeRow>> {
+            let rtxn = db.begin_read().map_err(store)?;
+            let t = rtxn.open_table(NODES).map_err(store)?;
+            let mut out = Vec::new();
+            for entry in t.iter().map_err(store)? {
+                let (_k, v) = entry.map_err(store)?;
+                let row: NodeRow = match serde_json::from_slice(v.value()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let stored = match row.payload.get("path").and_then(|x| x.as_str()) {
+                    Some(s) => Path::new(s).to_path_buf(),
+                    None => continue,
+                };
+                if path_matches_flexible(&stored, &needle) {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Store(format!("join: {e}")))?
+    }
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -788,6 +902,45 @@ fn forward_to_reverse_key(fwd: &str) -> Option<String> {
     let (src, rest) = fwd.split_once('|')?;
     let (kind, dst) = rest.split_once('|')?;
     Some(format!("{dst}|{kind}|{src}"))
+}
+
+/// Drop `.` components and parent-less `./` so `./a/b` and `a/b` compare
+/// equal. Does not resolve `..` — keep that literal so we never cross
+/// boundaries implicitly.
+fn normalize_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => continue,
+            _ => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True if `stored` and `needle` refer to the same file after stripping
+/// `./` components — either exact equality, or either path is a
+/// trailing-component suffix of the other.
+///
+/// Suffix-on-components (not suffix-on-string) so `foo/rule.rs` does not
+/// match `foorule.rs` and `src/rule.rs` does not match `other_src/rule.rs`.
+fn path_matches_flexible(stored: &Path, needle: &Path) -> bool {
+    let s = normalize_path(stored);
+    let n = needle.to_path_buf();
+    if s == n {
+        return true;
+    }
+    let s_comps: Vec<_> = s.components().collect();
+    let n_comps: Vec<_> = n.components().collect();
+    if s_comps.is_empty() || n_comps.is_empty() {
+        return false;
+    }
+    let (shorter, longer) = if n_comps.len() <= s_comps.len() {
+        (&n_comps, &s_comps)
+    } else {
+        (&s_comps, &n_comps)
+    };
+    longer[longer.len() - shorter.len()..] == shorter[..]
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -813,6 +966,91 @@ mod prefix_scan_tests {
         let db_path = dir.path().join("kv.redb");
         let store = KvStore::open(&db_path).await.unwrap();
         (dir, store)
+    }
+
+    /// Suffix / relative / absolute path forms must all hit the same
+    /// symbol row so `detect_changes` works regardless of whether the
+    /// indexer was invoked with `.`, `./`, or an absolute path. Mirror
+    /// the realistic case: stored path is absolute, needle is the
+    /// cwd-relative form `git diff` prints.
+    #[tokio::test]
+    async fn symbols_for_path_like_matches_all_flavours() {
+        let (_dir, store) = open_store().await;
+        let row = SymbolRow {
+            fqn: "rule::Rule".to_string(),
+            path: PathBuf::from("/abs/proj/cli/src/cmd/rule.rs"),
+            start_line: 16,
+            end_line: 31,
+            kind: "type".to_string(),
+        };
+        store.put_symbol(row).await.unwrap();
+
+        // Three flavours a caller might pass in.
+        for needle in [
+            "/abs/proj/cli/src/cmd/rule.rs",
+            "cli/src/cmd/rule.rs",
+            "./cli/src/cmd/rule.rs",
+        ] {
+            let hits = store
+                .symbols_for_path_like(PathBuf::from(needle))
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "needle {needle:?} should match the stored absolute path"
+            );
+        }
+
+        // A component-disjoint basename collision must NOT match.
+        let hits = store
+            .symbols_for_path_like(PathBuf::from("other/rule.rs"))
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "basename-only match would be a false positive"
+        );
+    }
+
+    /// Suffix FQN lookup used by `impact`/`symbol_context` when the
+    /// user supplies a more-qualified path than the graph key.
+    #[tokio::test]
+    async fn find_nodes_by_suffix_respects_module_boundary() {
+        let (_dir, store) = open_store().await;
+        store
+            .put_nodes_batch(vec![
+                NodeRow {
+                    id: "hook::cmd_enforce".to_string(),
+                    kind: "function".to_string(),
+                    payload: serde_json::json!({"path": "hook.rs", "line": 10}),
+                },
+                NodeRow {
+                    id: "rule::cmd_enforce".to_string(),
+                    kind: "function".to_string(),
+                    payload: serde_json::json!({"path": "rule.rs", "line": 20}),
+                },
+                // Same trailing chars but NOT on a module boundary —
+                // must not match `cmd_enforce`.
+                NodeRow {
+                    id: "x::xcmd_enforce".to_string(),
+                    kind: "function".to_string(),
+                    payload: serde_json::json!({"path": "x.rs", "line": 5}),
+                },
+            ])
+            .await
+            .unwrap();
+
+        // Qualified suffix → unique hit.
+        let hits = store.find_nodes_by_suffix("hook::cmd_enforce").await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "hook::cmd_enforce");
+
+        // Bare leaf → both real matches, not the `xcmd_enforce` red herring.
+        let hits = store.find_nodes_by_suffix("cmd_enforce").await.unwrap();
+        let mut ids: Vec<_> = hits.into_iter().map(|n| n.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["hook::cmd_enforce", "rule::cmd_enforce"]);
     }
 
     /// REQ-02: prefix_scan_early_exit — `symbols_with_prefix` must stop as

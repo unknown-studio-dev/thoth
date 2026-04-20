@@ -166,6 +166,44 @@ impl Graph {
         Ok(self.kv.get_node(fqn).await?.map(row_to_node))
     }
 
+    /// Best-effort lookup by FQN with a suffix-match fallback.
+    ///
+    /// Tries `get(fqn)` first. On miss, scans the node table for any
+    /// node whose FQN ends with `fqn` on a `::` boundary, then:
+    ///
+    /// - exactly one hit → returns it (canonical form in [`Node::fqn`]);
+    /// - zero hits → `Ok(None)` — caller should surface the original FQN
+    ///   in the error so the user can see what they asked for;
+    /// - multiple hits → `Ok(None)` plus the list via
+    ///   [`Self::find_suffix_candidates`] so the caller can show an
+    ///   ambiguity message instead of picking arbitrarily.
+    ///
+    /// Used by `impact` / `symbol_context` to soften the pain of a user
+    /// typing `cli::cmd::rule::foo` when the graph key is `rule::foo`.
+    pub async fn resolve_fqn(&self, fqn: &str) -> Result<Option<Node>> {
+        if let Some(n) = self.get(fqn).await? {
+            return Ok(Some(n));
+        }
+        let candidates = self.find_suffix_candidates(fqn).await?;
+        if candidates.len() == 1 {
+            return Ok(Some(candidates.into_iter().next().unwrap()));
+        }
+        Ok(None)
+    }
+
+    /// Every node whose FQN ends with `needle` on a `::` boundary.
+    /// Caller-facing so `impact` / `symbol_context` can render the
+    /// ambiguity list when the lookup is not unique.
+    pub async fn find_suffix_candidates(&self, needle: &str) -> Result<Vec<Node>> {
+        Ok(self
+            .kv
+            .find_nodes_by_suffix(needle)
+            .await?
+            .into_iter()
+            .map(row_to_node)
+            .collect())
+    }
+
     /// BFS callees: `fqn` → what `fqn` calls, transitively, up to `depth`.
     pub async fn callees(&self, fqn: &str, depth: usize) -> Result<Vec<Node>> {
         self.bfs(fqn, depth, Direction::Out, Some(&[EdgeKind::Calls]))
@@ -217,8 +255,47 @@ impl Graph {
                 [EdgeKind::Calls, EdgeKind::References, EdgeKind::Extends],
             ),
         };
-        self.bfs_depth_tagged(fqn, depth, direction, Some(&kinds))
-            .await
+        let mut hits = self
+            .bfs_depth_tagged(fqn, depth, direction, Some(&kinds))
+            .await?;
+
+        // Secondary walk from the bare leaf name. Call sites in Rust
+        // (and TS/JS) that reference a symbol through a path the file
+        // didn't `use` — e.g. `cmd::hook::cmd_enforce(&cwd)` dispatched
+        // from a match arm in `main.rs` — are recorded with the edge's
+        // `to` set to `cmd_enforce` (the last segment) because the
+        // indexer's file-local resolver doesn't know about
+        // `hook::cmd_enforce`. A BFS rooted at the canonical FQN alone
+        // misses those edges entirely, which is the core of the "impact
+        // reports 0 callers for a real cross-file symbol" complaint.
+        //
+        // Walking additionally from the leaf for Up / Both directions
+        // picks those unresolved edges up. The tradeoff: if two symbols
+        // share a leaf (`a::foo` and `b::foo`), `impact(a::foo)` may
+        // report some of `b::foo`'s callers as well. Over-reporting is
+        // the right failure mode for a blast-radius tool — the alternative
+        // is silently missing breakage.
+        if matches!(dir, BlastDir::Up | BlastDir::Both)
+            && let Some(leaf) = fqn.rsplit("::").next()
+            && leaf != fqn
+            && !leaf.is_empty()
+        {
+            let extra = self
+                .bfs_depth_tagged(leaf, depth, direction, Some(&kinds))
+                .await?;
+            let mut seen: std::collections::HashSet<String> =
+                hits.iter().map(|(n, _)| n.fqn.clone()).collect();
+            // Skip any hit whose FQN is the input — we never want to
+            // report `fqn` as its own caller.
+            seen.insert(fqn.to_string());
+            for (n, d) in extra {
+                if seen.insert(n.fqn.clone()) {
+                    hits.push((n, d));
+                }
+            }
+        }
+
+        Ok(hits)
     }
 
     /// Delete every node and every edge that touches any symbol declared in
@@ -240,6 +317,24 @@ impl Graph {
         Ok(self
             .kv
             .nodes_for_path(path)
+            .await?
+            .into_iter()
+            .map(row_to_node)
+            .collect())
+    }
+
+    /// Like [`Self::symbols_in_file`] but tolerates absolute /
+    /// cwd-relative / `./`-prefixed path variants. The symbols table
+    /// stores whatever path form the indexer was invoked with, and the
+    /// caller (e.g. `detect_changes`) often has a different flavour in
+    /// hand. Delegates to [`thoth_store::KvStore::nodes_for_path_like`].
+    pub async fn symbols_in_file_like(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Vec<Node>> {
+        Ok(self
+            .kv
+            .nodes_for_path_like(path)
             .await?
             .into_iter()
             .map(row_to_node)
@@ -309,11 +404,32 @@ impl Graph {
     /// [`Self::out_neighbors`].
     pub async fn in_neighbors(&self, fqn: &str, kind: EdgeKind) -> Result<Vec<Node>> {
         let mut out = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for e in self.incoming(fqn).await? {
             if e.kind == kind
+                && seen.insert(e.from.clone())
                 && let Some(n) = self.get(&e.from).await?
             {
                 out.push(n);
+            }
+        }
+        // Also include edges whose `dst` is the bare leaf of `fqn` —
+        // these are cross-file callers whose call text didn't resolve
+        // through the file-local alias map at index time (see
+        // [`Self::impact`] for the full rationale). Treat them as
+        // callers of `fqn` since they almost always are.
+        if let Some(leaf) = fqn.rsplit("::").next()
+            && leaf != fqn
+            && !leaf.is_empty()
+        {
+            for e in self.incoming(leaf).await? {
+                if e.kind == kind
+                    && e.from != fqn
+                    && seen.insert(e.from.clone())
+                    && let Some(n) = self.get(&e.from).await?
+                {
+                    out.push(n);
+                }
             }
         }
         Ok(out)
