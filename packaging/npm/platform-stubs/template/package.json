@@ -1,6 +1,6 @@
 {
   "name": "@unknownstudio/thoth-{PLATFORM}",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Platform-specific native binary for @unknownstudio/thoth ({TRIPLE}).",
   "license": "(MIT OR Apache-2.0)",
   "repository": {

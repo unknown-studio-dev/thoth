@@ -173,20 +173,22 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Locate a companion binary (`thoth-mcp`, `thoth-gate`) next to the
-/// currently-running `thoth` binary.
+/// Locate a companion binary (`thoth-mcp`, `thoth-gate`) as an absolute
+/// path so GUI-launched Claude Code (whose PATH misses the user's shell
+/// additions) can still spawn it.
 ///
-/// Why: Claude Code spawns hooks and MCP servers with its own PATH, which
-/// on macOS GUI launches doesn't include `~/.cargo/bin`, `/opt/homebrew/bin`,
-/// or whatever the user's shell rc exports. A bare `"command": "thoth-mcp"`
-/// therefore fails to start for GUI-launched Claude Code even though the
-/// binary exists in the user's shell. Writing the absolute path sidesteps
-/// that whole class of issue.
-///
-/// Falls back to the bare name if we can't locate a sibling binary — better
-/// a broken config that matches the user's expectation than a silent
-/// rewrite pointing at a non-existent path.
+/// Resolution order:
+///   1. `which <name>` — the user's shell PATH; gives the shortest,
+///      most stable path (symlinks, Homebrew shims, nvm wrappers all
+///      resolve correctly).
+///   2. Sibling of `current_exe()` — works for cargo-install and direct
+///      tarball extractions where the binaries sit next to each other.
+///   3. Bare name — last resort; will fail on GUI launches but at least
+///      the config is readable and fixable by the user.
 fn resolve_companion(name: &str) -> String {
+    if let Some(p) = which_bin(name) {
+        return p;
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(parent) = exe.parent()
     {
@@ -196,6 +198,18 @@ fn resolve_companion(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+/// Run `which <name>` and return the trimmed stdout if it succeeds.
+fn which_bin(name: &str) -> Option<String> {
+    std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Rewrite a single command string:

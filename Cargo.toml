@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.3-alpha"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -27,15 +27,15 @@ authors = ["Than The Van"]
 
 [workspace.dependencies]
 # Internal crates
-thoth          = { path = "crates/thoth",          version = "0.0.3-alpha" }
-thoth-core     = { path = "crates/thoth-core",     version = "0.0.3-alpha" }
-thoth-parse    = { path = "crates/thoth-parse",    version = "0.0.3-alpha" }
-thoth-store    = { path = "crates/thoth-store",    version = "0.0.3-alpha" }
-thoth-graph    = { path = "crates/thoth-graph",    version = "0.0.3-alpha" }
-thoth-memory   = { path = "crates/thoth-memory",   version = "0.0.3-alpha" }
-thoth-retrieve = { path = "crates/thoth-retrieve", version = "0.0.3-alpha" }
-thoth-domain   = { path = "crates/thoth-domain",   version = "0.0.3-alpha" }
-thoth-mcp      = { path = "crates/thoth-mcp",      version = "0.0.3-alpha" }
+thoth          = { path = "crates/thoth",          version = "0.0.4" }
+thoth-core     = { path = "crates/thoth-core",     version = "0.0.4" }
+thoth-parse    = { path = "crates/thoth-parse",    version = "0.0.4" }
+thoth-store    = { path = "crates/thoth-store",    version = "0.0.4" }
+thoth-graph    = { path = "crates/thoth-graph",    version = "0.0.4" }
+thoth-memory   = { path = "crates/thoth-memory",   version = "0.0.4" }
+thoth-retrieve = { path = "crates/thoth-retrieve", version = "0.0.4" }
+thoth-domain   = { path = "crates/thoth-domain",   version = "0.0.4" }
+thoth-mcp      = { path = "crates/thoth-mcp",      version = "0.0.4" }
 
 # Async + error handling
 tokio        = { version = "1.43", features = ["macros", "rt-multi-thread", "fs", "sync", "time", "io-util"] }
